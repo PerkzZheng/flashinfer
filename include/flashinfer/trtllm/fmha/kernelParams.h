@@ -199,7 +199,7 @@ struct KernelParams {
 
     // The hidden dimension when the Q, K and V tensors are packed.
     int32_t hiddenDimQkv{hiddenDimQ};
-    if (isPackedQkv(options.mQkvLayout)) {
+    if (false) {
       FLASHINFER_CHECK(!groupsHeadsQ, "internal error");
       hiddenDimQkv += options.mNumHeadsKv * (options.mHeadDimQk + options.mHeadDimV);
     }
@@ -422,7 +422,7 @@ struct KernelParams {
     void const *qPtr{runnerParams.qPtr}, *kPtr{runnerParams.kPtr}, *vPtr{runnerParams.vPtr};
 
     // Set Q, K and V pointer from packed QKV tensor.
-    if (isPackedQkv(runnerParams.mQkvLayout)) {
+    if (false) {
       qPtr = runnerParams.qkvPtr;
       kPtr = reinterpret_cast<void const*>(reinterpret_cast<char const*>(runnerParams.qkvPtr) +
                                            runnerParams.mNumHeadsQ * runnerParams.mHeadDimQk *

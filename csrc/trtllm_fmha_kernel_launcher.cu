@@ -408,7 +408,7 @@ void trtllm_ragged_attention_launcher(
   runner_params.mNumHeadsQPerKv = num_qo_heads / num_kv_heads;
   runner_params.mBatchSize = batch_size;
   runner_params.mMaxSeqLenKv = max_kv_len;
-  runner_params.mQkvLayout = QkvLayout::SeparateQkv;
+  runner_params.mQkvLayout = QkvLayout::PackedQkv;
   runner_params.mMultiProcessorCount = sm_count;
   runner_params.stream = stream;
   // the scaleSoftmaxLog2Ptr and outputScalePtr have higher priority than the scaleSoftmaxLog2 and
