@@ -2,6 +2,7 @@ import math
 
 import pytest
 import torch
+
 from tests.test_helpers.utils_fp4 import (
     cast_from_fp4,
     recover_swizzled_scales,
@@ -1035,6 +1036,153 @@ def test_trtllm_gen_prefill_deepseek(
         lse_ref,
         atol=1e-3,
         rtol=1e-3,
+    )
+    # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
+    # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
+    assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+
+
+# reference tests for custom chunked context (1920 Q, 1920 KV)
+def reference_chunked_context_fmha(
+    q, k, v, batch_size, sm_scale, is_custom_chunked_context
+):
+    # Assume fixed seqlen q and kv.
+    sum_seqlen_q = q.size(0)
+    seqlen_q = sum_seqlen_q // batch_size
+    sum_seqlen_k = k.size(0)
+    seqlen_k = sum_seqlen_k // batch_size
+    num_heads = q.size(1)
+    head_dim = q.size(2)
+    q = q.view(batch_size, seqlen_q, num_heads, head_dim)
+    k = k.view(batch_size, seqlen_k, num_heads, head_dim)
+    v = v.view(batch_size, seqlen_k, num_heads, head_dim)
+
+    # BMM1
+    s = torch.einsum("bmhd,bnhd->bhmn", q, k)
+    # create mask
+    if is_custom_chunked_context:
+        mask = torch.ones(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device)
+        for q_idx in range(seqlen_q):
+            valid_seqlen = 1152 if q_idx < 1152 else seqlen_k
+            mask[q_idx, :valid_seqlen] = False
+        s = s.masked_fill(mask, -float("inf"))
+    s = s * sm_scale
+    s = torch.softmax(s, dim=-1)
+    output = torch.einsum("bhmn,bnhd->bmhd", s, v)
+    return output.reshape(sum_seqlen_q, num_heads, head_dim)
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("s_qo", [768, 1920])
+@pytest.mark.parametrize("s_kv", [1920])
+@pytest.mark.parametrize("num_kv_heads", [1])
+@pytest.mark.parametrize("head_grp_size", [1])
+@pytest.mark.parametrize("causal", [False])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_trtllm_gen_prefill_128(
+    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal, dtype
+):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    if s_qo > s_kv:
+        pytest.skip("s_qo > s_kv, skipping test as causal")
+
+    num_qo_heads = num_kv_heads * head_grp_size
+    head_dim_qk = 128
+    head_dim_vo = 128
+
+    seed = 0
+    torch.manual_seed(seed)
+    device = "cuda:0"
+
+    # enable chunked context when s_qo = 1920
+    is_custom_chunked_context = s_qo == 1920
+
+    actual_seq_lens_q = torch.full(
+        (batch_size,), s_qo, dtype=torch.int32, device=device
+    )
+
+    actual_seq_lens_kv = torch.full(
+        (batch_size,), s_kv, dtype=torch.int32, device=device
+    )
+
+    cumsum_s_qo = torch.sum(actual_seq_lens_q)
+    cumsum_s_kv = torch.sum(actual_seq_lens_kv)
+
+    q = torch.randn(
+        cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
+    )
+
+    k_cache = torch.randn(
+        (cumsum_s_kv, num_kv_heads, head_dim_qk),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn(
+        (cumsum_s_kv, num_kv_heads, head_dim_vo),
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    # Initialize scale
+    scale = float(1.0 / (head_dim_qk**0.5))
+
+    workspace_buffer, workspace_buffer_ref = create_workspace_buffers(device)
+
+    qo_indptr = torch.cat(
+        [
+            torch.tensor([0], device=device),
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
+        ]
+    ).int()
+
+    # kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * s_kv
+
+    # Create kv_indptr as cumulative sum of actual_seq_lens_kv
+    kv_indptr = torch.cat(
+        [
+            torch.tensor(
+                [0],
+                device=device,
+            ),
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
+        ]
+    ).int()
+
+    output_ref = reference_chunked_context_fmha(
+        q, k_cache, v_cache, batch_size, scale, is_custom_chunked_context
+    )
+    output = torch.empty_like(output_ref)
+
+    bmm1_scale = scale
+    bmm2_scale = 1.0
+    output_trtllm = flashinfer.prefill.trtllm_ragged_attention(
+        q,
+        k_cache,
+        v_cache,
+        workspace_buffer,
+        actual_seq_lens_kv,
+        s_qo,
+        s_kv,
+        bmm1_scale,
+        bmm2_scale,
+        -1,
+        batch_size,
+        -1,
+        qo_indptr,
+        kv_indptr,
+        False,
+        causal,
+        is_custom_chunked_context,
+        False,
+        out=output,
+    )
+    torch.testing.assert_close(
+        output_trtllm,
+        output_ref,
+        atol=1e-2,
+        rtol=1e-2,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future

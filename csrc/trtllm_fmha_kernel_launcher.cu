@@ -329,9 +329,9 @@ void trtllm_ragged_attention_launcher(
     int64_t max_kv_len, int64_t num_qo_heads, int64_t num_kv_heads, int64_t head_dim_qk,
     int64_t head_dim_v, int64_t sum_seq_q, int64_t sum_seq_kv, double bmm1_scale, double bmm2_scale,
     double o_sf_scale, int64_t batch_size, int64_t window_left, int64_t sm_count, bool enable_pdl,
-    bool is_causal, int64_t k_stride_keys_values, int64_t k_stride_heads, int64_t k_stride_batch,
-    int64_t v_stride_keys_values, int64_t v_stride_heads, int64_t v_stride_batch,
-    int64_t workspace_size, cudaStream_t stream) {
+    bool is_causal, bool is_custom_chunked_context, int64_t k_stride_keys_values,
+    int64_t k_stride_heads, int64_t k_stride_batch, int64_t v_stride_keys_values,
+    int64_t v_stride_heads, int64_t v_stride_batch, int64_t workspace_size, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -380,8 +380,13 @@ void trtllm_ragged_attention_launcher(
 
   runner_params.mKernelType = FmhaKernelType::Context;
   runner_params.mTileScheduler = TileScheduler::Persistent;
-  runner_params.mMaskType =
-      is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
+  if (is_custom_chunked_context) {
+    runner_params.mMaskType = TrtllmGenAttentionMaskType::CustomChunkedContext;
+  } else if (is_causal) {
+    runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
+  } else {
+    runner_params.mMaskType = TrtllmGenAttentionMaskType::Dense;
+  }
   runner_params.lsePtr = lse;
 
   AlignedAllocator float_allocator(workspace_buffer, workspace_size);
@@ -415,8 +420,8 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
                              double o_sf_scale, int64_t batch_size, int64_t window_left,
                              TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv,
                              int64_t sm_count, bool enable_pdl, bool is_causal,
-                             int64_t workspace_size, Optional<TensorView> attention_sinks,
-                             Optional<TensorView> lse) {
+                             bool is_custom_chunked_context, int64_t workspace_size,
+                             Optional<TensorView> attention_sinks, Optional<TensorView> lse) {
   float* attention_sinks_ptr = nullptr;
   if (attention_sinks.has_value()) {
     TVM_FFI_ICHECK_EQ(attention_sinks.value().dtype(), dl_float32)
@@ -457,8 +462,8 @@ void trtllm_ragged_attention(TensorView out, TensorView query, TensorView key, T
       attention_sinks_ptr, lse_ptr, q_data_type, kv_data_type, o_data_type, max_q_len, max_kv_len,
       num_qo_heads, num_kv_heads, head_dim_qk, head_dim_v, sum_seq_q, sum_seq_kv, bmm1_scale,
       bmm2_scale, o_sf_scale, batch_size, window_left, sm_count, enable_pdl, is_causal,
-      k_stride_keys_values, k_stride_heads, k_stride_batch, v_stride_keys_values, v_stride_heads,
-      v_stride_batch, workspace_size, stream);
+      is_custom_chunked_context, k_stride_keys_values, k_stride_heads, k_stride_batch,
+      v_stride_keys_values, v_stride_heads, v_stride_batch, workspace_size, stream);
 }
 
 namespace trtllm_cubin_loader {
