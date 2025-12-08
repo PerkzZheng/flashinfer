@@ -87,7 +87,7 @@ class ArtifactPath:
     When compiling new cubins for backend directories, update the corresponding path.
     """
 
-    TRTLLM_GEN_FMHA: str = "9f1b6ddaa1592a8339a82fcab7d27a57eff445fd/fmha/trtllm-gen/"
+    TRTLLM_GEN_FMHA: str = "68a7b091668413d2ffa92bf169785e5518989834/fmha/trtllm-gen/"
     TRTLLM_GEN_BMM: str = (
         "c108f5cc46420e11805467898186533fb48d6a6f/batched_gemm-0d28130-7b26988"
     )
@@ -107,7 +107,7 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "a5a60600a80076317703695f56bbef2f0a44075ef4e24d7b06ba67ff68bc9da2"
+        "3dbed642c68157a4165bcece53225a20d8e0c787a49ef5156773e5f6a8c27437"
     )
     TRTLLM_GEN_BMM: str = (
         "85a4516b7ab25b1a6495398ae934a00e30ccd6662b9ec27be1330d7bba5e1ddf"

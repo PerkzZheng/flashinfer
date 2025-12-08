@@ -115,6 +115,11 @@ struct KernelParams {
   int32_t mBatchSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
+  // The custom chunked context size.
+  int32_t mCustomChunkedContextSize;
+  // The factor to add to the maximum value to increase the probability
+  //   of skip correction during next iterations.
+  float mInflateMax;
   // The log of the Sage Attention block size for K.
   int32_t mLogNumEltsPerSageAttnBlkK;
   // The log of the Sage Attention block size for P.
@@ -706,6 +711,14 @@ struct KernelParams {
     } else {
       // Default 0 means that chunked attention is disabled.
       params.mChunkedAttentionSizeLog2 = 0;
+    }
+
+    // The custom chunked context size.
+    params.mCustomChunkedContextSize = options.mCustomChunkedContextSize;
+    if (isCustomChunkedContextMask(static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType))) {
+      FLASHINFER_CHECK(
+          options.mCustomChunkedContextSize > 0 && (options.mCustomChunkedContextSize % 128) == 0,
+          "Custom chunked context size must be greater than 0 and a multiple of 128");
     }
 
     // Compute the log of numTokensPerPage

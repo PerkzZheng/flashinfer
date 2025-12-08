@@ -35,7 +35,9 @@ enum class TrtllmGenAttentionMaskType {
   // Sliding window or chunked causal mask.
   SlidingOrChunkedCausal,
   // Custom mask.
-  Custom
+  Custom,
+  // Custom chunked context mask.
+  CustomChunkedContext,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -51,6 +53,7 @@ ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
 ATTENTION_MASK_TYPE_FUNCTION(Custom)
+ATTENTION_MASK_TYPE_FUNCTION(CustomChunkedContext)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
 
@@ -265,6 +268,8 @@ struct TllmGenFmhaRunnerParams {
   int mAttentionWindowSize;
   // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
   int mChunkedAttentionSize;
+  // The custom chunked context size.
+  int mCustomChunkedContextSize;
   // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
   int mSumOfSeqLensQ;
   int mSumOfSeqLensKv;
