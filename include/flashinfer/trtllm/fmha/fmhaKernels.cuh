@@ -352,7 +352,7 @@ class TllmGenFmhaKernel {
 
       // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
       int const maxNumCtasPerSeqKv =
-          (maxAttentionWindow + kernelMeta.mStepKv - 1) / kernelMeta.mStepKv;
+          (maxAttentionWindow + 512 - 1) / 512;
       // Compute numCtasPerSeqKv.
       numCtasPerSeqKv = std::min(
           maxNumCtasPerSeqKv,
@@ -495,9 +495,7 @@ class TllmGenFmhaKernel {
         }
       }
     } else if (isGenerationKernel(params.mKernelType)) {
-      kernelType = (params.mNumHeadsQPerKv <= 16 && params.mHeadDimQk != 32)
-                       ? FmhaKernelType::SwapsMmaAbForGeneration
-                       : FmhaKernelType::KeepsMmaAbForGeneration;
+      kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
     }
 
     // The maximum number of headsQPerKv that the kernel can support in one Cta.
