@@ -1078,9 +1078,16 @@ def reference_chunked_context_fmha(
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("head_grp_size", [1])
 @pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize(
+    "q_dtype,kv_dtype,o_dtype",
+    [
+        ("bf16", "bf16", "bf16"),
+        ("fp8", "fp8", "bf16"),
+        ("fp8", "fp8", "fp8"),
+    ],
+)
 def test_trtllm_gen_prefill_128(
-    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal, dtype
+    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal, q_dtype, kv_dtype, o_dtype
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
@@ -1088,6 +1095,7 @@ def test_trtllm_gen_prefill_128(
     if s_qo > s_kv:
         pytest.skip("s_qo > s_kv, skipping test as causal")
 
+    is_fp8 = q_dtype == "fp8"
     num_qo_heads = num_kv_heads * head_grp_size
     head_dim_qk = 128
     head_dim_vo = 128
@@ -1110,20 +1118,39 @@ def test_trtllm_gen_prefill_128(
     cumsum_s_qo = torch.sum(actual_seq_lens_q)
     cumsum_s_kv = torch.sum(actual_seq_lens_kv)
 
-    q = torch.randn(
+    # Generate tensors in bf16
+    q_bf16 = torch.randn(
         cumsum_s_qo, num_qo_heads, head_dim_qk, device=device, dtype=torch.bfloat16
     )
-
-    k_cache = torch.randn(
+    k_bf16 = torch.randn(
         (cumsum_s_kv, num_kv_heads, head_dim_qk),
         device=device,
         dtype=torch.bfloat16,
     )
-    v_cache = torch.randn(
+    v_bf16 = torch.randn(
         (cumsum_s_kv, num_kv_heads, head_dim_vo),
         device=device,
         dtype=torch.bfloat16,
     )
+
+    if is_fp8:
+        q, q_scale = to_float8(q_bf16)
+        k_cache, k_scale = to_float8(k_bf16)
+        v_cache, v_scale = to_float8(v_bf16)
+        # Reference uses bf16 with fake-quantization to avoid precision issues
+        ref_q = q.bfloat16() * q_scale
+        ref_k = k_cache.bfloat16() * k_scale
+        ref_v = v_cache.bfloat16() * v_scale
+    else:
+        k_scale = 1.0
+        q = q_bf16
+        q_scale = 1.0
+        k_cache = k_bf16
+        ref_k = k_bf16
+        ref_q = q_bf16
+        ref_v = v_bf16
+        v_cache = v_bf16
+        v_scale = 1.0
 
     # Initialize scale
     scale = float(1.0 / (head_dim_qk**0.5))
@@ -1137,8 +1164,6 @@ def test_trtllm_gen_prefill_128(
         ]
     ).int()
 
-    # kv_indptr = torch.arange(0, batch_size + 1, device="cuda", dtype=torch.int32) * s_kv
-
     # Create kv_indptr as cumulative sum of actual_seq_lens_kv
     kv_indptr = torch.cat(
         [
@@ -1151,12 +1176,20 @@ def test_trtllm_gen_prefill_128(
     ).int()
 
     output_ref = reference_chunked_context_fmha(
-        q, k_cache, v_cache, batch_size, scale, is_custom_chunked_context
+        ref_q, ref_k, ref_v, batch_size, scale, is_custom_chunked_context
     )
-    output = torch.empty_like(output_ref)
 
-    bmm1_scale = scale
-    bmm2_scale = 1.0
+    if o_dtype == "fp8":
+        o_scale = torch.rand(1).item() * 0.5 + 0.5
+        output = torch.empty(
+            output_ref.shape, device=device, dtype=torch.float8_e4m3fn
+        )
+    else:
+        o_scale = 1.0
+        output = torch.empty_like(output_ref)
+
+    bmm1_scale = float(q_scale * k_scale * scale)
+    bmm2_scale = float(v_scale / o_scale)
     output_trtllm = flashinfer.prefill.trtllm_ragged_attention(
         q,
         k_cache,
@@ -1178,11 +1211,19 @@ def test_trtllm_gen_prefill_128(
         False,
         out=output,
     )
+
+    if is_fp8 and o_dtype == "fp8":
+        rtol, atol = 5e-2, 7e-2
+    elif is_fp8:
+        rtol, atol = 4e-2, 6e-2
+    else:
+        rtol, atol = 1e-2, 1e-2
+
     torch.testing.assert_close(
-        output_trtllm,
-        output_ref,
-        atol=1e-2,
-        rtol=1e-2,
+        output_trtllm.float() * o_scale,
+        output_ref.float(),
+        atol=atol,
+        rtol=rtol,
     )
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
