@@ -1044,7 +1044,7 @@ def test_trtllm_gen_prefill_deepseek(
 
 # reference tests for custom chunked context (1920 Q, 1920 KV)
 def reference_chunked_context_fmha(
-    q, k, v, batch_size, sm_scale, is_custom_chunked_context
+    q, k, v, batch_size, sm_scale, is_custom_chunked_context, chunk_size
 ):
     # Assume fixed seqlen q and kv.
     sum_seqlen_q = q.size(0)
@@ -1061,9 +1061,11 @@ def reference_chunked_context_fmha(
     s = torch.einsum("bmhd,bnhd->bhmn", q, k)
     # create mask
     if is_custom_chunked_context:
+        assert seqlen_q % chunk_size == 0
+        assert seqlen_k % chunk_size == 0
         mask = torch.ones(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device)
         for q_idx in range(seqlen_q):
-            valid_seqlen = 1152 if q_idx < 1152 else seqlen_k
+            valid_seqlen = 3 * chunk_size if q_idx < 3 * chunk_size else 5 * chunk_size
             mask[q_idx, :valid_seqlen] = False
         s = s.masked_fill(mask, -float("inf"))
     s = s * sm_scale
@@ -1073,8 +1075,7 @@ def reference_chunked_context_fmha(
 
 
 @pytest.mark.parametrize("batch_size", [1, 2, 4, 8])
-@pytest.mark.parametrize("s_qo", [768, 1920])
-@pytest.mark.parametrize("s_kv", [1920])
+@pytest.mark.parametrize("s_qo_kv", [(768, 1920), (1920, 1920), (672, 1680), (1680, 1680)])
 @pytest.mark.parametrize("num_kv_heads", [1])
 @pytest.mark.parametrize("head_grp_size", [1])
 @pytest.mark.parametrize("causal", [False])
@@ -1087,9 +1088,10 @@ def reference_chunked_context_fmha(
     ],
 )
 def test_trtllm_gen_prefill_128(
-    batch_size, s_qo, s_kv, num_kv_heads, head_grp_size, causal, q_dtype, kv_dtype, o_dtype
+    batch_size, s_qo_kv, num_kv_heads, head_grp_size, causal, q_dtype, kv_dtype, o_dtype
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
+    s_qo, s_kv = s_qo_kv
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     if s_qo > s_kv:
@@ -1105,7 +1107,11 @@ def test_trtllm_gen_prefill_128(
     device = "cuda:0"
 
     # enable chunked context when s_qo = 1920
-    is_custom_chunked_context = s_qo == 1920
+    is_custom_chunked_context = s_qo == s_kv
+    chunk_size = 0
+    if is_custom_chunked_context:
+        assert s_qo % 5 == 0
+        chunk_size = s_qo // 5
 
     actual_seq_lens_q = torch.full(
         (batch_size,), s_qo, dtype=torch.int32, device=device
@@ -1176,7 +1182,7 @@ def test_trtllm_gen_prefill_128(
     ).int()
 
     output_ref = reference_chunked_context_fmha(
-        ref_q, ref_k, ref_v, batch_size, scale, is_custom_chunked_context
+        ref_q, ref_k, ref_v, batch_size, scale, is_custom_chunked_context, chunk_size
     )
 
     if o_dtype == "fp8":

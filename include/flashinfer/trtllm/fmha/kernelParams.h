@@ -111,6 +111,8 @@ struct KernelParams {
   int32_t mAttentionWindowSize;
   // The batch size
   int32_t mBatchSize;
+  // The custom chunk size for custom chunked context mask.
+  int32_t mCustomChunkSize;
   // The chunked attention size in log2.
   int32_t mChunkedAttentionSizeLog2;
   // The log of the Sage Attention block size for K.
@@ -671,6 +673,12 @@ struct KernelParams {
     params.mScaleSfO = options.mScaleSfO;
 
     params.mAttentionWindowSize = options.mAttentionWindowSize;
+    if (isCustomChunkedContextMask(options.mMaskType)) {
+      FLASHINFER_CHECK((options.mMaxSeqLenQ % 5) == 0, "mMaxSeqLenQ must be a multiple of 5");
+      params.mCustomChunkSize = options.mMaxSeqLenQ / 5;
+    } else {
+      params.mCustomChunkSize = -1;
+    }
     if (isSlidingOrChunkedCausalMask(
             static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType)) &&
         options.mChunkedAttentionSize != INT_MAX) {

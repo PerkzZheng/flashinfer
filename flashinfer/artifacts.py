@@ -120,7 +120,7 @@ class CheckSumHash:
     """
 
     TRTLLM_GEN_FMHA: str = (
-        "d7a9e2254618f9684671d2a8f96a18fc3e75e05bc6ae97e375dee0692ba6e0fc"
+        "2767e9c3a521baed5a368af089d1c27b233e0feb3ed802076308fc8b01cb3e61"
     )
     TRTLLM_GEN_BMM: str = (
         "8df2aae8f3aa39d64d2c723e775640beb4ac602a6cbb02e497c2a7316e349934"
