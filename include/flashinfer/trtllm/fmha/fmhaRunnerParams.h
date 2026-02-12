@@ -36,8 +36,10 @@ enum class TrtllmGenAttentionMaskType {
   SlidingOrChunkedCausal,
   // Custom mask.
   Custom,
-  // Custom chunked context mask.
-  CustomChunkedContext,
+  // Custom chunked context mask v0 (chunk size % 128 == 0)
+  CustomChunkedContextV0,
+  // Custom chunked context mask v1 (chunk size % 128 != 0)
+  CustomChunkedContextV1,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -53,7 +55,12 @@ ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
 ATTENTION_MASK_TYPE_FUNCTION(Custom)
-ATTENTION_MASK_TYPE_FUNCTION(CustomChunkedContext)
+ATTENTION_MASK_TYPE_FUNCTION(CustomChunkedContextV0)
+ATTENTION_MASK_TYPE_FUNCTION(CustomChunkedContextV1)
+
+inline bool isCustomChunkedContextMask(TrtllmGenAttentionMaskType maskType) {
+  return isCustomChunkedContextV0Mask(maskType) || isCustomChunkedContextV1Mask(maskType);
+}
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
 

@@ -380,8 +380,10 @@ void trtllm_ragged_attention_launcher(
 
   runner_params.mKernelType = FmhaKernelType::Context;
   runner_params.mTileScheduler = TileScheduler::Persistent;
-  if (is_custom_chunked_context) {
-    runner_params.mMaskType = TrtllmGenAttentionMaskType::CustomChunkedContext;
+  if (is_custom_chunked_context && (max_q_len % 128) == 0) {
+    runner_params.mMaskType = TrtllmGenAttentionMaskType::CustomChunkedContextV0;
+  } else if (is_custom_chunked_context && (max_q_len % 128) != 0) {
+    runner_params.mMaskType = TrtllmGenAttentionMaskType::CustomChunkedContextV1;
   } else if (is_causal) {
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
   } else {
