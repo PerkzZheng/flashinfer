@@ -704,11 +704,8 @@ class TllmGenFmhaKernel {
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
     }
 
-    // When maxSeqLenQ > 1, use an experimental kernel-timing model to select the best kernel that
-    // groups both tokensQ and headsQ into one CTA.
-    if (params.mMaxSeqLenQ > 1) {
-      selectTileSizeQForGqaGeneration(params, selectKernelParams);
-    }
+    // Use an experimental kernel-timing model to select the tileSizeQ with best performance.
+    selectTileSizeQForGqaGeneration(params, selectKernelParams);
   }
 
   // Select a kernel based on the heuristic.
