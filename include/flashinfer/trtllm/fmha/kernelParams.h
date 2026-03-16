@@ -203,6 +203,8 @@ struct KernelParams {
   int32_t mSparseMlaTopK;
   // The flag to use block sparse attention.
   bool mUseBlockSparseAttention;
+  // Whether the indices for K & V pages are shared as unified index (vLLM/FlashInfer).
+  bool mUsesSharedPagedKvIdx;
 
   // Create the TMA shape/stride for Q.
   template <class FmhaOptions>
@@ -500,15 +502,22 @@ struct KernelParams {
       kPtr = runnerParams.kPtr;
       vPtr = runnerParams.vPtr;
     }
-    // Set K and V pointer from contiguousQAnddKv tensor.
+    // Set K and V pointer from contiguousKv tensor.
     else if (isContiguousKv(runnerParams.mQkvLayout)) {
-      kPtr = runnerParams.kvPtr;
-      // The maximum headDim of K and V.
-      // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
-      int32_t const maxHeadDimKv{std::max(runnerParams.mHeadDimQk, runnerParams.mHeadDimV)};
-      vPtr = reinterpret_cast<void const*>(
-          reinterpret_cast<char const*>(runnerParams.kvPtr) +
-          runnerParams.mNumHeadsKv * runnerParams.mMaxSeqLenCacheKv * maxHeadDimKv * bytesPerElt);
+      if (runnerParams.kvPtr != nullptr) {
+        // Packed KV buffer: K then V, each [numHeadsKv, maxSeqLenCacheKv, maxHeadDimKv].
+        kPtr = runnerParams.kvPtr;
+        // The maximum headDim of K and V.
+        // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
+        int32_t const maxHeadDimKv{std::max(runnerParams.mHeadDimQk, runnerParams.mHeadDimV)};
+        vPtr = reinterpret_cast<void const*>(
+            reinterpret_cast<char const*>(runnerParams.kvPtr) +
+            runnerParams.mNumHeadsKv * runnerParams.mMaxSeqLenCacheKv * maxHeadDimKv * bytesPerElt);
+      } else {
+        // Separate K and V buffers (kPtr and vPtr are already set from runnerParams).
+        kPtr = runnerParams.kPtr;
+        vPtr = runnerParams.vPtr;
+      }
     }
 
     // Return the pointers.
@@ -813,6 +822,8 @@ struct KernelParams {
     params.mSparseMlaTopK = options.mSparseMlaTopK;
     // TODO: Integrate trtllm block-sparse attention kernels when needed.
     params.mUseBlockSparseAttention = false;
+    // FIXME: set this with options.mUsesSharedPagedKvIdx.
+    params.mUsesSharedPagedKvIdx = true;
     return params;
   }
 };

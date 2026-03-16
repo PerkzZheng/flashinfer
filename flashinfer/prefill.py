@@ -4256,3 +4256,230 @@ def trtllm_fmha_v2_prefill(
         return out, lse
     else:
         return out
+
+
+@flashinfer_api
+def trtllm_contiguous_kv_attention_decode(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    bmm1_scale: Union[float, torch.Tensor] = 1.0,
+    bmm2_scale: Union[float, torch.Tensor] = 1.0,
+    batch_size: Optional[int] = None,
+    window_left: int = -1,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+    attention_sinks: Optional[torch.Tensor] = None,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+) -> torch.Tensor:
+    """Run ContiguousKv decode (generation-phase) attention with trtllm-gen kernels.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Query tensor with shape ``[batch_size * q_len_per_req, num_qo_heads, head_dim]``
+        (flat token layout).  Typically ``q_len_per_req == 1`` for decode.
+    key_cache : torch.Tensor
+        Contiguous key cache with shape ``[batch_size, max_seq_len, num_kv_heads, head_dim]``
+        (BNHD layout).
+    value_cache : torch.Tensor
+        Contiguous value cache with shape ``[batch_size, max_seq_len, num_kv_heads, head_dim]``
+        (BNHD layout).
+    workspace_buffer : torch.Tensor
+        Pre-allocated workspace buffer (must be zero-initialised on first use).
+    seq_lens : torch.Tensor
+        Actual cached sequence length for each batch entry, shape ``[batch_size]``,
+        dtype ``torch.int32``.
+    max_q_len : int
+        Maximum query sequence length across requests.
+    max_kv_len : int
+        Maximum *actual* KV sequence length (``max(seq_lens)``).
+    bmm1_scale : Union[float, torch.Tensor]
+        Scale for the QK GEMM. Can be a ``float`` or a ``float32`` scalar tensor.
+    bmm2_scale : Union[float, torch.Tensor]
+        Scale for the AV GEMM. Can be a ``float`` or a ``float32`` scalar tensor.
+    batch_size : Optional[int]
+        Batch size.  Inferred from ``seq_lens`` when ``None``.
+    window_left : int
+        Sliding-window left boundary (inclusive). ``-1`` disables sliding window.
+    out : Optional[torch.Tensor]
+        Pre-allocated output tensor. Allocated automatically when ``None``.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch. Auto-detected when ``None``.
+    attention_sinks : Optional[torch.Tensor]
+        Per-head attention sink values for sink-attention support.
+    cum_seq_lens_q : Optional[torch.Tensor]
+        Cumulative query lengths ``[batch_size + 1]`` for variable-length queries.
+    skip_softmax_threshold_scale_factor : Optional[float]
+        Threshold for skip-softmax sparsity optimisation.
+
+    Returns
+    -------
+    out : torch.Tensor
+        Output tensor with shape ``[batch_size * q_len_per_req, num_qo_heads, head_dim]``.
+    """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
+    if batch_size is None:
+        batch_size = seq_lens.shape[0]
+
+    if out is None:
+        out = torch.empty_like(query)
+
+    run_func = get_trtllm_gen_fmha_module().trtllm_contiguous_kv_attention_decode
+    sm_count = get_device_sm_count(query.device)
+
+    if isinstance(bmm1_scale, torch.Tensor):
+        assert bmm1_scale.dtype == torch.float32
+        bmm1_scale = bmm1_scale * log2e
+    if isinstance(bmm2_scale, torch.Tensor):
+        assert bmm2_scale.dtype == torch.float32
+
+    run_func(
+        out,
+        None,  # out_scale_factor (fp4 not yet supported)
+        query,
+        key_cache,
+        value_cache,
+        workspace_buffer,
+        seq_lens.to(torch.int32),
+        max_q_len,
+        max_kv_len,
+        bmm1_scale,
+        bmm2_scale,
+        1.0,  # o_sf_scale
+        -1,  # o_sf_vec_size (-1 = unused)
+        0,  # o_sf_start_index
+        batch_size,
+        window_left,
+        sm_count,
+        enable_pdl,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
+        attention_sinks,
+        cum_seq_lens_q,
+        skip_softmax_threshold_scale_factor,
+    )
+    return out
+
+
+@flashinfer_api
+def trtllm_contiguous_kv_attention_context(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_q_len: int,
+    max_kv_len: int,
+    cum_seq_lens_q: torch.Tensor,
+    cum_seq_lens_kv: torch.Tensor,
+    bmm1_scale: Union[float, torch.Tensor] = 1.0,
+    bmm2_scale: Union[float, torch.Tensor] = 1.0,
+    batch_size: Optional[int] = None,
+    window_left: int = -1,
+    is_causal: bool = True,
+    out: Optional[torch.Tensor] = None,
+    enable_pdl: Optional[bool] = None,
+    attention_sinks: Optional[torch.Tensor] = None,
+    skip_softmax_threshold_scale_factor: Optional[float] = None,
+) -> torch.Tensor:
+    """Run ContiguousKv context (prefill-phase) attention with trtllm-gen kernels.
+
+    Parameters
+    ----------
+    query : torch.Tensor
+        Query tensor with shape ``[sum_seq_q, num_qo_heads, head_dim]``
+        (flat/ragged token layout across the batch).
+    key_cache : torch.Tensor
+        Contiguous key cache with shape ``[batch_size, max_seq_len, num_kv_heads, head_dim]``
+        (BNHD layout).
+    value_cache : torch.Tensor
+        Contiguous value cache with shape ``[batch_size, max_seq_len, num_kv_heads, head_dim]``
+        (BNHD layout).
+    workspace_buffer : torch.Tensor
+        Pre-allocated workspace buffer (must be zero-initialised on first use).
+    seq_lens : torch.Tensor
+        Actual cached KV sequence length for each batch entry, shape ``[batch_size]``,
+        dtype ``torch.int32``.
+    max_q_len : int
+        Maximum query sequence length across requests.
+    max_kv_len : int
+        Maximum *actual* KV sequence length (``max(seq_lens)``).
+    cum_seq_lens_q : torch.Tensor
+        Cumulative query sequence lengths, shape ``[batch_size + 1]``, dtype ``torch.int32``.
+    cum_seq_lens_kv : torch.Tensor
+        Cumulative KV sequence lengths, shape ``[batch_size + 1]``, dtype ``torch.int32``.
+    bmm1_scale : Union[float, torch.Tensor]
+        Scale for the QK GEMM. Can be a ``float`` or a ``float32`` scalar tensor.
+    bmm2_scale : Union[float, torch.Tensor]
+        Scale for the AV GEMM. Can be a ``float`` or a ``float32`` scalar tensor.
+    batch_size : Optional[int]
+        Batch size.  Inferred from ``seq_lens`` when ``None``.
+    window_left : int
+        Sliding-window left boundary (inclusive). ``-1`` disables sliding window.
+    is_causal : bool
+        Whether to apply a causal mask. Defaults to ``True``.
+    out : Optional[torch.Tensor]
+        Pre-allocated output tensor. Allocated automatically when ``None``.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch. Auto-detected when ``None``.
+    attention_sinks : Optional[torch.Tensor]
+        Per-head attention sink values for sink-attention support.
+    skip_softmax_threshold_scale_factor : Optional[float]
+        Threshold for skip-softmax sparsity optimisation.
+
+    Returns
+    -------
+    out : torch.Tensor
+        Output tensor with shape ``[sum_seq_q, num_qo_heads, head_dim]``.
+    """
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(query.device)
+    if batch_size is None:
+        batch_size = seq_lens.shape[0]
+
+    if out is None:
+        out_shape = (query.shape[0], query.shape[1], value_cache.shape[3])
+        out = torch.empty(out_shape, dtype=query.dtype, device=query.device)
+
+    run_func = get_trtllm_gen_fmha_module().trtllm_contiguous_kv_attention_context
+    sm_count = get_device_sm_count(query.device)
+
+    if isinstance(bmm1_scale, torch.Tensor):
+        assert bmm1_scale.dtype == torch.float32
+        bmm1_scale = bmm1_scale * log2e
+    if isinstance(bmm2_scale, torch.Tensor):
+        assert bmm2_scale.dtype == torch.float32
+
+    run_func(
+        out,
+        None,  # out_scale_factor (fp4 not yet supported)
+        query,
+        key_cache,
+        value_cache,
+        workspace_buffer,
+        seq_lens.to(torch.int32),
+        max_q_len,
+        max_kv_len,
+        bmm1_scale,
+        bmm2_scale,
+        1.0,  # o_sf_scale
+        -1,  # o_sf_vec_size (-1 = unused)
+        0,  # o_sf_start_index
+        batch_size,
+        window_left,
+        cum_seq_lens_q.to(torch.int32),
+        cum_seq_lens_kv.to(torch.int32),
+        is_causal,
+        sm_count,
+        enable_pdl,
+        workspace_buffer.numel() * workspace_buffer.element_size(),
+        attention_sinks,
+        skip_softmax_threshold_scale_factor,
+    )
+    return out

@@ -134,6 +134,10 @@ from .prefill import (
     single_prefill_with_kv_cache_return_lse as single_prefill_with_kv_cache_return_lse,
 )
 from .prefill import trtllm_fmha_v2_prefill as trtllm_fmha_v2_prefill
+from .prefill import (
+    trtllm_contiguous_kv_attention_decode as trtllm_contiguous_kv_attention_decode,
+    trtllm_contiguous_kv_attention_context as trtllm_contiguous_kv_attention_context,
+)
 from .quantization import packbits as packbits
 from .quantization import segment_packbits as segment_packbits
 from .rope import apply_llama31_rope as apply_llama31_rope
