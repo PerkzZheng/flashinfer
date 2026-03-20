@@ -176,7 +176,7 @@ struct TllmGenFmhaRunnerParams {
   // The tile scheduler.
   TileScheduler mTileScheduler;
   // The multiCtasKvMode (i.e. multiBlockMode).
-  bool mMultiCtasKvMode;
+  MultiCtasKvMode mMultiCtasKvMode;
 
   // Input QKV buffers.
   void const* qPtr;
@@ -375,8 +375,7 @@ struct TllmGenSelectKernelParams {
         mHeadDimPerCtaV(params.mHeadDimV)
         // Note the CgaSmemReduction will be enabled based on the heuristic.
         ,
-        mMultiCtasKvMode(params.mMultiCtasKvMode ? MultiCtasKvMode::GmemReduction
-                                                 : MultiCtasKvMode::Disabled),
+        mMultiCtasKvMode(params.mMultiCtasKvMode),
         mForceGmemReduction(false),
         mMaskType(params.mMaskType),
         mNumTokensPerPage(params.mNumTokensPerPage),

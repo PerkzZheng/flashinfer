@@ -160,7 +160,7 @@ void trtllm_paged_attention_launcher(
     runner_params.mMaskType = TrtllmGenAttentionMaskType::Causal;
     runner_params.mKernelType = FmhaKernelType::Context;
     runner_params.mTileScheduler = TileScheduler::Persistent;
-    runner_params.mMultiCtasKvMode = false;
+    runner_params.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
 
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
@@ -174,7 +174,8 @@ void trtllm_paged_attention_launcher(
     bool use_multi_block = true;
     runner_params.mTileScheduler =
         use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
-    runner_params.mMultiCtasKvMode = use_multi_block;
+    runner_params.mMultiCtasKvMode =
+        use_multi_block ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled;
 
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = nullptr;
@@ -674,8 +675,25 @@ void trtllm_contiguous_kv_attention_launcher(
     runner_params.mMaskType =
         is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
     runner_params.mKernelType = FmhaKernelType::Context;
-    runner_params.mTileScheduler = TileScheduler::Persistent;
-    runner_params.mMultiCtasKvMode = false;
+    // Heuristic: enable multiCtasKv (GmemReductionWithSeparateKernel) when the baseline number of
+    // CTAs (numInstsQ=2 → tileSizePerCtaQ=256) is small enough to underutilize the GPU.
+    // Each CTA covers 256 Q rows; total CTAs = ceil(max_q_len/256) * num_qo_heads * batch_size.
+    // When that fits within sm_count, we split the KV dimension across additional CTAs.
+    {
+      int32_t const numCtasQ =
+          (static_cast<int32_t>(max_q_len) + 255) / 256;
+      int32_t const numCtas = numCtasQ * static_cast<int32_t>(num_qo_heads) *
+                              static_cast<int32_t>(batch_size);
+      bool const useGmemReductionSeparateKernel =
+          (numCtas <= static_cast<int32_t>(sm_count));
+      if (useGmemReductionSeparateKernel) {
+        runner_params.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+        runner_params.mTileScheduler = TileScheduler::Static;
+      } else {
+        runner_params.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
+        runner_params.mTileScheduler = TileScheduler::Persistent;
+      }
+    }
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
 
@@ -695,7 +713,8 @@ void trtllm_contiguous_kv_attention_launcher(
     bool use_multi_block = true;
     runner_params.mTileScheduler =
         use_multi_block ? TileScheduler::Static : TileScheduler::Persistent;
-    runner_params.mMultiCtasKvMode = use_multi_block;
+    runner_params.mMultiCtasKvMode =
+        use_multi_block ? MultiCtasKvMode::GmemReduction : MultiCtasKvMode::Disabled;
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = nullptr;
 
