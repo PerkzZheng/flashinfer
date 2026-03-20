@@ -675,25 +675,10 @@ void trtllm_contiguous_kv_attention_launcher(
     runner_params.mMaskType =
         is_causal ? TrtllmGenAttentionMaskType::Causal : TrtllmGenAttentionMaskType::Dense;
     runner_params.mKernelType = FmhaKernelType::Context;
-    // Heuristic: enable multiCtasKv (GmemReductionWithSeparateKernel) when the baseline number of
-    // CTAs (numInstsQ=2 → tileSizePerCtaQ=256) is small enough to underutilize the GPU.
-    // Each CTA covers 256 Q rows; total CTAs = ceil(max_q_len/256) * num_qo_heads * batch_size.
-    // When that fits within sm_count, we split the KV dimension across additional CTAs.
-    {
-      int32_t const numCtasQ =
-          (static_cast<int32_t>(max_q_len) + 255) / 256;
-      int32_t const numCtas = numCtasQ * static_cast<int32_t>(num_qo_heads) *
-                              static_cast<int32_t>(batch_size);
-      bool const useGmemReductionSeparateKernel =
-          (numCtas <= static_cast<int32_t>(sm_count));
-      if (useGmemReductionSeparateKernel) {
-        runner_params.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
-        runner_params.mTileScheduler = TileScheduler::Static;
-      } else {
-        runner_params.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
-        runner_params.mTileScheduler = TileScheduler::Persistent;
-      }
-    }
+    // Always opt-in to GmemReductionWithSeparateKernel; fmhaKernels.cuh selectContextKernel will
+    // fall back to Disabled+Persistent when baseline CTAs already fill the GPU.
+    runner_params.mMultiCtasKvMode = MultiCtasKvMode::GmemReductionWithSeparateKernel;
+    runner_params.mTileScheduler = TileScheduler::Static;
     runner_params.cumSeqLensQPtr = cum_seq_lens_q;
     runner_params.cumSeqLensKvPtr = cum_seq_lens_kv;
 

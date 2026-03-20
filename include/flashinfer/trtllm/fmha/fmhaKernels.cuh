@@ -719,6 +719,24 @@ class TllmGenFmhaKernel {
     }
   }
 
+  // Select a heuristic for context kernels.
+  void selectContextKernel(RunnerParams const& params,
+                           SelectKernelParams& selectKernelParams) const {
+    // Heuristic: keep GmemReductionWithSeparateKernel only when the baseline CTA count
+    // (numInstsQ=2 → tileSizePerCtaQ=256) fits within sm_count so KV can be split across
+    // additional CTAs for better utilization. Otherwise fall back to Persistent.
+    if (isGmemReductionWithSeparateKernel(selectKernelParams.mMultiCtasKvMode)) {
+      int32_t const tileSizePerCtaQ = 256;  // numInstsQ=2 × tileSizeQ=128
+      int32_t const numCtasQ = flashinfer::ceil_div(params.mMaxSeqLenQ, tileSizePerCtaQ);
+      int32_t const numCtas = numCtasQ * params.mNumHeadsQ * params.mBatchSize;
+      if (numCtas > params.mMultiProcessorCount) {
+        // Enough baseline CTAs to fill the GPU — no need to split KV.
+        selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
+        selectKernelParams.mTileScheduler = TileScheduler::Persistent;
+      }
+    }
+  }
+
   // Select a kernel based on the heuristic.
   void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const {
     // Select the kernel based on the kernel type.
@@ -726,6 +744,8 @@ class TllmGenFmhaKernel {
       selectMlaGenerationKernel(params, selectKernelParams);
     } else if (isGenerationKernel(params.mKernelType)) {
       selectGqGenerationKernel(params, selectKernelParams);
+    } else if (isContextKernel(params.mKernelType)) {
+      selectContextKernel(params, selectKernelParams);
     }
 
     // Enable sliding window or chunked causal if the max kv sequence length exceeds attention
