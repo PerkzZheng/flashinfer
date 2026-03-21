@@ -680,7 +680,7 @@ class TllmGenFmhaKernel {
     // ContiguousKv + headDim=32: SwapsMmaAbForGeneration is not compiled for headDim=32 with
     // ContiguousKv, so always use KeepsMmaAbForGeneration. groupsTokensHeadsQ is not supported.
     if (isContiguousKv(params.mQkvLayout) && params.mHeadDimQk == 32) {
-      tileSizeQ = 64;
+      tileSizeQ = 128;
       kernelType = FmhaKernelType::KeepsMmaAbForGeneration;
       return;
     }
