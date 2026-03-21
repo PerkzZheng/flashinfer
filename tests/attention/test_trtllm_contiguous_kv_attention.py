@@ -322,3 +322,124 @@ def test_contiguous_kv_decode_with_history(dtype):
     )
     ref_flat = ref.flatten(0, 1)
     torch.testing.assert_close(out.float(), ref_flat.float(), rtol=1e-2, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# MultiCtasKv context: long seqLenKv triggers GmemReductionWithSeparateKernel
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_contiguous_kv_context_multi_ctas_kv(dtype):
+    """Context with large seqLenKv to exercise multiCtasKv (GmemReductionWithSeparateKernel)."""
+    B, S_q, H_q, H_kv, D = 1, 764, 4, 1, 128
+    cache_len = S_q
+    max_cache = 20000
+
+    torch.manual_seed(4)
+    q = torch.randn(B, S_q, H_q, D, dtype=dtype, device=DEVICE)
+    k_cache = torch.randn(B, max_cache, H_kv, D, dtype=dtype, device=DEVICE)
+    v_cache = torch.randn(B, max_cache, H_kv, D, dtype=dtype, device=DEVICE)
+    k_cache[:, :cache_len] = torch.randn(
+        B, cache_len, H_kv, D, dtype=dtype, device=DEVICE
+    )
+    v_cache[:, :cache_len] = torch.randn(
+        B, cache_len, H_kv, D, dtype=dtype, device=DEVICE
+    )
+
+    seq_lens = torch.tensor([cache_len], dtype=torch.int32, device=DEVICE)
+    cum_seq_lens_q = torch.tensor([0, S_q], dtype=torch.int32, device=DEVICE)
+    cum_seq_lens_kv = torch.tensor([0, cache_len], dtype=torch.int32, device=DEVICE)
+    workspace = make_workspace()
+    scale = sm_scale(D)
+
+    from flashinfer.prefill import trtllm_contiguous_kv_attention_context
+
+    q_flat = q.flatten(0, 1)
+    out = trtllm_contiguous_kv_attention_context(
+        query=q_flat,
+        key_cache=k_cache,
+        value_cache=v_cache,
+        workspace_buffer=workspace,
+        seq_lens=seq_lens,
+        max_q_len=S_q,
+        max_kv_len=cache_len,
+        cum_seq_lens_q=cum_seq_lens_q,
+        cum_seq_lens_kv=cum_seq_lens_kv,
+        bmm1_scale=scale,
+        bmm2_scale=1.0,
+        batch_size=B,
+        is_causal=True,
+    )
+    assert out.shape == q_flat.shape
+    assert not out.isnan().any()
+
+    ref = reference_attention(
+        q, k_cache[:, :cache_len], v_cache[:, :cache_len], scale=scale, is_causal=True
+    )
+    torch.testing.assert_close(
+        out.float(), ref.flatten(0, 1).float(), rtol=1e-2, atol=1e-2
+    )
+
+
+# ---------------------------------------------------------------------------
+# HeadDim=32 decode — ContiguousKv KeepsMmaAbForGeneration kernels support D=32
+# (Context + ContiguousKv only compiled for headDim=128)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    reason=(
+        "ContiguousKv headDim=32 cubins are not yet in the flashinfer cubin registry. "
+        "The kernels exist in trtllm-gen (KeepsMmaAbForGeneration) but must be published "
+        "to the cubin distribution before this test can pass."
+    ),
+    strict=True,
+)
+def test_contiguous_kv_decode_headdim32():
+    """Decode with headDim=32; KeepsMmaAbForGeneration ContiguousKv kernels support D=32."""
+    B, S_q, H_q, H_kv, D = 1, 1, 4, 4, 32
+    cache_len = 64
+    max_cache = 4096
+
+    torch.manual_seed(5)
+    dtype = torch.float16
+    q = torch.randn(B, S_q, H_q, D, dtype=dtype, device=DEVICE)
+    k_cache = torch.randn(B, max_cache, H_kv, D, dtype=dtype, device=DEVICE)
+    v_cache = torch.randn(B, max_cache, H_kv, D, dtype=dtype, device=DEVICE)
+    k_cache[:, :cache_len] = torch.randn(
+        B, cache_len, H_kv, D, dtype=dtype, device=DEVICE
+    )
+    v_cache[:, :cache_len] = torch.randn(
+        B, cache_len, H_kv, D, dtype=dtype, device=DEVICE
+    )
+
+    seq_lens = torch.tensor([cache_len], dtype=torch.int32, device=DEVICE)
+    workspace = make_workspace()
+    scale = sm_scale(D)
+
+    from flashinfer.prefill import trtllm_contiguous_kv_attention_decode
+
+    q_flat = q.flatten(0, 1)
+    out = trtllm_contiguous_kv_attention_decode(
+        query=q_flat,
+        key_cache=k_cache,
+        value_cache=v_cache,
+        workspace_buffer=workspace,
+        seq_lens=seq_lens,
+        max_q_len=S_q,
+        max_kv_len=cache_len,
+        bmm1_scale=scale,
+        bmm2_scale=1.0,
+        batch_size=B,
+    )
+    assert out.shape == q_flat.shape
+    assert not out.isnan().any()
+    assert not out.isinf().any()
+
+    ref = reference_attention(
+        q, k_cache[:, :cache_len], v_cache[:, :cache_len], scale=scale, is_causal=True
+    )
+    torch.testing.assert_close(
+        out.float(), ref.flatten(0, 1).float(), rtol=1e-2, atol=1e-2
+    )
