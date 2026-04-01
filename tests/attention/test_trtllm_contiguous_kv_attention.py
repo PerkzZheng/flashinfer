@@ -1,18 +1,19 @@
 """Tests for trtllm-gen ContiguousKv prefill/decode attention.
 
-Scenarios (all with batch_size=1, BNHD layout):
+Scenarios (all with batch_size=1, BNHD layout), parametrized over head_dim in [32, 64, 128]:
   Scenario 1 – causal=True
-    Decode:  q=[1,1,32,128],  k=v=[1,1,4,128],   cache=[1,28600,4,128]
-    Prefill: q=[1,72,32,128], k=v=[1,72,4,128],  cache=[1,28600,4,128]
+    Decode:  q=[1,1,32,D],  k=v=[1,cache_len,4,D]
+    Prefill: q=[1,72,32,D], k=v=[1,72,4,D]
 
   Scenario 2 – causal=False
-    Prefill: q=k=v=[1,764,4,128], cache=[1,315860,4,128]
+    Prefill: q=k=v=[1,764,4,D]
 """
 
 import math
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from flashinfer.utils import get_compute_capability
 
@@ -55,6 +56,9 @@ def reference_attention(
     KV tokens 0 .. past_kv_len + i.  For a fresh prefill S_kv == S_q so
     past_kv_len == 0 (standard causal).  For decode S_q == 1 and
     past_kv_len == S_kv - 1, allowing the query to see all cached tokens.
+
+    Uses scaled_dot_product_attention to avoid torch.bmm issues on some
+    CUDA/PyTorch version combinations.
     """
     B, S_q, H_q, D = q.shape
     S_kv = k.shape[1]
@@ -62,23 +66,27 @@ def reference_attention(
     groups = H_q // H_kv
     past_kv_len = S_kv - S_q
 
-    q_f = q.float()  # [B, S_q, H_q, D]
-    k_f = k.float().repeat_interleave(groups, dim=2)  # [B, S_kv, H_q, D]
-    v_f = v.float().repeat_interleave(groups, dim=2)
+    # Convert to [B, H, S, D] format required by SDPA.
+    q_f = q.float().permute(0, 2, 1, 3)  # [B, H_q, S_q, D]
+    k_f = k.float().repeat_interleave(groups, dim=2).permute(0, 2, 1, 3)  # [B, H_q, S_kv, D]
+    v_f = v.float().repeat_interleave(groups, dim=2).permute(0, 2, 1, 3)  # [B, H_q, S_kv, D]
 
-    # [B, H_q, S_q, S_kv]
-    scores = torch.einsum("bqhd,bkhd->bhqk", q_f, k_f) * scale
-
+    attn_mask = None
     if is_causal:
         # Query token i is at global position (past_kv_len + i).
-        # Causal rule: mask if k_pos > past_kv_len + q_i.
+        # Causal rule: mask (additive -inf) if k_pos > past_kv_len + q_i.
         q_positions = torch.arange(S_q, device=q.device) + past_kv_len  # [S_q]
         k_positions = torch.arange(S_kv, device=q.device)  # [S_kv]
-        causal_mask = k_positions[None, :] > q_positions[:, None]  # [S_q, S_kv]
-        scores.masked_fill_(causal_mask[None, None], float("-inf"))
+        mask = torch.where(
+            k_positions[None, :] > q_positions[:, None],
+            torch.full((), float("-inf"), device=q.device, dtype=torch.float32),
+            torch.zeros((), device=q.device, dtype=torch.float32),
+        )  # [S_q, S_kv]
+        attn_mask = mask[None, None, :, :]  # [1, 1, S_q, S_kv]
 
-    weights = torch.softmax(scores, dim=-1)
-    out = torch.einsum("bhqk,bkhd->bqhd", weights, v_f)  # [B, S_q, H_q, D]
+    out = F.scaled_dot_product_attention(q_f, k_f, v_f, attn_mask=attn_mask, scale=scale)
+    # [B, H_q, S_q, D] -> [B, S_q, H_q, D]
+    out = out.permute(0, 2, 1, 3)
     return out.to(q.dtype)
 
 
@@ -87,10 +95,11 @@ def reference_attention(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("head_dim", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_contiguous_kv_decode_scenario1(dtype):
-    """Scenario 1 decode: q=[1,1,32,128], cache=[1,28600,4,128], causal=True."""
-    B, S_q, H_q, H_kv, D = 1, 1, 32, 4, 128
+def test_contiguous_kv_decode_scenario1(dtype, head_dim):
+    """Scenario 1 decode: q=[1,1,32,D], cache=[1,100,4,D], causal=True."""
+    B, S_q, H_q, H_kv, D = 1, 1, 32, 4, head_dim
     cache_len = 100  # cached tokens already present
     max_cache = 315860
 
@@ -148,10 +157,11 @@ def test_contiguous_kv_decode_scenario1(dtype):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("head_dim", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_contiguous_kv_context_scenario1(dtype):
-    """Scenario 1 context: q=[1,72,32,128], cache=[1,28600,4,128], causal=True."""
-    B, S_q, H_q, H_kv, D = 1, 72, 32, 4, 128
+def test_contiguous_kv_context_scenario1(dtype, head_dim):
+    """Scenario 1 context: q=[1,72,32,D], cache=[1,72,4,D], causal=True."""
+    B, S_q, H_q, H_kv, D = 1, 72, 32, 4, head_dim
     cache_len = S_q  # fresh prefill: kv length equals query length
     max_cache = 28600
 
@@ -210,10 +220,11 @@ def test_contiguous_kv_context_scenario1(dtype):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("head_dim", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_contiguous_kv_context_scenario2_noncausal(dtype):
-    """Scenario 2 context: q=k=v=[1,764,4,128], cache=[1,315860,4,128], causal=False."""
-    B, S_q, H_q, H_kv, D = 1, 764, 4, 4, 128
+def test_contiguous_kv_context_scenario2_noncausal(dtype, head_dim):
+    """Scenario 2 context: q=k=v=[1,764,4,D], causal=False."""
+    B, S_q, H_q, H_kv, D = 1, 764, 4, 4, head_dim
     cache_len = S_q
     max_cache = 315860
 
@@ -272,10 +283,11 @@ def test_contiguous_kv_context_scenario2_noncausal(dtype):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("head_dim", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_contiguous_kv_decode_with_history(dtype):
+def test_contiguous_kv_decode_with_history(dtype, head_dim):
     """Decode where the cache already holds tokens from a prior prefill."""
-    B, S_q, H_q, H_kv, D = 1, 1, 32, 4, 128
+    B, S_q, H_q, H_kv, D = 1, 1, 32, 4, head_dim
     history_len = 72  # tokens from previous prefill
     max_cache = 28600
 
@@ -329,10 +341,11 @@ def test_contiguous_kv_decode_with_history(dtype):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("head_dim", [32, 64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_contiguous_kv_context_multi_ctas_kv(dtype):
+def test_contiguous_kv_context_multi_ctas_kv(dtype, head_dim):
     """Context with large seqLenKv to exercise multiCtasKv (GmemReductionWithSeparateKernel)."""
-    B, S_q, H_q, H_kv, D = 1, 764, 4, 1, 128
+    B, S_q, H_q, H_kv, D = 1, 764, 4, 1, head_dim
     cache_len = S_q
     max_cache = 20000
 
@@ -373,69 +386,6 @@ def test_contiguous_kv_context_multi_ctas_kv(dtype):
     )
     assert out.shape == q_flat.shape
     assert not out.isnan().any()
-
-    ref = reference_attention(
-        q, k_cache[:, :cache_len], v_cache[:, :cache_len], scale=scale, is_causal=True
-    )
-    torch.testing.assert_close(
-        out.float(), ref.flatten(0, 1).float(), rtol=1e-2, atol=1e-2
-    )
-
-
-# ---------------------------------------------------------------------------
-# HeadDim=32 decode — ContiguousKv KeepsMmaAbForGeneration kernels support D=32
-# (Context + ContiguousKv only compiled for headDim=128)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.xfail(
-    reason=(
-        "ContiguousKv headDim=32 cubins are not yet in the flashinfer cubin registry. "
-        "The kernels exist in trtllm-gen (KeepsMmaAbForGeneration) but must be published "
-        "to the cubin distribution before this test can pass."
-    ),
-    strict=True,
-)
-def test_contiguous_kv_decode_headdim32():
-    """Decode with headDim=32; KeepsMmaAbForGeneration ContiguousKv kernels support D=32."""
-    B, S_q, H_q, H_kv, D = 1, 1, 4, 4, 32
-    cache_len = 64
-    max_cache = 4096
-
-    torch.manual_seed(5)
-    dtype = torch.float16
-    q = torch.randn(B, S_q, H_q, D, dtype=dtype, device=DEVICE)
-    k_cache = torch.randn(B, max_cache, H_kv, D, dtype=dtype, device=DEVICE)
-    v_cache = torch.randn(B, max_cache, H_kv, D, dtype=dtype, device=DEVICE)
-    k_cache[:, :cache_len] = torch.randn(
-        B, cache_len, H_kv, D, dtype=dtype, device=DEVICE
-    )
-    v_cache[:, :cache_len] = torch.randn(
-        B, cache_len, H_kv, D, dtype=dtype, device=DEVICE
-    )
-
-    seq_lens = torch.tensor([cache_len], dtype=torch.int32, device=DEVICE)
-    workspace = make_workspace()
-    scale = sm_scale(D)
-
-    from flashinfer.prefill import trtllm_contiguous_kv_attention_decode
-
-    q_flat = q.flatten(0, 1)
-    out = trtllm_contiguous_kv_attention_decode(
-        query=q_flat,
-        key_cache=k_cache,
-        value_cache=v_cache,
-        workspace_buffer=workspace,
-        seq_lens=seq_lens,
-        max_q_len=S_q,
-        max_kv_len=cache_len,
-        bmm1_scale=scale,
-        bmm2_scale=1.0,
-        batch_size=B,
-    )
-    assert out.shape == q_flat.shape
-    assert not out.isnan().any()
-    assert not out.isinf().any()
 
     ref = reference_attention(
         q, k_cache[:, :cache_len], v_cache[:, :cache_len], scale=scale, is_causal=True
