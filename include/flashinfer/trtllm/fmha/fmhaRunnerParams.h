@@ -177,6 +177,8 @@ struct TllmGenFmhaRunnerParams {
   TileScheduler mTileScheduler;
   // The multiCtasKvMode (i.e. multiBlockMode).
   bool mMultiCtasKvMode;
+  // Whether V scale factors use TRT-LLM's 4-token interleaved physical layout.
+  bool mInterleaveSfV;
 
   // Input QKV buffers.
   void const* qPtr;
@@ -203,6 +205,8 @@ struct TllmGenFmhaRunnerParams {
   // The cumulative sequence length buffer for Q and K/V
   int const* cumSeqLensQPtr;
   int const* cumSeqLensKvPtr;
+  // The cumulative physical V-SF sequence lengths when V SF storage is padded independently.
+  int const* cumSeqLensSfVPtr;
   // The kv page idx
   int const* kvPageIdxPtr;
   bool useGmemScale;
@@ -251,10 +255,14 @@ struct TllmGenFmhaRunnerParams {
   // The stride between different batches for V.
   int vStrideBatch;
 
+  // The stride between different keys for K scaling factors.
+  int kSfStrideKeysValues;
   // The stride between different heads for K scaling factors.
   int kSfStrideHeads;
   // The stride between different batches for K scaling factors.
   int kSfStrideBatch;
+  // The stride between different values for V scaling factors.
+  int vSfStrideKeysValues;
   // The stride between different heads for V scaling factors.
   int vSfStrideHeads;
   // The stride between different batches for V scaling factors.
@@ -282,6 +290,7 @@ struct TllmGenFmhaRunnerParams {
   // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
   int mSumOfSeqLensQ;
   int mSumOfSeqLensKv;
+  int mSumOfSeqLensSfV;
   // The maximum number of pages per sequence in the paged-kv buffer.
   int mMaxNumPagesPerSeqKv;
   // The number of tokens per pageKv.

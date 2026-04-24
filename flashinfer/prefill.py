@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import itertools
 import logging
 import math
 from types import SimpleNamespace
@@ -3692,6 +3693,9 @@ def trtllm_ragged_attention_deepseek(
     skip_softmax_threshold_scale_factor: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    is_generation: bool = False,
+    use_multi_block: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -3742,6 +3746,15 @@ def trtllm_ragged_attention_deepseek(
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+    kv_cache_sf : Optional[Tuple[torch.Tensor, torch.Tensor]]
+        Required for NVFP4 separate-QKV. K scales use linear shape
+        ``[sum_seq_kv, num_kv_heads, head_dim // 16]``. V scales may use the same
+        logical linear shape and will be converted to TRT-LLM's per-sequence padded
+        4-token interleaved physical layout. Each sequence is padded independently to a
+        multiple of 4 in V SF storage while logical ``seq_lens`` remain unchanged. V scales
+        may also be passed in already padded linear shape
+        ``[sum_seq_sfs_v, num_kv_heads, head_dim // 16]`` or already interleaved with shape
+        ``[sum_seq_sfs_v // 4, num_kv_heads, (head_dim // 16) * 4]``.
 
     Returns
     -------
@@ -3754,38 +3767,82 @@ def trtllm_ragged_attention_deepseek(
     is_smaller_dimensions = (
         query.shape[2] == 128 and key.shape[2] == 128 and value.shape[2] == 128
     )
-    assert is_dsr1 or is_smaller_dimensions, (
-        "currently only support deepseek r1 192 query and 128 value or smaller dimensions 128 query and 128 value"
+    is_fp4_kv = key.dtype == torch.uint8 and value.dtype == torch.uint8
+    logical_head_dim_k = key.shape[2] * 2 if is_fp4_kv else key.shape[2]
+    logical_head_dim_v = value.shape[2] * 2 if is_fp4_kv else value.shape[2]
+    is_head_dim_256 = (
+        query.shape[2] == 256
+        and logical_head_dim_k == 256
+        and logical_head_dim_v == 256
+    )
+    assert is_dsr1 or is_smaller_dimensions or is_head_dim_256, (
+        "currently only support deepseek r1 192 query and 128 value, smaller dimensions 128 query and 128 value, or headDim 256"
     )
 
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
 
+    key_block_scales = None
+    value_block_scales = None
+    cum_seq_lens_sfs_v = None
+    if is_fp4_kv:
+        if (
+            kv_cache_sf is None
+            or not isinstance(kv_cache_sf, (tuple, list))
+            or len(kv_cache_sf) != 2
+            or not all(torch.is_tensor(x) for x in kv_cache_sf)
+        ):
+            raise ValueError(
+                "kv_cache_sf=(k_scales, v_scales) is required for NVFP4 KV."
+            )
+        key_block_scales, value_block_scales = kv_cache_sf
+        if (
+            key_block_scales.dtype != torch.float8_e4m3fn
+            or value_block_scales.dtype != torch.float8_e4m3fn
+        ):
+            raise ValueError("NVFP4 KV scale tensors must use torch.float8_e4m3fn.")
+        if is_head_dim_256:
+            value_block_scales, cum_seq_lens_sfs_v = (
+                _prepare_trtllm_gen_separate_v_scales(
+                    value_block_scales,
+                    seq_lens,
+                    key.shape[0],
+                    key.shape[1],
+                    logical_head_dim_v,
+                )
+            )
+
     run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
     sm_count = get_device_sm_count(query.device)
     if out is None:
         # FP8 inputs produce bfloat16 output by default (TRT-LLM kernels
-        # do not support FP8 output for ragged attention)
-        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        # do not support FP8 output for existing ragged attention paths). NVFP4 KV headDim256
+        # kernels are exported as E4M3 output, so keep query dtype for that path.
+        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not is_fp4_kv:
             out_dtype = torch.bfloat16
         else:
             out_dtype = query.dtype
         out = torch.empty(
             query.shape[0],
             query.shape[1],
-            value.shape[2],
+            logical_head_dim_v,
             device=query.device,
             dtype=out_dtype,
         )
     else:
-        expected_shape = (query.shape[0], query.shape[1], value.shape[2])
+        expected_shape = (query.shape[0], query.shape[1], logical_head_dim_v)
         if tuple(out.shape) != expected_shape:
             raise ValueError(
                 f"out must have shape {expected_shape}, got {tuple(out.shape)}"
             )
-        if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and out.dtype in (
-            torch.float8_e4m3fn,
-            torch.float8_e5m2,
+        if (
+            query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+            and out.dtype
+            in (
+                torch.float8_e4m3fn,
+                torch.float8_e5m2,
+            )
+            and not is_fp4_kv
         ):
             raise ValueError(
                 "FP8 output is not supported for trtllm_ragged_attention_deepseek; "
@@ -3822,6 +3879,7 @@ def trtllm_ragged_attention_deepseek(
         window_left,
         cum_seq_lens_q,
         cum_seq_lens_kv,
+        cum_seq_lens_sfs_v,
         sm_count,
         enable_pdl,
         is_causal,
@@ -3829,6 +3887,10 @@ def trtllm_ragged_attention_deepseek(
         attention_sinks,
         skip_softmax_threshold_scale_factor,
         lse,
+        key_block_scales,
+        value_block_scales,
+        is_generation,
+        use_multi_block,
     )
     if return_lse:
         assert lse is not None, (
@@ -3837,6 +3899,75 @@ def trtllm_ragged_attention_deepseek(
         return out, lse
     else:
         return out
+
+
+def _prepare_trtllm_gen_separate_v_scales(
+    value_block_scales: torch.Tensor,
+    seq_lens: torch.Tensor,
+    num_tokens: int,
+    num_kv_heads: int,
+    logical_head_dim_v: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if seq_lens.ndim != 1:
+        raise ValueError(
+            f"seq_lens must be a 1D tensor, got shape {tuple(seq_lens.shape)}"
+        )
+    if seq_lens.numel() == 0:
+        raise ValueError("seq_lens must not be empty")
+    seq_lens_list = [
+        int(x) for x in seq_lens.to(dtype=torch.int64, device="cpu").tolist()
+    ]
+    if sum(seq_lens_list) != num_tokens:
+        raise ValueError(
+            "seq_lens must sum to the flattened KV token count, got "
+            f"{sum(seq_lens_list)} and {num_tokens}."
+        )
+    padded_seq_lens = [((seq_len + 3) // 4) * 4 for seq_len in seq_lens_list]
+    sum_seq_sfs_v = sum(padded_seq_lens)
+    cum_seq_lens_sfs_v = torch.tensor(
+        [0, *itertools.accumulate(padded_seq_lens)],
+        dtype=torch.int32,
+        device=value_block_scales.device,
+    )
+    sf_dim = logical_head_dim_v // 16
+    logical_linear_shape = (num_tokens, num_kv_heads, sf_dim)
+    padded_linear_shape = (sum_seq_sfs_v, num_kv_heads, sf_dim)
+    interleaved_shape = (sum_seq_sfs_v // 4, num_kv_heads, sf_dim * 4)
+    if tuple(value_block_scales.shape) == interleaved_shape:
+        return value_block_scales.contiguous(), cum_seq_lens_sfs_v
+    if tuple(value_block_scales.shape) not in (
+        logical_linear_shape,
+        padded_linear_shape,
+    ):
+        raise ValueError(
+            "NVFP4 separate-QKV V scales must have shape "
+            f"{logical_linear_shape} before padding, {padded_linear_shape} after padding, "
+            f"or {interleaved_shape} after interleaving, "
+            f"got {tuple(value_block_scales.shape)}."
+        )
+    if tuple(value_block_scales.shape) == logical_linear_shape:
+        padded_linear = torch.zeros(
+            padded_linear_shape,
+            dtype=value_block_scales.dtype,
+            device=value_block_scales.device,
+        )
+        src_start = 0
+        dst_start = 0
+        for seq_len, padded_seq_len in zip(seq_lens_list, padded_seq_lens, strict=True):
+            padded_linear[dst_start : dst_start + seq_len] = value_block_scales[
+                src_start : src_start + seq_len
+            ]
+            src_start += seq_len
+            dst_start += padded_seq_len
+    else:
+        padded_linear = value_block_scales
+    return (
+        padded_linear.reshape(sum_seq_sfs_v // 4, 4, num_kv_heads, sf_dim)
+        .permute(0, 2, 3, 1)
+        .reshape(interleaved_shape)
+        .contiguous(),
+        cum_seq_lens_sfs_v,
+    )
 
 
 @flashinfer_api

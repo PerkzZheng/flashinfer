@@ -47,6 +47,7 @@ from .prefill import (
     get_batch_prefill_jit_module,
     get_batch_prefill_module,
     get_single_prefill_module,
+    trtllm_ragged_attention_deepseek,
 )
 from .utils import (
     log2e,
@@ -2232,12 +2233,133 @@ def get_trtllm_gen_decode_module(*args):
     )
 
 
+def _trtllm_batch_decode_with_separate_qkv(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    bmm1_scale: Union[float, torch.Tensor],
+    bmm2_scale: Union[float, torch.Tensor],
+    window_left: int,
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[Union[torch.dtype, str]],
+    o_sf_scale: Optional[float],
+    sinks: Optional[List[torch.Tensor]],
+    enable_pdl: Optional[bool],
+    q_len_per_req: Optional[int],
+    max_q_len: Optional[int],
+    cum_seq_lens_q: Optional[torch.Tensor],
+    skip_softmax_threshold_scale_factor: Optional[float],
+    kv_cache_sf: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    uses_shared_paged_kv_idx: bool,
+) -> torch.Tensor:
+    if not uses_shared_paged_kv_idx:
+        raise ValueError(
+            "Separate-QKV decode input does not use paged KV indices; "
+            "uses_shared_paged_kv_idx must be True."
+        )
+    if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
+        raise ValueError("Separate-QKV decode input does not support nvfp4 output.")
+    if isinstance(out, FP4Tensor):
+        raise ValueError("Separate-QKV decode input does not support FP4Tensor output.")
+
+    seq_lens = seq_lens.to(device=query.device, dtype=torch.int32)
+    if seq_lens.ndim != 1:
+        raise ValueError("seq_lens must be a 1D tensor for separate-QKV decode input.")
+
+    if q_len_per_req is not None:
+        if max_q_len is not None or cum_seq_lens_q is not None:
+            raise ValueError(
+                "Specify either q_len_per_req or (max_q_len, cum_seq_lens_q), not both."
+            )
+        max_q_len = q_len_per_req
+        if query.size(0) % q_len_per_req != 0:
+            raise ValueError(
+                "query.size(0) must be divisible by q_len_per_req for separate-QKV decode input."
+            )
+        batch_size = query.size(0) // q_len_per_req
+        cum_seq_lens_q = torch.arange(
+            0,
+            (batch_size + 1) * q_len_per_req,
+            q_len_per_req,
+            dtype=torch.int32,
+            device=query.device,
+        )
+    else:
+        if max_q_len is None or cum_seq_lens_q is None:
+            raise ValueError(
+                "Separate-QKV decode input requires q_len_per_req or both max_q_len and cum_seq_lens_q."
+            )
+        cum_seq_lens_q = cum_seq_lens_q.to(device=query.device, dtype=torch.int32)
+        batch_size = cum_seq_lens_q.size(0) - 1
+
+    if seq_lens.numel() != batch_size:
+        raise ValueError(
+            f"seq_lens must have shape [{batch_size}] for separate-QKV decode input, "
+            f"got {tuple(seq_lens.shape)}."
+        )
+    if int(seq_lens.to(dtype=torch.int64).sum().item()) != k_cache.size(0):
+        raise ValueError(
+            "seq_lens must sum to the flattened KV token count for separate-QKV decode input."
+        )
+    if max_seq_len < int(seq_lens.max().item()):
+        raise ValueError(
+            "max_seq_len must be at least max(seq_lens) for separate-QKV decode input."
+        )
+
+    if out is None and out_dtype is not None:
+        out_dtype = canonicalize_torch_dtype(out_dtype)
+        out = torch.empty(
+            query.shape[0],
+            query.shape[1],
+            v_cache.shape[2] * 2 if v_cache.dtype == torch.uint8 else v_cache.shape[2],
+            dtype=out_dtype,
+            device=query.device,
+        )
+
+    cum_seq_lens_kv = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=query.device),
+            torch.cumsum(seq_lens, dim=0, dtype=torch.int32),
+        ]
+    )
+    is_generation = max_q_len == 1
+    use_multi_block = is_generation and max_seq_len > 2048
+    return trtllm_ragged_attention_deepseek(
+        query=query,
+        key=k_cache,
+        value=v_cache,
+        workspace_buffer=workspace_buffer,
+        seq_lens=seq_lens,
+        max_q_len=max_q_len,
+        max_kv_len=max_seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        o_sf_scale=o_sf_scale or -1.0,
+        batch_size=batch_size,
+        window_left=window_left,
+        cum_seq_lens_q=cum_seq_lens_q,
+        cum_seq_lens_kv=cum_seq_lens_kv,
+        enable_pdl=enable_pdl,
+        is_causal=True,
+        return_lse=False,
+        attention_sinks=sinks,
+        skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        out=out,
+        kv_cache_sf=kv_cache_sf,
+        is_generation=is_generation,
+        use_multi_block=use_multi_block,
+    )
+
+
 @flashinfer_api
 def trtllm_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
     workspace_buffer: torch.Tensor,
-    block_tables: torch.Tensor,
+    block_tables: Optional[torch.Tensor],
     seq_lens: torch.Tensor,
     max_seq_len: int,
     bmm1_scale: Union[float, torch.Tensor] = 1.0,
@@ -2272,6 +2394,9 @@ def trtllm_batch_decode_with_kv_cache(
         If kv_cache is a tuple of two tensors, it should be a tuple of two tensors with shape [num_pages, num_kv_heads, page_size, head_dim] if :attr:`kv_layout` is ``HND``,
         or [num_pages, page_size, num_kv_heads, head_dim] if :attr:`kv_layout` is ``NHD``.
         The first tensor is the key cache, and the second tensor is the value cache.
+        For trtllm-gen only, this API also accepts separate-QKV decode input as
+        ``kv_cache=(k, v)`` with ``k`` and ``v`` shaped ``[sum_seq_kv, num_kv_heads, head_dim]``.
+        In that mode the API routes into the separate-QKV decode kernels instead of the paged-KV kernels.
 
         **Contiguity requirements (trtllm-gen backend):**
 
@@ -2281,11 +2406,13 @@ def trtllm_batch_decode_with_kv_cache(
     workspace_buffer : torch.Tensor. Must be initialized to 0 for its first use.
         workspace
 
-    block_tables : torch.Tensor
+    block_tables : Optional[torch.Tensor]
         Page table of kv cache.
         When ``uses_shared_paged_kv_idx`` is True (default): shape ``[batch_size, max_num_pages_per_seq]``.
         When ``uses_shared_paged_kv_idx`` is False: shape ``[batch_size, 2, max_num_pages_per_seq]``
         where dim 1 distinguishes K (0) and V (1) page indices.
+        This argument is ignored for separate-QKV decode input ``kv_cache=(k, v)`` with
+        ``k`` and ``v`` shaped ``[sum_seq_kv, num_kv_heads, head_dim]``.
 
     seq_lens : torch.Tensor
         A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``
@@ -2365,6 +2492,14 @@ def trtllm_batch_decode_with_kv_cache(
         Per-block scale factors for NVFP4 KV cache, as a tuple of ``(k_scales, v_scales)``.
         Each scale tensor has shape ``[num_pages, num_kv_heads, page_size, head_dim // 16]``
         in HND layout, with dtype ``torch.float8_e4m3fn``.
+        For paged NVFP4 decode, ``v_scales`` use the page-local TRT-LLM swizzled layout produced
+        by :func:`flashinfer.fp4_quantization.nvfp4_quantize_paged_kv_cache`. This path does not
+        use ``cum_seq_lens_sfs_v``. The per-sequence padded V-SF prefix domain and
+        ``cum_seq_lens_sfs_v`` are only used by the separate-QKV ragged path
+        ``flashinfer.prefill.trtllm_ragged_attention_deepseek(..., is_generation=True)``.
+        When this decode API is used with separate-QKV input, it reuses that same separate-QKV path.
+        In that case K scales use linear shape ``[sum_seq_kv, num_kv_heads, head_dim // 16]`` and
+        V scales may be logical linear, padded linear, or already interleaved.
 
         **Contiguity requirements (trtllm-gen backend):**
 
@@ -2398,6 +2533,14 @@ def trtllm_batch_decode_with_kv_cache(
             # NOTE(Zihao): unbind transforms [num_pages, 2, ...] to ([num_pages, ...], [num_pages, ...])
             # it doesn't change underlying storage
             k_cache, v_cache = kv_cache.unbind(dim=1)
+    is_separate_qkv_decode = k_cache.ndim == 3 and v_cache.ndim == 3
+    if is_separate_qkv_decode:
+        if k_cache.shape != v_cache.shape:
+            raise ValueError(
+                "Separate-QKV decode expects key and value tensors to have the same shape."
+            )
+        if backend == "xqa":
+            raise ValueError("xqa backend does not support separate-QKV decode input")
 
     if (
         k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
@@ -2432,6 +2575,8 @@ def trtllm_batch_decode_with_kv_cache(
         )
 
     if backend == "xqa":
+        if is_separate_qkv_decode:
+            raise ValueError("xqa backend does not support separate-QKV decode input")
         # xqa backend doesn't support nvfp4 output
         if out_dtype == "nvfp4" or (out_dtype is None and isinstance(out, FP4Tensor)):
             raise ValueError("xqa backend does not support nvfp4 output")
@@ -2449,6 +2594,8 @@ def trtllm_batch_decode_with_kv_cache(
             out_dtype = out.dtype if out is not None else query.dtype
         if out is None:
             out = torch.empty_like(query, dtype=out_dtype)
+        if block_tables is None:
+            raise ValueError("block_tables must be provided for paged KV decode input.")
 
         # Call xqa_batch_decode_with_kv_cache
         return xqa_batch_decode_with_kv_cache(
@@ -2471,6 +2618,29 @@ def trtllm_batch_decode_with_kv_cache(
             mask=mask,
         )
     elif backend == "trtllm-gen":
+        if is_separate_qkv_decode:
+            return _trtllm_batch_decode_with_separate_qkv(
+                query=query,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                workspace_buffer=workspace_buffer,
+                seq_lens=seq_lens,
+                max_seq_len=max_seq_len,
+                bmm1_scale=bmm1_scale,
+                bmm2_scale=bmm2_scale,
+                window_left=window_left,
+                out=out,
+                out_dtype=out_dtype,
+                o_sf_scale=o_sf_scale,
+                sinks=sinks,
+                enable_pdl=enable_pdl,
+                q_len_per_req=q_len_per_req,
+                max_q_len=max_q_len,
+                cum_seq_lens_q=cum_seq_lens_q,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                kv_cache_sf=kv_cache_sf,
+                uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+            )
         # Convert NHD layout to HND if necessary
         if kv_layout == "NHD":
             k_cache = k_cache.transpose(-3, -2)
@@ -2576,6 +2746,8 @@ def trtllm_batch_decode_with_kv_cache(
             assert max_q_len is not None
             batch_size = cum_seq_lens_q.size(0) - 1
 
+        if block_tables is None:
+            raise ValueError("block_tables must be provided for paged KV decode input.")
         _check_block_tables_shape(block_tables, uses_shared_paged_kv_idx)
 
         run_func(

@@ -1,3 +1,4 @@
+import itertools
 import math
 from typing import Union
 
@@ -16,7 +17,12 @@ from tests.test_helpers.utils_fp4 import (
 from tests.test_helpers.test_helpers import assert_close_with_mismatch_tolerance
 import einops
 from tests.test_helpers.sink_attention_reference import sink_attention_unified
-from flashinfer.fp4_quantization import nvfp4_quantize_paged_kv_cache
+from flashinfer.fp4_quantization import (
+    nvfp4_kv_dequantize,
+    nvfp4_quantize,
+    nvfp4_quantize_paged_kv_cache,
+)
+from flashinfer.tllm_enums import SfLayout
 
 import flashinfer
 from flashinfer.utils import FP4Tensor, ceil_div, round_up, get_compute_capability
@@ -198,6 +204,106 @@ def create_kv_cache(
         kv_cache = torch.stack([k_cache, v_cache], dim=1)
 
     return kv_cache, k_scale, v_scale, ref_kv_cache, kv_cache_sf
+
+
+def quantize_separate_nvfp4_kv(k_cache: torch.Tensor, v_cache: torch.Tensor):
+    """Quantize separate-QKV K/V tensors with linear SF layout [tokens, heads, head_dim / 16]."""
+
+    def quantize_one(x: torch.Tensor):
+        float8_max = 448.0
+        global_sf = torch.tensor(
+            [float8_max / max(x.float().abs().amax().item(), 1e-12)],
+            dtype=torch.float32,
+            device=x.device,
+        )
+        tokens, heads, head_dim = x.shape
+        packed, sf = nvfp4_quantize(
+            x.reshape(tokens * heads, head_dim),
+            global_sf,
+            sfLayout=SfLayout.layout_linear,
+        )
+        packed = packed.view(torch.uint8).reshape(tokens, heads, head_dim // 2)
+        sf = sf.view(torch.float8_e4m3fn).reshape(tokens, heads, head_dim // 16)
+        return packed, sf, 1.0 / global_sf.item()
+
+    k_fp4, k_sf, k_scale = quantize_one(k_cache)
+    v_fp4, v_sf, v_scale = quantize_one(v_cache)
+    return k_fp4, v_fp4, k_sf, v_sf, k_scale, v_scale
+
+
+def dequantize_separate_nvfp4_kv(
+    fp4_data: torch.Tensor,
+    block_scales: torch.Tensor,
+    global_scale: float,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    tokens, heads, packed_head_dim = fp4_data.shape
+    logical_head_dim = packed_head_dim * 2
+    output = nvfp4_kv_dequantize(
+        fp4_data.reshape(tokens * heads, packed_head_dim),
+        block_scales.reshape(tokens * heads, logical_head_dim // 16).view(torch.uint8),
+        torch.tensor([global_scale], dtype=torch.float32, device=fp4_data.device),
+        output_dtype=output_dtype,
+    )
+    return output.reshape(tokens, heads, logical_head_dim)
+
+
+def make_cum_seq_lens_sfs_v(seq_lens: torch.Tensor) -> torch.Tensor:
+    padded_seq_lens = [((int(seq_len) + 3) // 4) * 4 for seq_len in seq_lens.tolist()]
+    return torch.tensor(
+        [0, *itertools.accumulate(padded_seq_lens)],
+        dtype=torch.int32,
+        device=seq_lens.device,
+    )
+
+
+def pad_separate_v_scales_linear(
+    value_block_scales: torch.Tensor, seq_lens: torch.Tensor
+) -> torch.Tensor:
+    seq_lens_list = [int(seq_len) for seq_len in seq_lens.tolist()]
+    padded_seq_lens = [((seq_len + 3) // 4) * 4 for seq_len in seq_lens_list]
+    sum_seq_sfs_v = sum(padded_seq_lens)
+    padded_linear = torch.zeros(
+        (sum_seq_sfs_v, *value_block_scales.shape[1:]),
+        dtype=value_block_scales.dtype,
+        device=value_block_scales.device,
+    )
+    src_start = 0
+    dst_start = 0
+    for seq_len, padded_seq_len in zip(seq_lens_list, padded_seq_lens, strict=True):
+        padded_linear[dst_start : dst_start + seq_len] = value_block_scales[
+            src_start : src_start + seq_len
+        ]
+        src_start += seq_len
+        dst_start += padded_seq_len
+    return padded_linear
+
+
+def interleave_separate_v_scales(
+    padded_value_block_scales: torch.Tensor,
+) -> torch.Tensor:
+    sum_seq_sfs_v, num_kv_heads, sf_dim = padded_value_block_scales.shape
+    assert sum_seq_sfs_v % 4 == 0
+    return (
+        padded_value_block_scales.reshape(sum_seq_sfs_v // 4, 4, num_kv_heads, sf_dim)
+        .permute(0, 2, 3, 1)
+        .reshape(sum_seq_sfs_v // 4, num_kv_heads, sf_dim * 4)
+        .contiguous()
+    )
+
+
+def convert_separate_v_scales_layout(
+    value_block_scales: torch.Tensor,
+    seq_lens: torch.Tensor,
+    layout: str,
+) -> torch.Tensor:
+    if layout == "logical_linear":
+        return value_block_scales
+    padded_linear = pad_separate_v_scales_linear(value_block_scales, seq_lens)
+    if layout == "padded_linear":
+        return padded_linear
+    assert layout == "interleaved"
+    return interleave_separate_v_scales(padded_linear)
 
 
 def create_page_table(batch_size: int, seq_lens: torch.Tensor, page_size: int):
@@ -576,6 +682,79 @@ def sdpa_paged_reference(
         outputs.append(
             out_b.transpose(0, 1).to(ref_q.dtype)
         )  # [q_len, num_qo_heads, head_dim]
+
+    return torch.cat(outputs, dim=0)
+
+
+def sdpa_ragged_reference(
+    ref_q: torch.Tensor,
+    ref_k: torch.Tensor,
+    ref_v: torch.Tensor,
+    q_lens: torch.Tensor,
+    kv_lens: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    causal: bool,
+    window_left: int = -1,
+):
+    sm_scale = 1.0 / (head_dim**0.5)
+    batch_size = q_lens.shape[0]
+    q_indptr = torch.cat(
+        [
+            torch.zeros(1, dtype=q_lens.dtype, device=q_lens.device),
+            torch.cumsum(q_lens, dim=0),
+        ]
+    )
+    kv_indptr = torch.cat(
+        [
+            torch.zeros(1, dtype=kv_lens.dtype, device=kv_lens.device),
+            torch.cumsum(kv_lens, dim=0),
+        ]
+    )
+    outputs = []
+    head_grp = num_qo_heads // num_kv_heads
+    for b in range(batch_size):
+        q_start, q_end = q_indptr[b].item(), q_indptr[b + 1].item()
+        kv_start, kv_end = kv_indptr[b].item(), kv_indptr[b + 1].item()
+        q_b = ref_q[q_start:q_end]
+        k_b = ref_k[kv_start:kv_end]
+        v_b = ref_v[kv_start:kv_end]
+        q_len = q_b.shape[0]
+        kv_len = k_b.shape[0]
+
+        k_exp = (
+            k_b.unsqueeze(2)
+            .expand(-1, num_kv_heads, head_grp, -1)
+            .reshape(kv_len, num_qo_heads, head_dim)
+        )
+        v_exp = (
+            v_b.unsqueeze(2)
+            .expand(-1, num_kv_heads, head_grp, -1)
+            .reshape(kv_len, num_qo_heads, head_dim)
+        )
+
+        q_t = q_b.transpose(0, 1).float()
+        k_t = k_exp.transpose(0, 1).float()
+        v_t = v_exp.transpose(0, 1).float()
+        attn_mask = None
+        if causal:
+            kv_offset = kv_len - q_len
+            q_pos = torch.arange(q_len, device=q_b.device).unsqueeze(1) + kv_offset
+            k_pos = torch.arange(kv_len, device=q_b.device).unsqueeze(0)
+            causal_mask = k_pos <= q_pos
+            if window_left >= 0:
+                causal_mask = causal_mask & (q_pos - k_pos <= window_left)
+            attn_mask = causal_mask.unsqueeze(0).expand(num_qo_heads, -1, -1)
+
+        out_b = torch.nn.functional.scaled_dot_product_attention(
+            q_t,
+            k_t,
+            v_t,
+            attn_mask=attn_mask,
+            scale=sm_scale,
+        )
+        outputs.append(out_b.transpose(0, 1).to(ref_q.dtype))
 
     return torch.cat(outputs, dim=0)
 
@@ -1021,6 +1200,8 @@ def _test_trtllm_batch_decode(
     non_contiguous_query: bool = False,
     skips_softmax: bool = False,
     uses_shared_paged_kv_idx: bool = True,
+    expect_separate_kv_buffers: bool = False,
+    seq_lens_override: torch.Tensor | None = None,
 ) -> None:
     """
     Common function for testing trtllm-gen decode.
@@ -1070,11 +1251,22 @@ def _test_trtllm_batch_decode(
     # Set up test parameters
     torch.manual_seed(0)
 
-    # Generate random sequence lengths
     num_qo_heads = num_kv_heads * head_grp_size
-    q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
-        batch_size, q_len_per_req, max_in_kv_len, max_q_len
-    )
+    if seq_lens_override is None:
+        q_lens, in_kv_lens, seq_lens = generate_seq_lens_decode(
+            batch_size, q_len_per_req, max_in_kv_len, max_q_len
+        )
+    else:
+        assert q_len_per_req is not None, (
+            "Explicit decode sequence lengths currently require fixed q_len_per_req."
+        )
+        q_lens = torch.full((batch_size,), q_len_per_req, dtype=torch.int32)
+        seq_lens = seq_lens_override.to(dtype=torch.int32).cpu()
+        assert seq_lens.numel() == batch_size
+        in_kv_lens = seq_lens - q_lens
+        assert torch.all(in_kv_lens >= 0), (
+            "Explicit decode sequence lengths must be at least q_len_per_req."
+        )
 
     # Create query tensor and related data
     q, q_scale, ref_q = create_query_tensor(q_lens, num_qo_heads, head_dim, q_dtype)
@@ -1100,6 +1292,13 @@ def _test_trtllm_batch_decode(
     kv_cache_arg, page_table_kernel, kv_cache_sf_kernel = prepare_paged_kv_for_kernel(
         kv_cache, page_table, uses_shared_paged_kv_idx, kv_cache_sf
     )
+    if expect_separate_kv_buffers:
+        assert uses_shared_paged_kv_idx
+        assert kv_dtype == "nvfp4"
+        assert isinstance(kv_cache_arg, tuple)
+        assert isinstance(kv_cache_sf_kernel, tuple)
+        assert kv_cache_arg[0].data_ptr() != kv_cache_arg[1].data_ptr()
+        assert kv_cache_sf_kernel[0].data_ptr() != kv_cache_sf_kernel[1].data_ptr()
 
     workspace_buffer, workspace_buffer_ref = create_workspace_buffers(GPU_DEVICE)
 
@@ -1620,6 +1819,227 @@ def test_trtllm_batch_decode_head_dim_256(
     )
 
 
+@pytest.mark.parametrize(
+    ("seq_lens", "max_in_kv_len"),
+    [
+        ([111, 126, 203, 319], 318),
+        ([113, 510, 1025, 2051], 2050),
+        ([112, 125, 2048, 2051], 2050),
+    ],
+)
+def test_trtllm_batch_decode_with_kv_cache_separate_kv_nvfp4_head_dim_256(
+    seq_lens: list[int], max_in_kv_len: int
+) -> None:
+    seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32)
+    assert torch.any(seq_lens_t % 4 != 0)
+    _test_trtllm_batch_decode(
+        "trtllm-gen",
+        "HND",
+        batch_size=len(seq_lens),
+        q_len_per_req=1,
+        page_size=16,
+        num_kv_heads=4,
+        head_grp_size=8,
+        window_left=-1,
+        q_dtype="fp8",
+        o_dtype="fp8",
+        kv_dtype="nvfp4",
+        enable_pdl=None,
+        enable_sink=False,
+        max_in_kv_len=max_in_kv_len,
+        head_dim=256,
+        device_scale=False,
+        uses_shared_paged_kv_idx=True,
+        expect_separate_kv_buffers=True,
+        seq_lens_override=seq_lens_t,
+    )
+
+
+@pytest.mark.parametrize("kv_lens", [[111, 126, 203], [2051]])
+@pytest.mark.parametrize(
+    "v_sf_layout",
+    ["logical_linear", "padded_linear", "interleaved"],
+)
+def test_trtllm_batch_decode_with_kv_cache_separate_qkv_nvfp4_head_dim_256(
+    kv_lens: list[int], v_sf_layout: str
+) -> None:
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    torch.manual_seed(0)
+    device = GPU_DEVICE
+    batch_size = len(kv_lens)
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
+    q_lens = torch.ones(batch_size, dtype=torch.int32)
+    num_kv_heads = 4
+    head_grp_size = 8
+    num_qo_heads = num_kv_heads * head_grp_size
+    head_dim = 256
+    max_kv_len = int(kv_lens_t.max().item())
+    sum_q = int(q_lens.sum().item())
+    sum_kv = int(kv_lens_t.sum().item())
+
+    q_bf16 = torch.randn(
+        sum_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    q, q_scale = to_float8(q_bf16)
+    ref_q = q.bfloat16() * q_scale
+
+    k_ref = torch.randn(
+        sum_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_ref = torch.randn(
+        sum_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_ref[..., head_dim // 4 : head_dim // 4 + 16] *= 16.0
+    v_ref[..., head_dim // 4 : head_dim // 4 + 16] *= 2.0
+    k_fp4, v_fp4, k_sf, v_sf, k_scale, v_scale = quantize_separate_nvfp4_kv(
+        k_ref, v_ref
+    )
+    v_sf_for_kernel = convert_separate_v_scales_layout(v_sf, kv_lens_t, v_sf_layout)
+    k_dequant = dequantize_separate_nvfp4_kv(k_fp4, k_sf, k_scale, k_ref.dtype)
+    v_dequant = dequantize_separate_nvfp4_kv(v_fp4, v_sf, v_scale, v_ref.dtype)
+
+    output_ref = sdpa_ragged_reference(
+        ref_q,
+        k_dequant,
+        v_dequant,
+        q_lens.to(device),
+        kv_lens_t.to(device),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=True,
+    )
+
+    output = torch.empty_like(q)
+    output_trtllm = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        q,
+        (k_fp4, v_fp4),
+        create_workspace_buffers(device)[0],
+        None,
+        kv_lens_t.to(device),
+        max_kv_len,
+        q_scale * k_scale / math.sqrt(head_dim),
+        v_scale,
+        -1,
+        out=output,
+        kv_layout="HND",
+        enable_pdl=False,
+        backend="trtllm-gen",
+        q_len_per_req=1,
+        kv_cache_sf=(k_sf, v_sf_for_kernel),
+    )
+
+    assert_close_with_mismatch_tolerance(
+        output_trtllm.float(),
+        output_ref.float(),
+        rtol=5e-1,
+        atol=5e-1,
+        max_mismatched_elements=int(0.10 * output_trtllm.numel()),
+    )
+    cos = torch.nn.functional.cosine_similarity(
+        output_trtllm.float().reshape(-1), output_ref.float().reshape(-1), dim=0
+    )
+    assert cos.item() > 0.86
+
+
+@pytest.mark.parametrize(
+    ("kv_lens", "expected_use_multi_block"),
+    [
+        ([111, 126, 2051], True),
+        ([111, 126, 203], False),
+    ],
+)
+@pytest.mark.parametrize(
+    "v_sf_layout",
+    ["logical_linear", "padded_linear", "interleaved"],
+)
+def test_trtllm_batch_decode_with_kv_cache_separate_qkv_prepares_cum_seq_lens_sfs_v(
+    monkeypatch: pytest.MonkeyPatch,
+    kv_lens: list[int],
+    expected_use_multi_block: bool,
+    v_sf_layout: str,
+) -> None:
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    device = GPU_DEVICE
+    kv_lens_t = torch.tensor(kv_lens, dtype=torch.int32)
+    q_lens = torch.ones(len(kv_lens), dtype=torch.int32)
+    num_kv_heads = 4
+    head_grp_size = 8
+    num_qo_heads = num_kv_heads * head_grp_size
+    head_dim = 256
+    max_kv_len = int(kv_lens_t.max().item())
+    sum_q = int(q_lens.sum().item())
+    sum_kv = int(kv_lens_t.sum().item())
+
+    q_bf16 = torch.randn(
+        sum_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    q, q_scale = to_float8(q_bf16)
+    k_ref = torch.randn(
+        sum_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_ref = torch.randn(
+        sum_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_fp4, v_fp4, k_sf, v_sf, k_scale, v_scale = quantize_separate_nvfp4_kv(
+        k_ref, v_ref
+    )
+    v_sf_for_kernel = convert_separate_v_scales_layout(v_sf, kv_lens_t, v_sf_layout)
+    expected_cum_seq_lens_sfs_v = make_cum_seq_lens_sfs_v(kv_lens_t.to(device))
+    expected_v_scales = interleave_separate_v_scales(
+        pad_separate_v_scales_linear(v_sf, kv_lens_t)
+    )
+    expected_q_indptr = generate_cumsum_lens(q_lens)
+    expected_kv_indptr = generate_cumsum_lens(kv_lens_t)
+
+    class CaptureModule:
+        def __init__(self):
+            self.args = None
+
+        def trtllm_ragged_attention(self, *args):
+            self.args = args
+            args[0].zero_()
+
+    capture_module = CaptureModule()
+    monkeypatch.setattr(
+        flashinfer.prefill,
+        "get_trtllm_gen_fmha_module",
+        lambda: capture_module,
+    )
+
+    flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+        q,
+        (k_fp4, v_fp4),
+        create_workspace_buffers(device)[0],
+        None,
+        kv_lens_t.to(device),
+        max_kv_len,
+        q_scale * k_scale / math.sqrt(head_dim),
+        v_scale,
+        -1,
+        out=torch.empty_like(q),
+        kv_layout="HND",
+        enable_pdl=False,
+        backend="trtllm-gen",
+        q_len_per_req=1,
+        kv_cache_sf=(k_sf, v_sf_for_kernel),
+    )
+
+    assert capture_module.args is not None
+    torch.testing.assert_close(capture_module.args[13], expected_q_indptr)
+    torch.testing.assert_close(capture_module.args[14], expected_kv_indptr)
+    torch.testing.assert_close(capture_module.args[15], expected_cum_seq_lens_sfs_v)
+    torch.testing.assert_close(capture_module.args[24], expected_v_scales)
+    assert capture_module.args[25] is True
+    assert capture_module.args[26] is expected_use_multi_block
+
+
 @pytest.mark.parametrize("kv_layout", ["HND"])  # trtllm-gen only support HND
 @pytest.mark.parametrize(
     "batch_size,q_len_per_req,page_size,num_kv_heads,head_grp_size",
@@ -1970,9 +2390,220 @@ def test_trtllm_gen_prefill(
         atol=1e-3,
         rtol=1e-3,
     )
+
+
+@pytest.mark.parametrize(
+    ("is_generation", "use_multi_block"),
+    [(False, False), (True, False), (True, True)],
+)
+@pytest.mark.parametrize(
+    "v_sf_layout",
+    ["logical_linear", "padded_linear", "interleaved"],
+)
+def test_trtllm_separate_qkv_nvfp4_head_dim_256(
+    is_generation: bool, use_multi_block: bool, v_sf_layout: str
+) -> None:
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    torch.manual_seed(0)
+    device = GPU_DEVICE
+    batch_size = 1 if use_multi_block else 2
+    num_kv_heads = 4
+    head_grp_size = 8
+    num_qo_heads = num_kv_heads * head_grp_size
+    head_dim = 256
+    if use_multi_block:
+        q_lens = torch.ones(batch_size, dtype=torch.int32)
+        kv_lens = torch.tensor([2049], dtype=torch.int32)
+    else:
+        q_lens = (
+            torch.ones(batch_size, dtype=torch.int32)
+            if is_generation
+            else torch.tensor([96, 128], dtype=torch.int32)
+        )
+        kv_lens = torch.tensor([159, 254], dtype=torch.int32)
+    max_q_len = int(q_lens.max().item())
+    max_kv_len = int(kv_lens.max().item())
+    sum_q = int(q_lens.sum().item())
+    sum_kv = int(kv_lens.sum().item())
+
+    q_bf16 = torch.randn(
+        sum_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    q, q_scale = to_float8(q_bf16)
+    ref_q = q.bfloat16() * q_scale
+
+    k_ref = torch.randn(
+        sum_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_ref = torch.randn(
+        sum_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_ref[..., head_dim // 4 : head_dim // 4 + 16] *= 16.0
+    v_ref[..., head_dim // 4 : head_dim // 4 + 16] *= 2.0
+    k_fp4, v_fp4, k_sf, v_sf, k_scale, v_scale = quantize_separate_nvfp4_kv(
+        k_ref, v_ref
+    )
+    v_sf_for_kernel = convert_separate_v_scales_layout(v_sf, kv_lens, v_sf_layout)
+    k_dequant = dequantize_separate_nvfp4_kv(k_fp4, k_sf, k_scale, k_ref.dtype)
+    v_dequant = dequantize_separate_nvfp4_kv(v_fp4, v_sf, v_scale, v_ref.dtype)
+
+    q_indptr = generate_cumsum_lens(q_lens)
+    kv_indptr = generate_cumsum_lens(kv_lens)
+    workspace_buffer, _ = create_workspace_buffers(device)
+
+    output_ref = sdpa_ragged_reference(
+        ref_q,
+        k_dequant,
+        v_dequant,
+        q_lens.to(device),
+        kv_lens.to(device),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        causal=True,
+    )
+
+    output = torch.empty_like(q)
+    output_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        q,
+        k_fp4,
+        v_fp4,
+        workspace_buffer,
+        kv_lens.to(device),
+        max_q_len,
+        max_kv_len,
+        q_scale * k_scale / math.sqrt(head_dim),
+        v_scale,
+        -1,
+        batch_size,
+        -1,
+        q_indptr,
+        kv_indptr,
+        False,
+        True,
+        False,
+        out=output,
+        kv_cache_sf=(k_sf, v_sf_for_kernel),
+        is_generation=is_generation,
+        use_multi_block=use_multi_block,
+    )
+
+    assert_close_with_mismatch_tolerance(
+        output_trtllm.float(),
+        output_ref.float(),
+        rtol=5e-1,
+        atol=5e-1,
+        max_mismatched_elements=int(0.10 * output_trtllm.numel()),
+    )
+    cos = torch.nn.functional.cosine_similarity(
+        output_trtllm.float().reshape(-1), output_ref.float().reshape(-1), dim=0
+    )
+    assert cos.item() > 0.86
     # check if the first 8192 * 256 * 4 bytes of workspace_buffer is zero
     # note(Yingyi): the first 8192 * 256 * 4 bytes of workspace_buffer is the counter workspace, size might change in the future
     assert (workspace_buffer[: 8192 * 256 * 4].cpu().numpy() == 0).all()
+
+
+@pytest.mark.parametrize("use_multi_block", [False, True])
+@pytest.mark.parametrize(
+    "v_sf_layout",
+    ["logical_linear", "padded_linear", "interleaved"],
+)
+def test_trtllm_separate_qkv_nvfp4_decode_prepares_cum_seq_lens_sfs_v(
+    monkeypatch: pytest.MonkeyPatch,
+    use_multi_block: bool,
+    v_sf_layout: str,
+) -> None:
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] != 10:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+
+    device = GPU_DEVICE
+    num_kv_heads = 4
+    head_grp_size = 8
+    num_qo_heads = num_kv_heads * head_grp_size
+    head_dim = 256
+    q_lens = torch.ones(1 if use_multi_block else 3, dtype=torch.int32)
+    kv_lens = (
+        torch.tensor([2051], dtype=torch.int32)
+        if use_multi_block
+        else torch.tensor([111, 126, 2051], dtype=torch.int32)
+    )
+    expected_cum_seq_lens_sfs_v = make_cum_seq_lens_sfs_v(kv_lens.to(device))
+    max_q_len = int(q_lens.max().item())
+    max_kv_len = int(kv_lens.max().item())
+    sum_q = int(q_lens.sum().item())
+    sum_kv = int(kv_lens.sum().item())
+
+    q_bf16 = torch.randn(
+        sum_q, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    q, q_scale = to_float8(q_bf16)
+    k_ref = torch.randn(
+        sum_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    v_ref = torch.randn(
+        sum_kv, num_kv_heads, head_dim, dtype=torch.bfloat16, device=device
+    )
+    k_fp4, v_fp4, k_sf, v_sf, k_scale, v_scale = quantize_separate_nvfp4_kv(
+        k_ref, v_ref
+    )
+    v_sf_for_kernel = convert_separate_v_scales_layout(v_sf, kv_lens, v_sf_layout)
+    expected_interleaved_v_sf = interleave_separate_v_scales(
+        pad_separate_v_scales_linear(v_sf, kv_lens)
+    )
+    q_indptr = generate_cumsum_lens(q_lens)
+    kv_indptr = generate_cumsum_lens(kv_lens)
+    workspace_buffer, _ = create_workspace_buffers(device)
+    output = torch.empty_like(q)
+
+    class CaptureModule:
+        def __init__(self):
+            self.args = None
+
+        def trtllm_ragged_attention(self, *args):
+            self.args = args
+            args[0].zero_()
+
+    capture_module = CaptureModule()
+    monkeypatch.setattr(
+        flashinfer.prefill,
+        "get_trtllm_gen_fmha_module",
+        lambda: capture_module,
+    )
+
+    flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        q,
+        k_fp4,
+        v_fp4,
+        workspace_buffer,
+        kv_lens.to(device),
+        max_q_len,
+        max_kv_len,
+        q_scale * k_scale / math.sqrt(head_dim),
+        v_scale,
+        -1,
+        q_lens.numel(),
+        -1,
+        q_indptr,
+        kv_indptr,
+        False,
+        True,
+        False,
+        out=output,
+        kv_cache_sf=(k_sf, v_sf_for_kernel),
+        is_generation=True,
+        use_multi_block=use_multi_block,
+    )
+
+    assert capture_module.args is not None
+    torch.testing.assert_close(capture_module.args[15], expected_cum_seq_lens_sfs_v)
+    torch.testing.assert_close(capture_module.args[24], expected_interleaved_v_sf)
+    assert capture_module.args[25] is True
+    assert capture_module.args[26] is use_multi_block
 
 
 @pytest.mark.parametrize(

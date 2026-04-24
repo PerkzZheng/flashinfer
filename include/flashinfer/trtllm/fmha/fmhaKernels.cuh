@@ -150,7 +150,8 @@ class TllmGenFmhaKernel {
   inline uint64_t hashID(int qkvLayout, int maskType, int kernelType, int scheduler,
                          int multiCtasKvMode, int headDimPerCtaV, int headDimQk, int headDimV,
                          int tileSizeQ, int tileSizeKv, int numTokensPerPage, bool reuseSmemKForV,
-                         bool uses2CtaMma, bool sparseMla, bool skipsSoftmax) const {
+                         bool uses2CtaMma, bool sparseMla, bool skipsSoftmax,
+                         bool interleaveSfV) const {
     FLASHINFER_CHECK((headDimPerCtaV >= 32) && (headDimQk >= 32) && (headDimV >= 32) &&
                          (headDimPerCtaV <= 1024) && (headDimQk <= 1024) && (headDimV <= 1024),
                      "Expect (32 <= headDim <= 1024), got headDimPerCtaV=%d, headDimQk=%d, "
@@ -180,6 +181,7 @@ class TllmGenFmhaKernel {
     // Bit 54 - 54: uses2CtaMma.
     // Bit 55 - 55: sparseMla.
     // Bit 56 - 56: skipsSoftmax.
+    // Bit 57 - 57: interleaveSfV.
     return (static_cast<uint64_t>(qkvLayout) << 0) | (static_cast<uint64_t>(maskType) << 4) |
            (static_cast<uint64_t>(kernelType) << 8) | (static_cast<uint64_t>(scheduler) << 12) |
            (static_cast<uint64_t>(multiCtasKvMode) << 16) |
@@ -191,7 +193,8 @@ class TllmGenFmhaKernel {
            (static_cast<uint64_t>(log2(tileSizeQ)) << 49) |
            (static_cast<uint64_t>(reuseSmemKForV) << 53) |
            (static_cast<uint64_t>(uses2CtaMma) << 54) | (static_cast<uint64_t>(sparseMla) << 55) |
-           (static_cast<uint64_t>(skipsSoftmax) << 56);
+           (static_cast<uint64_t>(skipsSoftmax) << 56) |
+           (static_cast<uint64_t>(interleaveSfV) << 57);
   }
 
   uint64_t hashID(KernelMeta const& kernelMeta) const {
@@ -200,7 +203,7 @@ class TllmGenFmhaKernel {
                   kernelMeta.mHeadDimPerCtaV, kernelMeta.mHeadDimQk, kernelMeta.mHeadDimV,
                   kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv, kernelMeta.mNumTokensPerPage,
                   kernelMeta.mReuseSmemKForV, kernelMeta.m2CtaMma, kernelMeta.mSparseAttn != 0,
-                  kernelMeta.mSkipsSoftmaxWhenPossible);
+                  kernelMeta.mSkipsSoftmaxWhenPossible, kernelMeta.mInterleaveSfV);
   }
 
   std::pair<bool, std::string> checkIfKernelExist(RunnerParams const& params) const {
@@ -849,7 +852,8 @@ class TllmGenFmhaKernel {
         ", reuseSmemKForV=" + std::to_string(selectKernelParams.mReuseSmemKForV) +
         ", uses2CtaMma=" + std::to_string(selectKernelParams.mUses2CtaMma) +
         ", sparseMla=" + std::to_string(params.mSparseMla) +
-        ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible);
+        ", skipsSoftmax=" + std::to_string(selectKernelParams.mSkipsSoftmaxWhenPossible) +
+        ", interleaveSfV=" + std::to_string(params.mInterleaveSfV);
     IKL_LOG_DEBUG(
         "Searching for kernel traits (%d available) in TllmGenFmhaKernel(%s, %s, %s, %d) %s",
         getNumLoadedKernels(), toStr(mDtypeQ), toStr(mDtypeKv), toStr(mDtypeOut), mSM,
@@ -864,7 +868,7 @@ class TllmGenFmhaKernel {
                selectKernelParams.mTileSizeQ, selectKernelParams.mTileSizeKv,
                selectKernelParams.mNumTokensPerPage, selectKernelParams.mReuseSmemKForV,
                selectKernelParams.mUses2CtaMma, params.mSparseMla,
-               selectKernelParams.mSkipsSoftmaxWhenPossible),
+               selectKernelParams.mSkipsSoftmaxWhenPossible, params.mInterleaveSfV),
         info);
   }
 

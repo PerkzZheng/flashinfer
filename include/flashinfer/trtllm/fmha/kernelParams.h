@@ -70,6 +70,8 @@ struct KernelParams {
   int32_t const* ptrCumSeqLensQ;
   // The cumulative sequence lengths for K/V.
   int32_t const* ptrCumSeqLensKv;
+  // The cumulative physical sequence lengths for V SF.
+  int32_t const* ptrCumSeqLensSfV;
   // The packed custom mask.
   uint32_t const* ptrCustomMask;
   // The packed custom mask's offsets of each sequence.
@@ -176,7 +178,7 @@ struct KernelParams {
   // kernel when inflight batching is enabled in TRT-LLM.
   int32_t mStartTokenIdxSfO;
   // The sum of sequence lengths for Q and K/V.
-  int32_t mSumOfSeqLensQ, mSumOfSeqLensKv;
+  int32_t mSumOfSeqLensQ, mSumOfSeqLensKv, mSumOfSeqLensSfV;
   // The flag to use block sparse attention.
   bool mUseBlockSparseAttention;
   // Whether the indices for K & V pages are shared as unified index.
@@ -438,7 +440,9 @@ struct KernelParams {
 
   // Create the TMA shape/stride for KV scaling factors (block scales for NVFP4 KV cache).
   //
-  // Layout requirement (HND): [num_pages, num_kv_heads, page_size, head_dim // 16]
+  // Layout requirement:
+  //   pagedKv HND:    [num_pages, num_kv_heads, page_size, head_dim // 16]
+  //   separateQkv:    [tokensKv, num_kv_heads, head_dim // 16]
   //   - The last two dims (page_size, head_dim // 16) MUST be contiguous (stride[-1] = 1,
   //     stride[-2] = head_dim // 16). This is because we reshape them into
   //     (16, page_size * head_dim / 16 / 16) with hardcoded stride[1] = 16 to satisfy TMA's
@@ -453,6 +457,9 @@ struct KernelParams {
                                      bool isK, int reshapeFactor) {
     // The shape elements.
     auto [numKeys, numHeadsQPerKv, batchSize] = makeShapeKv(options, params);
+    if (!isK && isSeparateQkv(options.mQkvLayout) && options.mInterleaveSfV) {
+      numKeys = options.mSumOfSeqLensSfV;
+    }
 
     // The headDim.
     // Note that contiguousKv or pagedKv will pad K and V to maxHeadDimKv.
@@ -464,24 +471,36 @@ struct KernelParams {
     int32_t NumEltsPerSf = 16;
 
     // Use actual scale factor strides instead of deriving from KV strides.
+    int32_t sfStrideKeysVals = isK ? options.kSfStrideKeysValues : options.vSfStrideKeysValues;
     int32_t sfStrideHeads = isK ? options.kSfStrideHeads : options.vSfStrideHeads;
     int32_t sfStrideBatch = isK ? options.kSfStrideBatch : options.vSfStrideBatch;
+    if (!isK && isSeparateQkv(options.mQkvLayout) && options.mInterleaveSfV) {
+      FLASHINFER_CHECK(reshapeFactor == 4,
+                       "Separate-QKV interleaved V scale factors require reshapeFactor=4.");
+      FLASHINFER_CHECK(sfStrideKeysVals % reshapeFactor == 0,
+                       "The interleaved V scale token-group stride must be divisible by 4.");
+      sfStrideKeysVals /= reshapeFactor;
+    }
 
     // The KV shape is: (headDim, numKeys, numHeadsKv, batchSize)
     // The KV SF shape is: (headDim / NumEltsPerSf, numKeys, numHeadsKv, batchSize).
     // Considering the TMA requires box width to be multiple of 16B, and ideally >= 128B, we reshape
     // with a factor into: (headDim / NumEltsPerSf * r, numKeys / r, numHeadsKv, batchSize)
 
-    // Note that it only works for pagedKv layout.
-    FLASHINFER_CHECK(isPagedKv(options.mQkvLayout), "The qkvLayout is not supported.");
+    FLASHINFER_CHECK(isPagedKv(options.mQkvLayout) || isSeparateQkv(options.mQkvLayout),
+                     "The qkvLayout is not supported.");
+
+    if (isPagedKv(options.mQkvLayout)) {
+      sfStrideKeysVals = headDim / NumEltsPerSf;
+    }
 
     auto shape = std::vector<uint64_t>{
         static_cast<uint64_t>(headDim / NumEltsPerSf * reshapeFactor),
         static_cast<uint64_t>(numKeys / reshapeFactor), static_cast<uint64_t>(options.mNumHeadsKv),
         static_cast<uint64_t>(batchSize)};
-    auto stride = std::vector<uint64_t>{
-        1, static_cast<uint64_t>(headDim / NumEltsPerSf * reshapeFactor),
-        static_cast<uint64_t>(sfStrideHeads), static_cast<uint64_t>(sfStrideBatch)};
+    auto stride = std::vector<uint64_t>{1, static_cast<uint64_t>(sfStrideKeysVals * reshapeFactor),
+                                        static_cast<uint64_t>(sfStrideHeads),
+                                        static_cast<uint64_t>(sfStrideBatch)};
 
     return std::make_tuple(shape, stride);
   }
@@ -735,29 +754,41 @@ struct KernelParams {
     if (kernelMeta.mDataTypeKv == DATA_TYPE_E2M1) {
       // The number of elements per SF.
       int32_t NumEltsPerSf = 16;
-      // The reshape factor for K/V SF: aim for box width 128B, limit to numKeysPerTile.
-      int32_t const reshapeFactorKvSf =
-          std::min(128 / (maxHeadDimKv / NumEltsPerSf), numKeysPerTile);
+      // Paged KV can reshape both K and V because tokens are contiguous within each head. For
+      // separate-QKV, K stays linear in [tokens, heads, sf], while V may use the physical
+      // [tokens / 4, heads, sf, 4] layout.
+      int32_t const pagedKvSfReshapeFactor =
+          isPagedKv(options.mQkvLayout)
+              ? std::min(128 / (maxHeadDimKv / NumEltsPerSf), numKeysPerTile)
+              : 1;
+      int32_t const reshapeFactorKSf = pagedKvSfReshapeFactor;
+      int32_t const reshapeFactorVSf =
+          isSeparateQkv(options.mQkvLayout) && kernelMeta.mInterleaveSfV ? 4
+                                                                         : pagedKvSfReshapeFactor;
       // Compute the shape and stride for SF tensor.
-      // FIXME: assume K and V uses the same shape.
-      auto [shapeKvSf, strideKvSf] =
-          makeTmaShapeStrideKvSf(options, params, /*isK*/ true, reshapeFactorKvSf);
+      auto [shapeKSf, strideKSf] =
+          makeTmaShapeStrideKvSf(options, params, /*isK*/ true, reshapeFactorKSf);
+      auto [shapeVSf, strideVSf] =
+          makeTmaShapeStrideKvSf(options, params, /*isK*/ false, reshapeFactorVSf);
 
       // The tileShapes for K/V.
-      std::vector<uint32_t> tileShapeKvSf(shapeKvSf.size(), 1);
-      tileShapeKvSf[0] = maxHeadDimKv / NumEltsPerSf * reshapeFactorKvSf;
-      tileShapeKvSf[1] = numKeysPerTile / reshapeFactorKvSf;
+      std::vector<uint32_t> tileShapeKvSf(shapeKSf.size(), 1);
+      tileShapeKvSf[0] = maxHeadDimKv / NumEltsPerSf * reshapeFactorKSf;
+      tileShapeKvSf[1] = numKeysPerTile / reshapeFactorKSf;
+      std::vector<uint32_t> tileShapeVSf(shapeVSf.size(), 1);
+      tileShapeVSf[0] = maxHeadDimKv / NumEltsPerSf * reshapeFactorVSf;
+      tileShapeVSf[1] = numKeysPerTile / reshapeFactorVSf;
 
       // The tile box is reshaped from (headDim / NumEltsPerSf, tileSizeKv) into
       // (headDim / NumEltsPerSf * reshapeFactorKvSf, tileSizeKv / reshapeFactorKvSf).
       // Build tma descriptor for K SF.
-      params.tmaKSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf,
+      params.tmaKSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKSf, strideKSf,
                                             tileShapeKvSf, const_cast<void*>(options.kSfBasePtr),
                                             /*swizzled = */ false);
 
       // Build tma descriptor for V SF.
-      params.tmaVSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeKvSf, strideKvSf,
-                                            tileShapeKvSf, const_cast<void*>(options.vSfBasePtr),
+      params.tmaVSf_ = buildNdTmaDescriptor(options, DATA_TYPE_E4M3, shapeVSf, strideVSf,
+                                            tileShapeVSf, const_cast<void*>(options.vSfBasePtr),
                                             /*swizzled = */ false);
     }
 
@@ -773,6 +804,7 @@ struct KernelParams {
     // Set the other kernel parameters.
     params.ptrCumSeqLensQ = options.cumSeqLensQPtr;
     params.ptrCumSeqLensKv = options.cumSeqLensKvPtr;
+    params.ptrCumSeqLensSfV = options.cumSeqLensSfVPtr;
 
     // The packed custom mask.
     params.ptrCustomMask = options.customMaskPtr;
@@ -837,6 +869,7 @@ struct KernelParams {
     // TODO: just use mMaxSeqLenQ for number of MTP tokens.
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
     params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
+    params.mSumOfSeqLensSfV = options.mSumOfSeqLensSfV;
     params.mBatchSize = options.mBatchSize;
     params.mChunkedAttentionSizeLog2 = 0;
     params.mNumHeadsQ = options.mNumHeadsQ;
