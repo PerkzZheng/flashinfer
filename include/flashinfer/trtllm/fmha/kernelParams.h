@@ -44,6 +44,8 @@ struct KernelParams {
   CUtensorMap tmaQ_;
   // TMA descriptor for K.
   CUtensorMap tmaK_;
+  // TMA descriptor for DSv4 sparse MLA sliding-window KV pool. Same format as tmaK_.
+  CUtensorMap tmaKSlidingWindowKvPool_;
   // TMA descriptor for V.
   CUtensorMap tmaV_;
   // The descriptor for O.
@@ -117,6 +119,8 @@ struct KernelParams {
 
   // The softmax stats buffer.
   float2* ptrSoftmaxStats;
+  // The variable sparse MLA top-k lengths, one value per query token.
+  int32_t const* ptrSparseMlaTopKLens;
 
   // The attention window size for sliding window attention.
   int32_t mAttentionWindowSize;
@@ -736,6 +740,15 @@ struct KernelParams {
     params.tmaK_ = buildNdTmaDescriptor(
         options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK, const_cast<void*>(kPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+
+    if (options.mHasSlidingWindowKvPool && options.mSparseMla &&
+        options.slidingWindowKvPoolPtr != nullptr) {
+      params.tmaKSlidingWindowKvPool_ =
+          buildNdTmaDescriptor(options, kernelMeta.mDataTypeK, shapeK, strideK, tileShapeK,
+                               const_cast<void*>(options.slidingWindowKvPoolPtr),
+                               /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
+    }
+
     params.tmaV_ = buildNdTmaDescriptor(
         options, kernelMeta.mDataTypeV, shapeV, strideV, tileShapeV, const_cast<void*>(vPtr),
         /*swizzled = */ swizzleKv, /*unpack4b = */ storeTransformedKvInTmem);
@@ -800,6 +813,7 @@ struct KernelParams {
 
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
+    params.ptrSparseMlaTopKLens = options.sparseMlaTopKLensPtr;
 
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
