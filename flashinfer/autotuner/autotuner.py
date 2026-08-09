@@ -789,6 +789,7 @@ def autotune(
         with tuner._lock:
             tuner._file_configs.clear()
             tuner._logged_file_hits.clear()
+            tuner._completed_tuning_requests.clear()
         if os.path.isfile(cache):
             tuner.load_configs(cache)
 
@@ -972,6 +973,25 @@ class ProfilingCacheKey:
         )
 
 
+@dataclass(frozen=True)
+class CompletedTuningRequestKey:
+    """Identifies an explicit-bucket tuning grid known to be fully cached.
+
+    ``base_profile`` retains static dimensions and replaces every dynamic or
+    constrained dimension with ``-1``. Consequently, calls at different
+    runtime points within the same explicit bucket grid share one completion
+    marker without allowing unrelated static shapes to collide.
+    """
+
+    custom_op: str
+    tuning_buckets: tuple[int, ...]
+    round_up: bool
+    base_profile: tuple[tuple[int, ...], ...]
+    dynamic_dims: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]
+    constraint_dims: tuple[tuple[int, int], ...]
+    runner_fingerprints: tuple[tuple[type, int, tuple[Any, ...]], ...]
+
+
 @dataclass
 class AutoTunerStatistics:
     """Statistics collected by the AutoTuner.
@@ -1094,6 +1114,10 @@ class AutoTuner:
         self.profiling_cache: dict[
             ProfilingCacheKey, tuple[Any, OptimizationProfile | None]
         ] = {}
+        # Explicit-bucket tuning requests for which every generated profile is
+        # present in profiling_cache or _file_configs. This lets repeated
+        # multi-bucket calls skip profile generation and runner reflection.
+        self._completed_tuning_requests: set[CompletedTuningRequestKey] = set()
         self.is_tuning_mode = False
         self._active_tuning_contexts = 0
 
@@ -1416,6 +1440,57 @@ class AutoTuner:
         )
         return new_config
 
+    @staticmethod
+    def _get_completed_tuning_request_key(
+        custom_op: str,
+        runners: list[TunableRunner],
+        input_shapes: tuple[tuple[int, ...], ...],
+        tuning_config: TuningConfig,
+        inputs: list[Any],
+        tuning_buckets: tuple[int, ...],
+        round_up: bool,
+    ) -> CompletedTuningRequestKey:
+        """Build a stable key for one explicit-bucket optimization grid.
+
+        The generated grid depends on static input dimensions, the
+        dynamic/constraint dimension layout, the explicit buckets, and the
+        available runners. Runtime values of dynamic dimensions do not affect
+        an explicit grid and are replaced by ``-1`` so all points in that grid
+        reuse one completion marker.
+        """
+        base_profile = [list(shape) for shape in input_shapes]
+        dynamic_dims = tuple(
+            (spec.input_idx, spec.dim_idx)
+            for spec in tuning_config.dynamic_tensor_specs
+        )
+        for input_indices, dim_indices in dynamic_dims:
+            for input_idx, dim_idx in zip(input_indices, dim_indices, strict=True):
+                base_profile[input_idx][dim_idx] = -1
+
+        constraint_dims = tuple(
+            (spec.input_idx, spec.dim_idx) for spec in tuning_config.constraint_specs
+        )
+        for input_idx, dim_idx in constraint_dims:
+            base_profile[input_idx][dim_idx] = -1
+
+        runner_fingerprints = tuple(
+            (
+                runner.__class__,
+                hash(runner),
+                runner.get_cache_key_extras(inputs),
+            )
+            for runner in runners
+        )
+        return CompletedTuningRequestKey(
+            custom_op=custom_op,
+            tuning_buckets=tuning_buckets,
+            round_up=round_up,
+            base_profile=tuple(tuple(shape) for shape in base_profile),
+            dynamic_dims=dynamic_dims,
+            constraint_dims=constraint_dims,
+            runner_fingerprints=runner_fingerprints,
+        )
+
     def choose_one(
         self,
         custom_op: str,
@@ -1467,10 +1542,44 @@ class AutoTuner:
 
         with self._lock:
             # Apply tuning bucket / rounding overrides from autotune() context.
-            if self._override_tuning_buckets is not None or self._override_round_up:
+            override_tuning_buckets = self._override_tuning_buckets
+            if override_tuning_buckets is not None or self._override_round_up:
                 tuning_config = self._apply_tuning_overrides(tuning_config)
 
             input_shapes = tuple(self._get_input_sizes(inputs))
+
+            tuning_request_key = None
+            if self.is_tuning_mode and override_tuning_buckets is not None:
+                tuning_request_key = self._get_completed_tuning_request_key(
+                    custom_op=custom_op,
+                    runners=runners,
+                    input_shapes=input_shapes,
+                    tuning_config=tuning_config,
+                    inputs=inputs,
+                    tuning_buckets=override_tuning_buckets,
+                    round_up=self._override_round_up,
+                )
+
+            # For a singleton grid, a hit for the runtime shape proves the only
+            # profile is complete. For a multi-bucket grid, take this direct
+            # path only after a prior pass verified every generated profile.
+            # A stale marker is discarded if its runtime lookup no longer
+            # resolves, for example after external cache mutation.
+            tuning_request_complete = (
+                tuning_request_key is not None
+                and tuning_request_key in self._completed_tuning_requests
+            )
+            if tuning_request_key is not None and (
+                len(tuning_request_key.tuning_buckets) == 1 or tuning_request_complete
+            ):
+                is_cache_hit, runner_id, tactic, _ = self.search_cache(
+                    custom_op, runners, input_shapes, tuning_config, inputs=inputs
+                )
+                if is_cache_hit:
+                    self._completed_tuning_requests.add(tuning_request_key)
+                    return runners[runner_id], tactic
+                if tuning_request_complete:
+                    self._completed_tuning_requests.discard(tuning_request_key)
 
             # Early return if it's not tuning, use cache found one or fallback one
             if not self.is_tuning_mode:
@@ -1549,6 +1658,26 @@ class AutoTuner:
             profiles = self._generate_optimization_profiles(tuning_config, inputs)
             # Record the total configs to try
             self.stats.tuned_op_total_configs[custom_op] = len(profiles)
+
+            # A completion marker is process-local, so a fully populated file
+            # cache may not have one yet. Verify the generated grid once, then
+            # avoid both profile generation and runner reflection on all
+            # subsequent calls.
+            if tuning_request_key is not None and all(
+                self.search_cache(
+                    custom_op,
+                    runners,
+                    profile.get_opt_shapes(),
+                    tuning_config,
+                    inputs=inputs,
+                )[0]
+                for profile in profiles
+            ):
+                self._completed_tuning_requests.add(tuning_request_key)
+                _, runner_id, tactic, _ = self.search_cache(
+                    custom_op, runners, input_shapes, tuning_config, inputs=inputs
+                )
+                return runners[runner_id], tactic
 
             # Pre-compute runner arg names to avoid calling inspect.signature in the loop
             runner_arg_names_map = {}
@@ -1733,6 +1862,18 @@ class AutoTuner:
 
             if pbar is not None:
                 pbar.close()
+
+            if tuning_request_key is not None and all(
+                self.search_cache(
+                    custom_op,
+                    runners,
+                    profile.get_opt_shapes(),
+                    tuning_config,
+                    inputs=inputs,
+                )[0]
+                for profile in profiles
+            ):
+                self._completed_tuning_requests.add(tuning_request_key)
 
             # Get the best runner and tactic from cache
             # If no valid tactic is found, the fallback runner and tactic will be used
@@ -2017,37 +2158,51 @@ class AutoTuner:
             logger.debug(f"[Autotuner]: generated profile: {p}")
         return generated_profiles
 
-    @classmethod
+    @staticmethod
     @functools.lru_cache(maxsize=16384)
-    def _find_nearest_profile(
-        cls, shapes: tuple[tuple[int, ...], ...], tuning_config: TuningConfig
+    def _find_nearest_profile_cached(
+        shapes: tuple[tuple[int, ...], ...],
+        dynamic_mapping_specs: tuple[
+            tuple[tuple[int, ...], tuple[int, ...], Callable[[int], int]], ...
+        ],
+        constraint_dims: tuple[tuple[int, int], ...],
     ) -> tuple[tuple[int, ...], ...]:
-        """Find the nearest optimization profile for given inputs
-        User can define their own nearest profile generation method to reduce the host overhead.
+        """Map shapes using only the canonical fields that affect the result.
 
-        Args:
-            shapes: Tuple of input tensor shapes
-            tuning_config: Tuning configuration
-
-        Return:
-            Tuple: A tuple containing:
-                - attributes: Tuple of runner attributes, sorted.
-                - profile: Tuple of input tensor shapes
+        Profiling-only fields such as tensor initializers and input hooks are
+        deliberately absent. Including the whole ``TuningConfig`` here makes
+        logically identical configs compare unequal when callers rebuild
+        initializer closures on every dispatch, defeating this LRU and causing
+        a growing same-hash equality chain.
         """
         base_profile = list(list(shape) for shape in shapes)
 
-        for spec in tuning_config.dynamic_tensor_specs:
-            mapped_val = spec.map_to_tuning_buckets(
-                base_profile[spec.input_idx[0]][spec.dim_idx[0]]
-            )
+        for input_idx, dim_idx, mapper in dynamic_mapping_specs:
+            mapped_val = mapper(base_profile[input_idx[0]][dim_idx[0]])
             # Apply the same mapped bucket to all linked dimensions in this spec.
-            for input_i, dim_i in zip(spec.input_idx, spec.dim_idx, strict=True):
+            for input_i, dim_i in zip(input_idx, dim_idx, strict=True):
                 base_profile[input_i][dim_i] = mapped_val
 
         # associated dimensions dependent on other free dynamic dimensions, so assign -1 in the profile
-        for constraint_spec in tuning_config.constraint_specs:
-            base_profile[constraint_spec.input_idx][constraint_spec.dim_idx] = -1
+        for input_idx, dim_idx in constraint_dims:
+            base_profile[input_idx][dim_idx] = -1
         return tuple(tuple(shape) for shape in base_profile)
+
+    @classmethod
+    def _find_nearest_profile(
+        cls, shapes: tuple[tuple[int, ...], ...], tuning_config: TuningConfig
+    ) -> tuple[tuple[int, ...], ...]:
+        """Find the nearest profile using a canonical structural mapping key."""
+        dynamic_mapping_specs = tuple(
+            (spec.input_idx, spec.dim_idx, spec.map_to_tuning_buckets)
+            for spec in tuning_config.dynamic_tensor_specs
+        )
+        constraint_dims = tuple(
+            (spec.input_idx, spec.dim_idx) for spec in tuning_config.constraint_specs
+        )
+        return cls._find_nearest_profile_cached(
+            shapes, dynamic_mapping_specs, constraint_dims
+        )
 
     @classmethod
     def _get_cache_key(
@@ -2436,12 +2591,13 @@ class AutoTuner:
         return inputs_list
 
     def clear_cache(self) -> None:
-        """Clear the profiling cache and user-loaded file configs."""
+        """Clear cached profiles, file configs, and completion markers."""
         with self._lock:
             self.profiling_cache.clear()
             self._file_configs.clear()
             self._logged_file_hits.clear()
             self._logged_cache_miss_oor.clear()
+            self._completed_tuning_requests.clear()
             self._dirty = False
             self._dirty_seq = 0
 
