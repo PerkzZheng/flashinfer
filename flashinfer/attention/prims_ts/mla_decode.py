@@ -164,6 +164,15 @@ def _validate_mla_int32_extent(value: int, name: str) -> int:
     return value
 
 
+def _validate_mla_nonnegative_int32_extent(value: int, name: str) -> int:
+    """Validate a possibly empty flattened extent used by Int32 coordinates."""
+    if value < 0:
+        raise ValueError(f"{name} must be nonnegative")
+    if value > _INT32_MAX:
+        raise NotImplementedError(f"{name} must fit in a signed int32")
+    return value
+
+
 def _validate_mla_query_head_extent(
     *,
     batch_size: int,
@@ -177,7 +186,7 @@ def _validate_mla_query_head_extent(
         "batch_size * max_seq_len_q * num_heads",
     )
     if total_q is not None:
-        _validate_mla_int32_extent(
+        _validate_mla_nonnegative_int32_extent(
             total_q * num_heads,
             "total_q * num_heads",
         )
@@ -298,7 +307,7 @@ def _derive_max_seq_len_q(
     *,
     batch_size: int,
 ) -> tuple[int, int, tuple[int, ...]]:
-    """Validate cumulative offsets and derive their maximum positive delta.
+    """Validate cumulative offsets and derive their maximum nonnegative delta.
 
     This helper intentionally synchronizes and is therefore used only by the
     wrapper planning path when the caller omits an explicit static bound.
@@ -312,8 +321,8 @@ def _derive_max_seq_len_q(
     q_lengths = tuple(
         end - start for start, end in zip(offsets[:-1], offsets[1:], strict=True)
     )
-    if any(length <= 0 for length in q_lengths):
-        raise ValueError("qo_indptr must be strictly increasing")
+    if any(length < 0 for length in q_lengths):
+        raise ValueError("qo_indptr must be nondecreasing")
     return max(q_lengths), offsets[-1], q_lengths
 
 
@@ -367,7 +376,10 @@ def _validate_query(
     if query.ndim != expected_rank:
         expected_shape = "[total_q, H, 576]" if packed_query else "[B, SQ, H, 576]"
         raise ValueError(f"query must have shape {expected_shape}")
-    if any(int(extent) <= 0 for extent in query.shape[:-1]):
+    if packed_query:
+        if int(query.shape[1]) <= 0:
+            raise ValueError("query head extent must be positive")
+    elif any(int(extent) <= 0 for extent in query.shape[:-1]):
         raise ValueError("query row and head extents must be positive")
     if query.shape[-1] != _MLA_QUERY_DIM:
         raise ValueError(
@@ -398,10 +410,10 @@ def _validate_query(
             if batch_size is None:
                 raise ValueError("batch_size is required to validate packed query")
             total_q = int(query.shape[0])
-            if total_q < batch_size or total_q > batch_size * max_seq_len_q:
+            if total_q > batch_size * max_seq_len_q:
                 raise ValueError(
                     "packed query total rows must be within "
-                    f"[{batch_size}, {batch_size * max_seq_len_q}], got {total_q}"
+                    f"[0, {batch_size * max_seq_len_q}], got {total_q}"
                 )
         elif query.shape[1] != max_seq_len_q:
             raise ValueError(
@@ -1383,6 +1395,8 @@ def _launch_mla_decode(
     """Form the dimension-first views and launch one compiled MLA kernel."""
 
     packed_query = qo_indptr is not None
+    if packed_query and int(runtime.query.shape[0]) == 0:
+        return runtime.out
     if packed_query:
         q_latent = runtime.query[..., :kv_lora_rank].permute(1, 2, 0)
         q_rope = runtime.query[..., kv_lora_rank:].permute(1, 2, 0)
@@ -1444,8 +1458,10 @@ def prims_ts_batch_decode_with_kv_cache_mla(
     ``qo_indptr`` contains the ``B + 1`` cumulative Q offsets. Runtime Q
     lengths are exclusively ``qo_indptr[b + 1] - qo_indptr[b]``;
     ``max_seq_len_q`` is only the static policy, JIT, and workspace bound and
-    is required for compact launches. The last query dimension concatenates
-    the 512 latent and 64 RoPE dimensions. ``kv_cache`` accepts compact rank-3
+    is required for compact launches. Individual packed requests may be empty,
+    and an all-empty launch returns its empty output without dispatching a GPU
+    kernel. The last query dimension concatenates the 512 latent and 64 RoPE
+    dimensions. ``kv_cache`` accepts compact rank-3
     ``[pages, page_size, 576]`` or rank-4 ``[pages, 1, page_size, 576]``
     storage. ``block_tables`` and ``seq_lens`` follow FlashInfer's native dense
     paged-cache ABI; ``max_seq_len`` is the exact static policy/JIT maximum.
@@ -1454,10 +1470,10 @@ def prims_ts_batch_decode_with_kv_cache_mla(
 
     The workspace is exclusive to one in-flight launch or captured graph and
     must not overlap query, K/V cache, metadata, or output storage.
-    Runtime lengths must remain positive and no larger than ``max_seq_len``;
+    Runtime K/V lengths must remain positive and no larger than ``max_seq_len``;
     this hot path deliberately performs no device-to-host metadata reads. For
     packed launches, callers must ensure that offsets start at zero, are
-    strictly increasing, end at ``query.shape[0]``, and have every delta no
+    nondecreasing, end at ``query.shape[0]``, and have every delta no
     larger than ``max_seq_len_q``. For causal masking, every fixed or packed
     per-request Q length must also be no greater than the corresponding live
     ``seq_lens`` value. Warm the semantic key before CUDA graph
@@ -1653,13 +1669,14 @@ class BatchMLADecodePagedTSWrapper:
         offsets. Planning always validates those offsets and their final total
         with one device-to-host synchronization. If ``max_seq_len_q`` is
         omitted, their exact maximum delta becomes the plan bound; an explicit
-        bound may be larger. Planning also reads and validates every K/V length;
+        bound may be larger. An all-empty packed plan requires an explicit
+        positive bound. Planning also reads and validates every K/V length;
         an explicit KV bound is checked against all rows. With
         ``qo_indptr=None``, the Q bound is the exact fixed query length and
         defaults to one. ``seq_len_q`` remains a backward-compatible alias for
         the same static bound. CUDA graph use requires stable ``qo_indptr``
-        storage. Interior offsets may change only when they remain strictly
-        increasing, every delta stays within the plan bound, and the final
+        storage. Interior offsets may change only when they remain
+        nondecreasing, every delta stays within the plan bound, and the final
         offset continues to match the packed query/output extent fixed by the
         plan. ``seq_lens`` is also live. For a causal plan, every replay must
         preserve ``q_len[b] <= seq_lens[b]`` for each request. One wrapper
@@ -1715,6 +1732,10 @@ class BatchMLADecodePagedTSWrapper:
                 planned_q_lengths,
             ) = _derive_max_seq_len_q(qo_indptr, batch_size=batch_size)
             if resolved_q_bound is None:
+                if derived_q_bound == 0:
+                    raise ValueError(
+                        "max_seq_len_q is required for an all-empty packed query"
+                    )
                 max_seq_len_q = derived_q_bound
             else:
                 max_seq_len_q = resolved_q_bound
@@ -1965,9 +1986,12 @@ def batch_decode_mla_with_paged_kv_cache(
         )
         num_heads = int(query.shape[1])
         if max_seq_len_q is None:
-            _validate_mla_int32_extent(
-                int(query.shape[0]) * num_heads,
-                "total_q * num_heads",
+            if int(query.shape[0]) == 0:
+                raise ValueError(
+                    "max_seq_len_q is required for an all-empty packed query"
+                )
+            _validate_mla_nonnegative_int32_extent(
+                int(query.shape[0]) * num_heads, "total_q * num_heads"
             )
         else:
             max_seq_len_q = _validate_positive_int(max_seq_len_q, "max_seq_len_q")

@@ -915,3 +915,60 @@ outside the Git checkout. This section identifies the correctness checkpoint
 that is committed before expanding the public contract to H6 and zero-length
 packed requests. Gate B is still open for the isolated small-batch BF16 gap
 recorded in section 11.
+
+## 13. H6 and zero-length packed-Q implementation checkpoint (2026-08-12)
+
+Work after committed checkpoint `4c13b424` widens the packed-query public
+contract from strictly increasing to nondecreasing `qo_indptr`. Individual
+requests may now have Q length zero. Packed query tensors may have
+`total_q == 0`, flattened query-head extent validation accepts that empty
+extent, and every public launch path returns the validated empty output before
+calling a compiled GPU kernel. Planning an all-empty packed batch still
+requires an explicit positive `max_seq_len_q`, because its offsets cannot
+derive a positive static policy/JIT/workspace bound.
+
+H6 uses the existing flat-row machinery without a kernel-layout fork: public
+auto dispatch maps its logical rows to a physical M8 1CTA tile for the 48-row
+H6/SQ8 case, and the existing M128 2CTA family covers H6/SQ64. The expanded
+tests cover H6 fixed Q in BF16 and FP8 for both families; mixed packed lengths
+`[8, 1, 0, 3]` for H6/H12/H24/H48/H96 in both dtypes; zero-request CLC
+progression; CUDA-graph replay whose live offsets contain alternating empty
+requests; and all-empty wrapper, caller-workspace, and one-shot APIs for
+public-auto 1CTA and 2CTA plans.
+
+The first B200 smoke set passed 6/6. The first 34-case expanded run passed 33
+cases and exposed one over-specific test expectation: an underfilled
+`B=2, H=96, SQmax=8, FP8` plan legitimately selected 1CTA through the existing
+public-auto occupancy probe. Moving the all-empty family anchor to B4 retained
+public-auto selection and produced the intended 2CTA policy for both dtypes;
+the corrected all-empty matrix then passed 4/4.
+
+Strengthening the packed public-path test to retain and replay a CUDA graph for
+each H6/H96 dtype anchor exposed a test-lifetime hazard. Destroying the owner
+objects for two otherwise valid captured graphs, then allowing their storage
+to be recycled by a later parametrized case, could produce a delayed illegal
+address. Each isolated capture and replay passed, mixed captured/noncaptured
+sequences passed, and retaining each graph together with its wrapper, output,
+and input allocations made the full 11-case public-path sequence pass. The
+harness now preserves that complete owner set for the module lifetime, matching
+the public CUDA-graph contract that captured pointer storage remains stable for
+the graph lifetime. No failure was observed while captured graph owners were
+valid.
+
+Final exact-tree results on the same B200 were:
+
+- Python compilation, Ruff lint/format, and `git diff --check`: passed.
+- `tests/attention/test_attention_ts_mla_decode.py`: 178 passed.
+- The strengthened mixed-zero public-path slice: 11 passed.
+- `tests/trace/test_fi_trace_template_consistency.py`: 629 passed.
+- The focused trace file plus `test_template_init.py` and
+  `test_template_registry.py`: 981 passed and 168 skipped.
+
+The first full trace invocation collected zero tests because Python resolved a
+different top-level `tests` package. Rerunning with this checkout first on
+`PYTHONPATH` restored the expected registry and passed; this was an invocation
+repair, not a source change. JUnit files and the graph-lifetime diagnostics are
+retained under
+`artifacts/groups_tokens_heads_20260812/h6_zero_q_gpu_ae9bb2c7`. These results
+qualify the H6/zero-length functionality checkpoint for commit on top of
+`4c13b424`; public-auto performance Gate B remains open.

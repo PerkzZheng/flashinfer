@@ -39,9 +39,9 @@ carry the wrapper's plan-owned fixed-versus-packed query mode.
 | Output dimension | 512 |
 | Q/cache dtype | Matching `torch.bfloat16` or `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` only |
-| Q length | Fixed or packed variable length; static maximum must be positive |
+| Q length | Fixed or packed variable length; packed requests may be empty, while the static maximum remains positive |
 | K/V length | Positive and at most `2**31 - 32768`; the reserve keeps the largest padded split-KV coordinate span in signed `int32` |
-| Q heads | Validated at 8, 12, 16, 24, 32, 48, 64, 96, and 128; other positive counts are accepted only when automatic selection reports an implementation |
+| Q heads | Validated at 6, 8, 12, 16, 24, 32, 48, 64, 96, and 128; other positive counts are accepted only when automatic selection reports an implementation |
 | K/V cache | Paged, one logical KV head; `[num_pages, page_size, 576]` or `[num_pages, 1, page_size, 576]` compact storage |
 | Metadata/cache index extents | Flattened query-head capacity, block-table elements, and physical page count must fit signed `int32` |
 | Page size | 16, 32, 64, or 128 tokens |
@@ -102,18 +102,20 @@ For causal request `b`, query row `i` can attend through
 
 Each `block_tables` row must contain at least
 `ceil(max_kv_len / page_size)` columns, and every page ID used by a runtime
-length must index the physical cache. Packed offsets start at zero, increase
-strictly, end at `total_q`, and have every per-request delta no greater than
-`max_seq_len_q`.
+length must index the physical cache. Packed offsets start at zero, are
+nondecreasing, end at `total_q`, and have every nonnegative per-request delta
+no greater than `max_seq_len_q`.
 
 The wrapper retains `block_tables`, `seq_lens`, and packed `qo_indptr` as live
 device inputs. Their storage must remain valid. Values may be changed in-place
 only while page IDs remain valid, K/V lengths stay positive and within the
-planned bound, packed-Q deltas stay positive and within their bound, and the
+planned bound, packed-Q deltas stay nonnegative and within their bound, and the
 final packed offset remains equal to the planned query/output extent. Causal
 metadata must also preserve `q_len[b] <= seq_lens[b]` for every request.
 For a packed wrapper plan, omitting `max_seq_len_q` makes `plan()` read the
-offsets once and use their largest delta as the bound. Every wrapper plan also
+offsets once and use their largest delta as the bound. An all-empty packed
+batch therefore requires an explicit positive `max_seq_len_q`; its launch
+returns an empty output without dispatching a GPU kernel. Every wrapper plan also
 reads `seq_lens` once, rejects nonpositive rows, and checks every row against
 the K/V bound. The standalone packed API requires an explicit bound and trusts
 the device-side values on each launch. Wrapper and standalone hot paths do not
