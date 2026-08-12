@@ -66,7 +66,7 @@ def ceil_div(a: int, b: int) -> int:
 def compute_split_kv(
     *,
     batch_size: int,
-    seq_len_q: int,
+    num_q_tiles: int,
     seq_len_kv: int,
     mma_qk_tiler_mn: Tuple[int, int] = (128, 128),
     max_active_blocks: int,
@@ -80,8 +80,8 @@ def compute_split_kv(
 
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
-    if seq_len_q <= 0:
-        raise ValueError(f"seq_len_q must be positive, got {seq_len_q}")
+    if num_q_tiles <= 0:
+        raise ValueError(f"num_q_tiles must be positive, got {num_q_tiles}")
     if seq_len_kv <= 0:
         raise ValueError(f"seq_len_kv must be positive, got {seq_len_kv}")
     if max_active_blocks <= 0:
@@ -92,7 +92,7 @@ def compute_split_kv(
         )
 
     max_splits = ceil_div(seq_len_kv, mma_qk_tiler_mn[1])
-    blocks_per_batch = max(1, max_active_blocks // batch_size // (seq_len_q * 2))
+    blocks_per_batch = max(1, max_active_blocks // batch_size // (num_q_tiles * 2))
     split_heur = min(max_splits, blocks_per_batch)
     k_waves = ceil_div(max_splits, split_heur)
     split_wave_aware = ceil_div(max_splits, k_waves)
@@ -103,19 +103,23 @@ def compute_split_kv(
 
 def compute_workspace_size(
     *,
-    num_heads: int,
-    seq_len_q: int,
+    tile_size_q: int,
+    num_q_tiles: int,
     latent_dim: int,
     batch_size: int,
     split_kv: int,
     partial_o_dtype,
     lse_dtype,
 ) -> int:
-    """Return mixed-dtype MLA split-KV workspace size in bytes."""
+    """Return the physical flat-tile split-KV workspace size in bytes."""
 
     if split_kv == 1:
         return 0
-    partial_rows = batch_size * num_heads * seq_len_q * split_kv
+    if tile_size_q <= 0:
+        raise ValueError(f"tile_size_q must be positive, got {tile_size_q}")
+    if num_q_tiles <= 0:
+        raise ValueError(f"num_q_tiles must be positive, got {num_q_tiles}")
+    partial_rows = batch_size * tile_size_q * num_q_tiles * split_kv
     return partial_rows * (
         latent_dim * partial_o_dtype.width // 8 + lse_dtype.width // 8
     )

@@ -498,17 +498,23 @@ class TmemSResource(MlaResource):
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)
         needs_row_causal_mask = cutlass.const_expr(
-            cfg.mask_type == MaskType.CAUSAL.value
-            and cfg.groups_tokens_heads_q_ratio > 1
+            cfg.mask_type == MaskType.CAUSAL.value and cfg.logical_seq_len_q > 1
         )
         if cutlass.const_expr(needs_row_causal_mask):
-            min_seq_len_kv = seq_len_kv - Int32(cfg.groups_tokens_heads_q_ratio - 1)
+            min_seq_len_kv = runtime_seq_len_kv_for_effective_head(
+                cfg,
+                self.cache_seqs,
+                batch_idx,
+                cta_idx_q,
+                Int32(0),
+                self.cu_seqlens_q,
+            )
             should_apply_dense_mask = should_apply_dense_mask or (
                 next_tile_offset_k > min_seq_len_kv
             )
         if should_apply_dense_mask:
-            # The CTA domain already captures dense and non-grouped causal
-            # visibility. Only grouped causal rows need a narrower row limit.
+            # The CTA domain follows the latest logical query row in the flat
+            # tile. Earlier rows can have a narrower bottom-right causal limit.
             warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
             lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
             if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):

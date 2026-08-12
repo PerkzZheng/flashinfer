@@ -31,6 +31,43 @@ _OUTPUT_ELEMENTS_PER_WORK_UNIT = 1024
 _MAX_PARTIAL_O_WORKSPACE_ELEMENTS = 2**31 - 1
 
 
+def should_use_q128_g1_parallel_reducer(
+    *,
+    batch_size: int,
+    physical_rows_per_batch: int,
+    producer_ctas: int,
+    reference_rows_per_cta: int,
+    physical_sm_count: int,
+) -> bool:
+    """Prefer one-row G1 only for an underfilled reference launch.
+
+    The Q128 reference reducer coarsens several rows into one CTA.  That is
+    efficient once it fills the machine, but a sub-wave launch leaves most SMs
+    idle.  The one-row G1 reducer is useful only when the producer supplies at
+    least half a physical-SM wave of split work and its expanded row grid
+    remains within the same four-wave pressure bound used by the clustered
+    Q128 topology.  These occupancy bounds avoid a per-shape dispatch table.
+    """
+
+    _validate_positive_int(batch_size, "batch_size")
+    _validate_positive_int(physical_rows_per_batch, "physical_rows_per_batch")
+    _validate_positive_int(producer_ctas, "producer_ctas")
+    _validate_positive_int(reference_rows_per_cta, "reference_rows_per_cta")
+    _validate_positive_int(physical_sm_count, "physical_sm_count")
+
+    reference_ctas = (
+        batch_size
+        * (physical_rows_per_batch + reference_rows_per_cta - 1)
+        // reference_rows_per_cta
+    )
+    parallel_ctas = batch_size * physical_rows_per_batch
+    return (
+        reference_ctas < physical_sm_count
+        and producer_ctas >= (physical_sm_count + 1) // 2
+        and parallel_ctas <= physical_sm_count * _PARALLEL_REDUCER_MAX_CLUSTER_WAVES
+    )
+
+
 def _next_power_of_two(value: int) -> int:
     return 1 << (value - 1).bit_length()
 

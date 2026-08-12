@@ -58,6 +58,12 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.resources 
 from flashinfer.attention.prims_ts.kernels.mla_decode.kernel_policy import (
     select_mla_ts_kernel,
 )
+from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.query import (
+    FlatQueryTileLayout,
+)
+from flashinfer.attention.prims_ts.kernels.mla_decode.parallel_reduction_topology import (
+    should_use_q128_g1_parallel_reducer,
+)
 from flashinfer.mla import (
     get_prims_ts_batch_decode_mla_workspace_size,
     prims_ts_batch_decode_with_kv_cache_mla,
@@ -123,6 +129,132 @@ _INTERNAL_TUNING_TOKEN_SEQUENCES = (
     ("single", "kv"),
     ("tensor", "cores"),
 )
+
+
+@pytest.mark.parametrize(
+    "num_heads,seq_len_q,tile_size_q,expected",
+    (
+        # M128 throughput-2CTA acceptance geometry.
+        (128, 3, 128, (384, 3, 128)),
+        (96, 4, 128, (384, 3, 128)),
+        (48, 8, 128, (384, 3, 128)),
+        (24, 16, 128, (384, 3, 128)),
+        (12, 32, 128, (384, 3, 128)),
+        (96, 3, 128, (288, 3, 32)),
+        (48, 3, 128, (144, 2, 16)),
+        (24, 6, 128, (144, 2, 16)),
+        (12, 11, 128, (132, 2, 4)),
+        # H > M throughput-latency-1CTA geometry.
+        (12, 2, 8, (24, 3, 8)),
+        (24, 2, 16, (48, 3, 16)),
+        (48, 2, 32, (96, 3, 32)),
+        (96, 2, 64, (192, 3, 64)),
+        # H < M grouping-removal and partial-tail geometry.
+        (12, 4, 16, (48, 3, 16)),
+        (24, 4, 32, (96, 3, 32)),
+        (48, 4, 64, (192, 3, 64)),
+        (12, 1, 8, (12, 2, 4)),
+        (24, 1, 16, (24, 2, 8)),
+        (48, 1, 32, (48, 2, 16)),
+        (96, 1, 64, (96, 2, 32)),
+    ),
+)
+def test_attention_ts_mla_flat_query_tile_layout(
+    num_heads, seq_len_q, tile_size_q, expected
+):
+    layout = FlatQueryTileLayout.for_tile(num_heads, seq_len_q, tile_size_q)
+    assert (layout.total_rows, layout.num_tiles, layout.tail_rows) == expected
+    assert layout.logical_num_heads_q == num_heads
+    assert layout.logical_seq_len_q == seq_len_q
+    assert layout.tile_size_q == tile_size_q
+
+
+@pytest.mark.parametrize(
+    "num_heads,seq_len_q,tile_size_q",
+    ((0, 1, 128), (64, 0, 128), (64, 1, 0), (-1, 1, 8)),
+)
+def test_attention_ts_mla_flat_query_tile_layout_rejects_invalid_extent(
+    num_heads, seq_len_q, tile_size_q
+):
+    with pytest.raises(ValueError):
+        FlatQueryTileLayout.for_tile(num_heads, seq_len_q, tile_size_q)
+
+
+@pytest.mark.parametrize(
+    "layout_args,query_tile_idx,row_in_tile,expected",
+    (
+        ((96, 2, 128), 0, 127, (127, 1, 31, True)),
+        ((96, 2, 128), 1, 0, (128, 1, 32, True)),
+        ((96, 2, 64), 1, 31, (95, 0, 95, True)),
+        ((96, 2, 64), 1, 32, (96, 1, 0, True)),
+        ((12, 11, 128), 1, 3, (131, 10, 11, True)),
+        ((12, 11, 128), 1, 4, (132, 11, 0, False)),
+    ),
+)
+def test_attention_ts_mla_flat_query_row_coordinates(
+    layout_args, query_tile_idx, row_in_tile, expected
+):
+    layout = FlatQueryTileLayout.for_tile(*layout_args)
+    assert layout.row_coordinates(query_tile_idx, row_in_tile) == expected
+    assert layout.valid_rows(query_tile_idx) == (
+        layout.tail_rows
+        if query_tile_idx == layout.num_tiles - 1
+        else layout.tile_size_q
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,physical_rows_per_batch,producer_ctas,expected",
+    (
+        pytest.param(1, 384, 96, True, id="b1-three-q128-tiles-s16"),
+        pytest.param(1, 384, 72, False, id="producer-below-half-wave"),
+        pytest.param(2, 384, 96, False, id="b2-exceeds-four-parallel-waves"),
+        pytest.param(4, 384, 96, False, id="b4-reference-fills-machine"),
+        pytest.param(1, 592, 96, True, id="four-wave-boundary"),
+        pytest.param(1, 593, 96, False, id="past-four-wave-boundary"),
+    ),
+)
+def test_attention_ts_mla_q128_g1_parallel_reducer_wave_policy(
+    batch_size: int,
+    physical_rows_per_batch: int,
+    producer_ctas: int,
+    expected: bool,
+):
+    assert (
+        should_use_q128_g1_parallel_reducer(
+            batch_size=batch_size,
+            physical_rows_per_batch=physical_rows_per_batch,
+            producer_ctas=producer_ctas,
+            reference_rows_per_cta=8,
+            physical_sm_count=148,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "bad_kwargs",
+    (
+        {"batch_size": 0},
+        {"physical_rows_per_batch": 0},
+        {"producer_ctas": 0},
+        {"reference_rows_per_cta": 0},
+        {"physical_sm_count": 0},
+    ),
+)
+def test_attention_ts_mla_q128_g1_parallel_reducer_rejects_invalid_extent(
+    bad_kwargs,
+):
+    kwargs = {
+        "batch_size": 1,
+        "physical_rows_per_batch": 384,
+        "producer_ctas": 96,
+        "reference_rows_per_cta": 8,
+        "physical_sm_count": 148,
+    }
+    kwargs.update(bad_kwargs)
+    with pytest.raises(ValueError):
+        should_use_q128_g1_parallel_reducer(**kwargs)
 
 
 @dataclass(frozen=True)
@@ -773,6 +905,17 @@ def _assert_auto_policy(
     assert policy["tile_size_kv"] == 128
     assert int(policy["num_insts_kv"]) in (1, 2)
     assert int(policy["split_kv"]) >= 1
+    logical_num_heads_q = int(policy["logical_num_heads_q"])
+    logical_seq_len_q = int(policy["logical_seq_len_q"])
+    total_q_rows = logical_num_heads_q * logical_seq_len_q
+    tile_size_q = int(policy["tile_size_q"])
+    num_q_tiles = (total_q_rows + tile_size_q - 1) // tile_size_q
+    assert int(policy["total_q_rows"]) == total_q_rows
+    assert int(policy["num_q_tiles"]) == num_q_tiles
+    assert int(policy["tail_q_rows"]) == (
+        total_q_rows - (num_q_tiles - 1) * tile_size_q
+    )
+    assert int(policy["producer_ctas"]) > 0
     head_dim_per_cta_v = int(policy["head_dim_per_cta_v"])
     num_ctas_per_head_dim = int(policy["num_ctas_per_head_dim"])
     assert head_dim_per_cta_v in (128, 256, 512)
@@ -1961,6 +2104,309 @@ def test_attention_ts_mla_decode_head_dtype_product(
     _exercise_auto_mla_case(case)
 
 
+@pytest.mark.parametrize(
+    "num_qo_heads,seq_len_q",
+    (
+        pytest.param(12, 4, id="h12-sq4"),
+        pytest.param(24, 2, id="h24-sq2"),
+        pytest.param(48, 1, id="h48-sq1"),
+    ),
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
+    num_qo_heads: int,
+    seq_len_q: int,
+    qkv_dtype: torch.dtype,
+):
+    """Public auto-policy accepts flat 48-row H12/H24/H48 1CTA shapes."""
+
+    case = _make_mla_case(
+        batch_size=4,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=257,
+        seq_len_q=seq_len_q,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=40000 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    policy = _exercise_auto_mla_case(
+        case,
+        expected_b200={
+            "kernel": "throughput_latency_1cta",
+            "total_q_rows": 48,
+            "num_q_tiles": 3,
+        },
+    )
+    assert policy["logical_num_heads_q"] == num_qo_heads
+    assert policy["logical_seq_len_q"] == seq_len_q
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,seq_len_q",
+    (
+        pytest.param(96, 4, id="h96-sq4"),
+        pytest.param(48, 8, id="h48-sq8"),
+        pytest.param(24, 16, id="h24-sq16"),
+        pytest.param(12, 32, id="h12-sq32"),
+    ),
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_non_power_of_two_heads_2cta_matched_rows(
+    num_qo_heads: int,
+    seq_len_q: int,
+    qkv_dtype: torch.dtype,
+):
+    """The requested 384-row shapes use three packed M128 2CTA tiles."""
+
+    case = _make_mla_case(
+        batch_size=16,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=1024,
+        seq_len_q=seq_len_q,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=41000 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_2cta",
+            "tile_size_q": 128,
+            "total_q_rows": 384,
+            "num_q_tiles": 3,
+            "tail_q_rows": 128,
+            "split_kv": 1,
+        },
+        device=case.query.device,
+    )
+    expected_workspace_bytes = 0
+    if int(policy["split_kv"]) > 1:
+        expected_workspace_bytes = (
+            case.block_tables.shape[0]
+            * int(policy["tile_size_q"])
+            * int(policy["num_q_tiles"])
+            * int(policy["split_kv"])
+            * (_LATENT_DIM * 2 + 4)
+        )
+    assert (
+        wrapper._workspace_layout.kernel_workspace.byte_size == expected_workspace_bytes
+    )
+    _exercise_public_paths(wrapper, case, policy, exercise_all_paths=False)
+
+
+@pytest.mark.parametrize(
+    "tile_size_q,num_qo_heads",
+    (
+        pytest.param(8, 12, id="m8-h12"),
+        pytest.param(16, 24, id="m16-h24"),
+        pytest.param(32, 48, id="m32-h48"),
+        pytest.param(64, 96, id="m64-h96"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_forced_1cta_flat_profile_product(
+    monkeypatch,
+    tile_size_q: int,
+    num_qo_heads: int,
+):
+    """Qualify every 1CTA M profile where logical H crosses tile boundaries."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode import (
+        kernel_policy as kernel_policy_module,
+    )
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
+        config as one_cta_config,
+    )
+
+    monkeypatch.setattr(
+        kernel_policy_module,
+        "resolve_mla_kernel_policy",
+        lambda policy, num_heads, seq_len_q, **automatic_work: (
+            "throughput_latency_1cta",
+            "forced-profile-test",
+        ),
+    )
+    monkeypatch.setattr(
+        one_cta_config,
+        "resolve_auto_mla_gen_groups_tokens_heads_q_shape",
+        lambda **kwargs: one_cta_config.GroupsTokensHeadsLaunchShape.for_tile(
+            kwargs["num_heads_q"],
+            kwargs["seq_len_q"],
+            tile_size_q,
+        ),
+    )
+    mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+    mla_decode_module._get_compiled_mla_decode.cache_clear()
+    try:
+        case = _make_mla_case(
+            batch_size=2,
+            num_qo_heads=num_qo_heads,
+            max_seq_len=257,
+            seq_len_q=2,
+            qkv_dtype=torch.bfloat16,
+            device="cuda",
+            seed=42000 + num_qo_heads,
+        )
+        case = _apply_mla_tail_markers(case)
+        wrapper = _plan_case(case)
+        policy = dict(wrapper._policy)
+        assert policy["kernel"] == "throughput_latency_1cta"
+        assert policy["source"] == "forced-profile-test"
+        assert policy["tile_size_q"] == tile_size_q
+        assert policy["logical_num_heads_q"] == num_qo_heads
+        assert policy["logical_seq_len_q"] == 2
+        assert policy["num_q_tiles"] == 3
+        assert policy["tail_q_rows"] == tile_size_q
+        output = _run_case(wrapper, case)
+        _assert_case_correct(output, case, policy)
+    finally:
+        # Cached launch specs retain monkeypatched callables through their
+        # selected kernel objects, so clear them before pytest restores attrs.
+        mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+        mla_decode_module._get_compiled_mla_decode.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,seq_len_q,expected_tail_rows",
+    (
+        pytest.param(96, 2, 64, id="h96-sq2-tail64"),
+        pytest.param(12, 11, 4, id="h12-sq11-tail4"),
+    ),
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_forced_2cta_flat_split_reducer(
+    monkeypatch,
+    num_qo_heads: int,
+    seq_len_q: int,
+    expected_tail_rows: int,
+    qkv_dtype: torch.dtype,
+):
+    """Exercise M128 cross-token tails through the split producer/reducer."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode import (
+        kernel_policy as kernel_policy_module,
+    )
+
+    monkeypatch.setattr(
+        kernel_policy_module,
+        "resolve_mla_kernel_policy",
+        lambda policy, num_heads, seq_len_q, **automatic_work: (
+            "throughput_2cta",
+            "forced-family-test",
+        ),
+    )
+    mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+    mla_decode_module._get_compiled_mla_decode.cache_clear()
+    try:
+        case = _make_mla_case(
+            batch_size=2,
+            num_qo_heads=num_qo_heads,
+            max_seq_len=256,
+            seq_len_q=seq_len_q,
+            qkv_dtype=qkv_dtype,
+            device="cuda",
+            seed=42500 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+        )
+        case = _apply_mla_tail_markers(case)
+        wrapper = _plan_case(case)
+        policy = dict(wrapper._policy)
+        assert policy["kernel"] == "throughput_2cta"
+        assert policy["source"] == "forced-family-test"
+        assert policy["tile_size_q"] == 128
+        assert policy["num_q_tiles"] == 2
+        assert policy["tail_q_rows"] == expected_tail_rows
+        assert policy["split_kv"] == 2
+        assert policy["separate_reducer_impl"] == "reference"
+        assert policy["reducer_cluster_size"] == 1
+        expected_workspace_bytes = (
+            case.block_tables.shape[0] * 128 * 2 * 2 * (_LATENT_DIM * 2 + 4)
+        )
+        assert (
+            wrapper._workspace_layout.kernel_workspace.byte_size
+            == expected_workspace_bytes
+        )
+        output = _run_case(wrapper, case)
+        _assert_case_correct(output, case, policy)
+    finally:
+        mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+        mla_decode_module._get_compiled_mla_decode.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_forced_2cta_underfilled_g1_reducer(
+    monkeypatch,
+    qkv_dtype: torch.dtype,
+):
+    """Use one-row G1 for a split-16 reducer whose eight-row grid underfills."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode import (
+        kernel_policy as kernel_policy_module,
+    )
+
+    monkeypatch.setattr(
+        kernel_policy_module,
+        "resolve_mla_kernel_policy",
+        lambda policy, num_heads, seq_len_q, **automatic_work: (
+            "throughput_2cta",
+            "forced-g1-test",
+        ),
+    )
+    mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+    mla_decode_module._get_compiled_mla_decode.cache_clear()
+    try:
+        case = _make_mla_case(
+            batch_size=1,
+            num_qo_heads=48,
+            max_seq_len=2048,
+            seq_len_q=8,
+            qkv_dtype=qkv_dtype,
+            device="cuda",
+            seed=42600 + (1 if qkv_dtype == _FP8 else 0),
+        )
+        case = _apply_mla_tail_markers(case)
+        wrapper = _plan_case(case)
+        policy = dict(wrapper._policy)
+        assert policy["kernel"] == "throughput_2cta"
+        assert policy["source"] == "forced-g1-test"
+        assert policy["num_q_tiles"] == 3
+        assert policy["split_kv"] == 16
+        assert policy["producer_ctas"] == 96
+        assert policy["separate_reducer_impl"] == "parallel"
+        assert policy["reducer_cluster_size"] == 1
+        output = _run_case(wrapper, case)
+        _assert_case_correct(output, case, policy)
+    finally:
+        mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
+        mla_decode_module._get_compiled_mla_decode.cache_clear()
+
+
 @pytest.mark.parametrize("num_qo_heads", (8, 16, 32, 64), ids=lambda value: f"h{value}")
 @pytest.mark.parametrize(
     "qkv_dtype",
@@ -2030,6 +2476,46 @@ def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
         max_seq_len_q=max_seq_len_q,
     )
     assert policy["source"] == "auto"
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,expected_kernel",
+    (
+        pytest.param(12, "throughput_latency_1cta", id="h12-1cta"),
+        pytest.param(96, "throughput_2cta", id="h96-2cta"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
+    num_qo_heads: int,
+    expected_kernel: str,
+):
+    """Packed requests predicate inactive flat tiles in both kernel families."""
+
+    q_lens = (1, 3, 5)
+    max_seq_len_q = max(q_lens)
+    case = _make_mla_case(
+        batch_size=len(q_lens),
+        num_qo_heads=num_qo_heads,
+        max_seq_len=1024,
+        seq_len_q=max_seq_len_q,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        page_size=64,
+        device="cuda",
+        seed=43000 + num_qo_heads,
+    )
+    case = _apply_mla_tail_markers(case)
+    case, qo_indptr = _pack_mla_case(case, q_lens)
+    policy = _exercise_auto_mla_case(
+        case,
+        expected_b200={"kernel": expected_kernel},
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+    )
+    assert policy["logical_num_heads_q"] == num_qo_heads
+    assert policy["logical_seq_len_q"] == max_seq_len_q
 
 
 @pytest.mark.parametrize(

@@ -27,7 +27,7 @@ from ..helpers.ops import (
     warp_reduce_max_f32,
     warp_reduce_sum_f32,
 )
-from ..helpers.query import groups_tokens_heads_q_row_state, public_query_flat_row
+from ..helpers.query import flat_query_row_state, public_query_flat_row
 from ..parallel_reduction_topology import ParallelReductionTopology
 from .config import MlaConfig
 
@@ -233,10 +233,10 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             _,
             _,
             valid_output_row,
-        ) = groups_tokens_heads_q_row_state(
+        ) = flat_query_row_state(
             head_idx,
             q_idx,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
             cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
@@ -310,10 +310,10 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
         _,
         _,
         valid_output_row,
-    ) = groups_tokens_heads_q_row_state(
+    ) = flat_query_row_state(
         head_idx,
         q_idx,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q=cu_seqlens_q,
@@ -453,10 +453,10 @@ def _run_parallel_gmem_reduction_shared_stats(
             _,
             _,
             valid_stats_row,
-        ) = groups_tokens_heads_q_row_state(
+        ) = flat_query_row_state(
             stats_head_idx,
             q_idx,
-            cfg.groups_tokens_heads_q_ratio,
+            cfg.tile_size_q,
             cfg.logical_num_heads_q,
             cfg.logical_seq_len_q,
             cu_seqlens_q=cu_seqlens_q,
@@ -535,10 +535,10 @@ def _run_parallel_gmem_reduction_shared_stats(
         _,
         _,
         valid_output_row,
-    ) = groups_tokens_heads_q_row_state(
+    ) = flat_query_row_state(
         head_idx,
         q_idx,
-        cfg.groups_tokens_heads_q_ratio,
+        cfg.tile_size_q,
         cfg.logical_num_heads_q,
         cfg.logical_seq_len_q,
         cu_seqlens_q=cu_seqlens_q,
@@ -649,10 +649,10 @@ def _run_parallel_gmem_reduction_shared_stats(
                 _,
                 _,
                 valid_stats_row,
-            ) = groups_tokens_heads_q_row_state(
+            ) = flat_query_row_state(
                 stats_head_idx,
                 q_idx,
-                cfg.groups_tokens_heads_q_ratio,
+                cfg.tile_size_q,
                 cfg.logical_num_heads_q,
                 cfg.logical_seq_len_q,
                 cu_seqlens_q=cu_seqlens_q,

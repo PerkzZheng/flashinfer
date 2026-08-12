@@ -41,7 +41,7 @@ carry the wrapper's plan-owned fixed-versus-packed query mode.
 | Output dtype | `torch.bfloat16` only |
 | Q length | Fixed or packed variable length; static maximum must be positive |
 | K/V length | Positive and at most `2**31 - 32768`; the reserve keeps the largest padded split-KV coordinate span in signed `int32` |
-| Q heads | Validated at 8, 16, 32, 64, and 128; other positive counts are accepted only when automatic selection reports an implementation |
+| Q heads | Validated at 8, 12, 16, 24, 32, 48, 64, 96, and 128; other positive counts are accepted only when automatic selection reports an implementation |
 | K/V cache | Paged, one logical KV head; `[num_pages, page_size, 576]` or `[num_pages, 1, page_size, 576]` compact storage |
 | Metadata/cache index extents | Flattened query-head capacity, block-table elements, and physical page count must fit signed `int32` |
 | Page size | 16, 32, 64, or 128 tokens |
@@ -52,8 +52,8 @@ carry the wrapper's plan-owned fixed-versus-packed query mode.
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but remains to be qualified.
 
-Some head and Q-length combinations outside the validated power-of-two matrix
-do not have a generated implementation and are rejected.
+Some head and Q-length combinations outside the validated matrix do not have a
+generated implementation and are rejected.
 
 Query, cache, and output tensors must be compact, 16-byte-aligned CUDA tensors
 on the metadata device. `block_tables` and `seq_lens` are compact,
@@ -79,6 +79,21 @@ only. FP32 LSE is internal workspace and is not exposed as an output.
   `block_tables`.
 - Runtime lengths: contiguous CUDA `int32[B]` `seq_lens`. Every length is
   positive and no larger than the static K/V bound.
+
+Internally, the query-token and query-head axes form one affine row space,
+`flat_row = query_idx * H + head_idx`. The 1-CTA profiles partition this space
+with physical M8/M16/M32/M64 tiles, while the 2-CTA family uses M128. Therefore
+the number of scheduled query tiles is `ceil(H * SQ / M)` and only the final
+physical tile can contain inactive rows. Public tensor shapes remain unchanged;
+valid physical rows map back to their logical `(query_idx, head_idx)` output
+coordinates.
+
+Split-KV workspaces intentionally retain rectangular physical geometry with
+`M * ceil(H * SQ / M)` rows. Producer stores and every reducer use the same
+mapping, and final-tile rows beyond `H * SQ` are predicated from public output.
+For packed Q, each request applies the same mapping to its runtime query length;
+rectangular tiles beyond a shorter request's active prefix retire scheduler
+bookkeeping without issuing Q/K/V or output accesses.
 
 For causal request `b`, query row `i` can attend through
 `seq_lens[b] - query_length[b] + i`. `bmm1_scale` and `bmm2_scale` default to
@@ -123,8 +138,17 @@ and reduction topology automatically. CLC-persistent scheduling is used when
 the logical work benefits from reusing resident CTAs; callers do not select a
 scheduler or kernel family through the public wrappers.
 
+For a static split-KV 2-CTA launch, the standalone reducer also follows launch
+geometry. Small split counts normally retain the coarsened reference reducer.
+The exact-capacity, one-row G1 reducer is selected only when that reference grid
+is smaller than one physical-SM wave, the producer supplies at least half a
+wave of split work, and expanding to one CTA per physical row stays within the
+shared four-wave pressure bound. S17 through S32 remain on the reference path;
+larger split counts may use the clustered reducer. These are topology rules,
+not per-head or per-sequence-length tuning exceptions.
+
 The BF16 2-CTA path enables CLC only when logical work exceeds one resident
-wave. Inactive Q groups, pruned split slots, and zero-visible-K tiles skip
+wave. Inactive physical Q tiles, pruned split slots, and zero-visible-K tiles skip
 their Q/K/V and TMEM data work and skip the active-tile throttle edge
 symmetrically. Every participating task still advances the work queue, so all
 tasks retire the same work-tile sequence. This matched progression is the
@@ -248,7 +272,9 @@ compact, 16-byte-aligned `out` tensor to avoid allocation.
 
 The public accuracy suite covers fixed and packed Q, `torch.bfloat16` and
 `torch.float8_e4m3fn` input, dense and causal masks, all four page sizes, both
-automatic kernel families, runtime K pruning, split-KV reduction,
+automatic kernel families, H12/H24/H48/H96 flat-row cases, forced 1-CTA
+M8/M16/M32/M64 profiles, 2-CTA M128 tails, runtime K pruning, split-KV
+reduction (including the underfilled one-row G1 and reference fallbacks),
 output/workspace contracts, and CUDA graphs:
 
 ```bash

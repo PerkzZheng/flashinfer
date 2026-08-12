@@ -24,7 +24,7 @@ from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.math import ceil_div
 from ..helpers.ops import fmax_f32, warp_reduce_max_f32, warp_reduce_sum_f32
-from ..helpers.query import groups_tokens_heads_q_row_state, query_batch_bounds
+from ..helpers.query import flat_query_row_state, query_batch_bounds
 from .work_partition import (
     runtime_row_prefix_active_split_count,
     runtime_split_kv_cap,
@@ -43,7 +43,7 @@ PARALLEL_REDUCTION_HEAD_DIM = (
 
 @cute.jit
 def _parallel_reduction_row_state(
-    groups_tokens_heads_q_ratio: cutlass.Constexpr[int],
+    tile_size_q: cutlass.Constexpr[int],
     num_heads: cutlass.Constexpr[int],
     seq_len_q: cutlass.Constexpr[int],
     is_var_split_kv: cutlass.Constexpr[bool],
@@ -71,10 +71,10 @@ def _parallel_reduction_row_state(
         logical_q_idx,
         storage_q_idx,
         query_is_valid,
-    ) = groups_tokens_heads_q_row_state(
+    ) = flat_query_row_state(
         effective_head_idx,
         seq_q_idx,
-        groups_tokens_heads_q_ratio,
+        tile_size_q,
         num_heads,
         seq_len_q,
         cu_seqlens_q,
@@ -96,10 +96,10 @@ def _parallel_reduction_row_state(
             batch_idx,
             seq_len_q,
         )
-        _, _, group_last_logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-            Int32(num_heads * groups_tokens_heads_q_ratio - 1),
+        _, _, group_last_logical_q_idx, _, _ = flat_query_row_state(
+            Int32(tile_size_q - 1),
             seq_q_idx,
-            groups_tokens_heads_q_ratio,
+            tile_size_q,
             num_heads,
             seq_len_q,
             cu_seqlens_q,
@@ -178,7 +178,6 @@ def _store_parallel_reduction_result(
 
 @cute.jit
 def run_parallel_reduction_kernel(
-    groups_tokens_heads_q_ratio: cutlass.Constexpr[int],
     num_heads: cutlass.Constexpr[int],
     seq_len_q: cutlass.Constexpr[int],
     is_var_split_kv: cutlass.Constexpr[bool],
@@ -220,7 +219,7 @@ def run_parallel_reduction_kernel(
         query_is_valid,
         active_split_kv,
     ) = _parallel_reduction_row_state(
-        groups_tokens_heads_q_ratio,
+        cfg.mma_qk_tiler[0],
         num_heads,
         seq_len_q,
         is_var_split_kv,

@@ -562,6 +562,7 @@ def _resolve_mla_decode_launch_spec(
         resolve_mla_kernel_policy,
         select_mla_ts_kernel,
     )
+    from .kernels.mla_decode.helpers.query import FlatQueryTileLayout
     from .kernels.mla_decode.throughput_2cta.config import (
         compute_split_kv,
         compute_workspace_size as compute_2cta_workspace_size,
@@ -610,18 +611,16 @@ def _resolve_mla_decode_launch_spec(
             2, plan_stream
         )
 
-        two_cta_launch_shape = GroupsTokensHeadsLaunchShape.for_tile(
-            num_heads, seq_len_q, 128
-        )
+        two_cta_layout = FlatQueryTileLayout.for_tile(num_heads, seq_len_q, 128)
         two_cta_split_kv = compute_split_kv(
             batch_size=batch_size,
-            seq_len_q=two_cta_launch_shape.seq_len_q,
+            num_q_tiles=two_cta_layout.num_tiles,
             seq_len_kv=max_kv_len,
             mma_qk_tiler_mn=(128, 128),
             max_active_blocks=max_active_two_cta_clusters * 2,
         )
         two_cta_cluster_work = (
-            batch_size * two_cta_launch_shape.seq_len_q * max(two_cta_split_kv, 1)
+            batch_size * two_cta_layout.num_tiles * max(two_cta_split_kv, 1)
         )
 
         one_cta_launch_shape = resolve_auto_mla_gen_groups_tokens_heads_q_shape(
@@ -846,6 +845,11 @@ def _resolve_mla_decode_launch_spec(
                 partial_o_dtype=cutlass.BFloat16,
                 lse_dtype=cutlass.Float32,
             )
+            final_query_layout = FlatQueryTileLayout.for_tile(
+                num_heads,
+                seq_len_q,
+                int(final_cfg.tile_size_q),
+            )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
                 split_kv=split_kv,
@@ -855,12 +859,26 @@ def _resolve_mla_decode_launch_spec(
                 ("kernel", decision.selected_kernel),
                 ("source", policy_source),
                 ("profile", decision.profile_name),
+                ("logical_num_heads_q", num_heads),
+                ("logical_seq_len_q", seq_len_q),
+                ("total_q_rows", int(final_query_layout.total_rows)),
+                ("num_q_tiles", int(final_query_layout.num_tiles)),
+                ("tail_q_rows", int(final_query_layout.tail_rows)),
                 ("tile_size_q", int(final_cfg.tile_size_q)),
                 ("tile_size_kv", int(final_cfg.tile_size_kv)),
                 ("num_insts_kv", int(final_cfg.num_insts_kv)),
                 ("split_kv", split_kv),
                 ("num_ctas_per_head_dim", int(final_cfg.num_ctas_per_head_dim)),
                 ("head_dim_per_cta_v", int(final_cfg.head_dim_per_cta_v)),
+                (
+                    "producer_ctas",
+                    int(
+                        batch_size
+                        * final_query_layout.num_tiles
+                        * split_kv
+                        * final_cfg.num_ctas_per_head_dim
+                    ),
+                ),
                 ("use_cluster_reduction", bool(final_cfg.use_cluster_reduction)),
                 (
                     "use_persistent_scheduler",
@@ -875,7 +893,7 @@ def _resolve_mla_decode_launch_spec(
             )
         else:
             max_active_clusters = max_active_two_cta_clusters
-            launch_shape = two_cta_launch_shape
+            launch_shape = two_cta_layout
             decision = select_mla_ts_kernel(
                 requested_policy=requested_policy,
                 batch_size=batch_size,
@@ -896,7 +914,7 @@ def _resolve_mla_decode_launch_spec(
             if not decision.implementation_ready:
                 raise NotImplementedError(decision.reason)
             split_kv = two_cta_split_kv
-            work_clusters = batch_size * launch_shape.seq_len_q * max(split_kv, 1)
+            work_clusters = batch_size * launch_shape.num_tiles * max(split_kv, 1)
             # Dynamic cluster stealing only helps once logical work exceeds a
             # resident wave.  Within one wave every cluster already launches,
             # so the CLC producer/response pipeline is pure overhead.
@@ -922,8 +940,8 @@ def _resolve_mla_decode_launch_spec(
                 mask_type=mask_type,
             )
             workspace_size = compute_2cta_workspace_size(
-                num_heads=int(launch_shape.num_heads_q),
-                seq_len_q=int(launch_shape.seq_len_q),
+                tile_size_q=int(launch_shape.tile_size_q),
+                num_q_tiles=int(launch_shape.num_tiles),
                 latent_dim=kv_lora_rank,
                 batch_size=batch_size,
                 split_kv=split_kv,
@@ -939,12 +957,21 @@ def _resolve_mla_decode_launch_spec(
                 ("kernel", decision.selected_kernel),
                 ("source", policy_source),
                 ("profile", None),
+                ("logical_num_heads_q", num_heads),
+                ("logical_seq_len_q", seq_len_q),
+                ("total_q_rows", int(launch_shape.total_rows)),
+                ("num_q_tiles", int(launch_shape.num_tiles)),
+                ("tail_q_rows", int(launch_shape.tail_rows)),
                 ("tile_size_q", 128),
                 ("tile_size_kv", 128),
                 ("num_insts_kv", 1),
                 ("split_kv", int(split_kv)),
                 ("num_ctas_per_head_dim", 2),
                 ("head_dim_per_cta_v", 256),
+                (
+                    "producer_ctas",
+                    int(2 * batch_size * launch_shape.num_tiles * split_kv),
+                ),
                 ("use_cluster_reduction", False),
                 ("use_persistent_scheduler", bool(is_persistent)),
                 (

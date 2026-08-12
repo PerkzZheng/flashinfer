@@ -34,8 +34,8 @@ from ....split_kv_mode_policy import select_split_kv_modes
 from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.query import (
+    FlatQueryTileLayout,
     groups_tokens_heads_q_capacity,
-    groups_tokens_heads_q_group_count,
 )
 
 
@@ -450,7 +450,7 @@ class MlaProfile:
 
 @dataclass(frozen=True)
 class GroupsTokensHeadsLaunchShape:
-    """Logical and effective groups_tokens_heads_q launch dimensions."""
+    """Logical inputs and normalized physical flat-Q launch dimensions."""
 
     enabled: bool
     ratio: int
@@ -467,22 +467,38 @@ class GroupsTokensHeadsLaunchShape:
         logical_seq_len_q: int,
         tile_size_q: int | None,
     ) -> "GroupsTokensHeadsLaunchShape":
-        """Build effective dimensions from an optional selected Q tile."""
+        """Build physical M-row tiles from an optional selected Q tile."""
 
         if logical_num_heads_q <= 0:
             raise ValueError("logical_num_heads_q must be positive")
-        ratio = (
-            groups_tokens_heads_q_capacity(logical_num_heads_q, tile_size_q)
-            if tile_size_q is not None
-            else 1
+        if logical_seq_len_q <= 0:
+            raise ValueError("logical_seq_len_q must be positive")
+        if tile_size_q is None:
+            return cls(
+                enabled=False,
+                ratio=1,
+                logical_num_heads_q=logical_num_heads_q,
+                logical_seq_len_q=logical_seq_len_q,
+                num_heads_q=logical_num_heads_q,
+                seq_len_q=logical_seq_len_q,
+                tile_size_q=None,
+            )
+
+        layout = FlatQueryTileLayout.for_tile(
+            logical_num_heads_q,
+            logical_seq_len_q,
+            tile_size_q,
         )
         return cls(
-            enabled=ratio > 1,
-            ratio=ratio,
+            enabled=(
+                layout.tile_size_q != logical_num_heads_q
+                or layout.num_tiles != logical_seq_len_q
+            ),
+            ratio=1,
             logical_num_heads_q=logical_num_heads_q,
             logical_seq_len_q=logical_seq_len_q,
-            num_heads_q=logical_num_heads_q * ratio,
-            seq_len_q=groups_tokens_heads_q_group_count(logical_seq_len_q, ratio),
+            num_heads_q=layout.tile_size_q,
+            seq_len_q=layout.num_tiles,
             tile_size_q=tile_size_q,
         )
 
@@ -521,13 +537,15 @@ def resolve_groups_tokens_heads_q_tile_hint(
 
 
 def should_auto_group_tokens_heads_q(num_heads_q: int, seq_len_q: int) -> bool:
-    """Return whether a no-hint 1CTA launch should group tokens and Q heads."""
+    """Return whether a no-hint 1CTA launch should normalize to flat tiles."""
 
     if num_heads_q <= 0:
         raise ValueError("num_heads_q must be positive")
     if seq_len_q <= 0:
         raise ValueError("seq_len_q must be positive")
-    return seq_len_q > 1 or num_heads_q < min(SUPPORTED_TILE_SIZE_Q)
+    # Every automatic launch must name a physical MMA tile independently of
+    # logical H.  This is also required for H>M and non-power-of-two H at SQ1.
+    return True
 
 
 def tile_size_q_for_tokens_heads(num_tokens_heads_q: int) -> int:
@@ -663,7 +681,7 @@ def use_swaps_mma_ab_mla_gen_kernel(
     TS-measured crossover and the q16 head split fits within one SM wave.
     """
 
-    num_ctas = batch_size * seq_len_q * ceil(num_heads_q / 16)
+    num_ctas = batch_size * ceil(num_heads_q * seq_len_q / 16)
     if num_ctas <= 0:
         return False
 
@@ -710,7 +728,7 @@ def auto_tile_size_q_for_mla_gen(
 
     q16_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 16)
     q32_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 32)
-    full_q32 = num_heads_q >= 32 and num_heads_q % 32 == 0
+    full_q32 = num_heads_q * seq_len_q >= 32
     if (
         base_tile_size_q == 16
         and full_q32
@@ -731,30 +749,36 @@ def resolve_auto_mla_gen_groups_tokens_heads_q_shape(
     qkv_dtype: str,
     max_active_clusters: int,
 ) -> GroupsTokensHeadsLaunchShape:
-    """Resolve the automatic grouped-Q shape used by the public MLA planner.
+    """Resolve the public 1CTA profile tile and flat-row launch extent.
 
-    The grouped FP8 q32 swaps-MMA-AB schedule is still a useful explicit
-    benchmark target, but grouping every query token into one q32 CTA removes
-    too much launch parallelism for a short-K launch whose per-token grid still
-    fits in one resident wave.  In that regime, retain the established
-    MLA-generation tile heuristic so the planner uses the smaller per-token
-    tile.  Long-K launches, multi-wave per-token grids, keeps-MMA-AB q64
-    grouping, and BF16 grouped schedules retain their existing choices.
+    Preserve the established grouped launch tile for the legacy power-of-two
+    head families. Their profiles and split policies were tuned around that
+    tile choice, and flat packing only needs to replace their row mapping. A
+    non-power-of-two logical head count has no valid legacy grouped shape, so
+    select its physical M tile with the normal occupancy heuristic.
+
+    The existing FP8 M32 short-K exception still applies to a legacy grouped
+    launch. Its work calculation is intentionally the new flat-row count.
     """
 
-    launch_shape = resolve_throughput_latency_groups_tokens_heads_q_shape(
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        explicit_tile_size_q=None,
-        profile=None,
-        auto_groups_tokens_heads=True,
-    )
-    if not (
-        qkv_dtype == "e4m3"
-        and launch_shape.tile_size_q == 32
-        and launch_shape.ratio > 1
-    ):
-        return launch_shape
+    legacy_grouped_shape = None
+    legacy_power_of_two_heads = num_heads_q in (8, 16, 32, 64)
+    if legacy_power_of_two_heads and seq_len_q > 1:
+        legacy_grouped_shape = GroupsTokensHeadsLaunchShape.for_tile(
+            num_heads_q,
+            seq_len_q,
+            tile_size_q_for_tokens_heads(num_heads_q * seq_len_q),
+        )
+        legacy_group_ratio = groups_tokens_heads_q_capacity(
+            num_heads_q,
+            legacy_grouped_shape.tile_size_q,
+        )
+        if not (
+            qkv_dtype == "e4m3"
+            and legacy_grouped_shape.tile_size_q == 32
+            and legacy_group_ratio > 1
+        ):
+            return legacy_grouped_shape
 
     tile_size_q = auto_tile_size_q_for_mla_gen(
         batch_size=batch_size,
@@ -763,21 +787,23 @@ def resolve_auto_mla_gen_groups_tokens_heads_q_shape(
         seq_len_kv=seq_len_kv,
         multi_processor_count=max_active_clusters,
     )
-    per_token_work = q_tile_work_count(
-        batch_size,
+    if legacy_grouped_shape is not None:
+        per_tile_work = q_tile_work_count(
+            batch_size,
+            num_heads_q,
+            seq_len_q,
+            tile_size_q,
+        )
+        steady_steps = ceil(
+            seq_len_kv / (MlaConfig.tile_size_kv * MlaConfig.num_insts_kv)
+        )
+        if per_tile_work > max_active_clusters or steady_steps > 8:
+            return legacy_grouped_shape
+
+    return GroupsTokensHeadsLaunchShape.for_tile(
         num_heads_q,
         seq_len_q,
         tile_size_q,
-    )
-    steady_steps = ceil(seq_len_kv / (MlaConfig.tile_size_kv * MlaConfig.num_insts_kv))
-    if per_token_work > max_active_clusters or steady_steps > 8:
-        return launch_shape
-    return resolve_throughput_latency_groups_tokens_heads_q_shape(
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        explicit_tile_size_q=tile_size_q,
-        profile=None,
-        auto_groups_tokens_heads=True,
     )
 
 
@@ -823,7 +849,7 @@ def q_tile_work_count(
     """Return CTA work count before KV or V-head-dim decomposition."""
 
     tile_size_q = tile_size_q or tile_size_q_for_heads(num_heads_q)
-    return batch_size * seq_len_q * ceil(num_heads_q / tile_size_q)
+    return batch_size * ceil(num_heads_q * seq_len_q / tile_size_q)
 
 
 def automatic_split_kv_step_tokens(
@@ -1880,18 +1906,9 @@ def make_throughput_latency_mla_config(
         raise ValueError("logical_seq_len_q must be positive")
     if seq_len_kv <= 0:
         raise ValueError("seq_len_kv must be positive")
-    if groups_tokens_heads_q_ratio <= 0:
-        raise ValueError("groups_tokens_heads_q_ratio must be positive")
-    if num_heads_q != logical_num_heads_q * groups_tokens_heads_q_ratio:
+    if groups_tokens_heads_q_ratio != 1:
         raise ValueError(
-            "effective num_heads_q must equal logical_num_heads_q * groups_tokens_heads_q_ratio"
-        )
-    if seq_len_q != groups_tokens_heads_q_group_count(
-        logical_seq_len_q, groups_tokens_heads_q_ratio
-    ):
-        raise ValueError(
-            "effective seq_len_q must equal ceil(logical_seq_len_q / "
-            "groups_tokens_heads_q_ratio)"
+            "flat query-row packing requires groups_tokens_heads_q_ratio=1"
         )
     if latent_dim <= 0:
         raise ValueError("latent_dim must be positive")
@@ -1949,6 +1966,19 @@ def make_throughput_latency_mla_config(
     tile_size_q = tile_size_q_for_profile(
         selected_profile, num_heads_q, seq_len_q, tile_size_q
     )
+    flat_layout = FlatQueryTileLayout.for_tile(
+        logical_num_heads_q,
+        logical_seq_len_q,
+        tile_size_q,
+    )
+    if num_heads_q != flat_layout.tile_size_q or seq_len_q != flat_layout.num_tiles:
+        raise ValueError(
+            "physical 1CTA launch shape must match the flat query-row layout: "
+            f"got num_heads_q={num_heads_q}, seq_len_q={seq_len_q}; expected "
+            f"num_heads_q={flat_layout.tile_size_q}, "
+            f"seq_len_q={flat_layout.num_tiles} for logical "
+            f"H={logical_num_heads_q}, SQ={logical_seq_len_q}"
+        )
     if selected_profile.kernel_variant == "keeps_mma_ab" and num_heads_q < tile_size_q:
         raise ValueError(
             "keeps_mma_ab profiles require an effective Q tile of at least "

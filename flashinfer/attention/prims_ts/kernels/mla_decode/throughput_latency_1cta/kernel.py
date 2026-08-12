@@ -207,7 +207,7 @@ def _publish_neutral_standalone_partial(
 
 @cute.jit
 def _persistent_work_tile_is_inactive(cfg, cache_seqs, cu_seqlens_q, work_tile):
-    """Return whether a persistent Q tile is runtime padding."""
+    """Return whether a persistent physical Q tile has no runtime rows."""
 
     cta_idx_q, _, batch_head_idx = work_tile.tile_idx
     batch_idx = Int32(batch_head_idx) // Int32(cfg.num_ctas_for_all_heads)
@@ -250,7 +250,7 @@ class ThroughputLatencyMlaStaticWorkQueue(WorkQueue):
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: WorkTileInfo):
-        """Skip packed-Q padding while retaining queue bookkeeping."""
+        """Skip inactive physical Q tiles while retaining queue bookkeeping."""
 
         return _persistent_work_tile_is_inactive(
             self.cfg,
@@ -333,7 +333,7 @@ class ThroughputLatencyMlaClcWorkQueue(WorkQueue):
 
     @cute.jit
     def skip_work_tile_if(self, work_tile: WorkTileInfo):
-        """Skip packed-Q padding while retaining queue bookkeeping."""
+        """Skip inactive physical Q tiles while retaining queue bookkeeping."""
 
         return _persistent_work_tile_is_inactive(
             self.cfg,

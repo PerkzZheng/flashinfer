@@ -34,7 +34,7 @@ from ..helpers.ops import (
     warp_reduce_sum_f32,
     vector_from_scalars,
 )
-from ..helpers.query import groups_tokens_heads_q_row_state, query_batch_bounds
+from ..helpers.query import flat_query_row_state, query_batch_bounds
 from .work_partition import (
     runtime_row_prefix_active_split_count,
     runtime_split_kv_cap,
@@ -59,8 +59,9 @@ def run_reduction_kernel(
 
     Each 64-thread row group owns one D512 output row.  Its first warp computes
     FP32 LSE rescale factors, both warps consume one contiguous 16-byte BF16
-    fragment per thread, and the final accumulation remains FP32.  Padded rows
-    still participate in CTA synchronization but never publish public output.
+    fragment per thread, and the final accumulation remains FP32. Physical
+    tail rows still participate in CTA synchronization but never publish
+    public output.
     """
     effective_head_group_idx, seq_q_idx, batch_idx = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
@@ -71,13 +72,13 @@ def run_reduction_kernel(
     )
     lane_idx = row_thread_idx % Int32(cfg.threads_per_warp)
 
-    effective_num_heads_q = Int32(kernel.num_heads * kernel.groups_tokens_heads_q_ratio)
+    effective_num_heads_q = Int32(cfg.mma_qk_tiler[0])
     effective_head_idx = (
         effective_head_group_idx * Int32(REDUCTION_ROWS_PER_CTA) + row_in_cta
     )
     head_is_valid = effective_head_idx < effective_num_heads_q
     # The row helper performs control-flow and storage-coordinate arithmetic.
-    # Clamp a tail CTA's padding rows before calling it, then predicate every
+    # Clamp a tail CTA's inactive rows before calling it, then predicate every
     # public/workspace access with ``head_is_valid``.
     safe_effective_head_idx = cute.math.min(
         effective_head_idx, effective_num_heads_q - Int32(1)
@@ -88,10 +89,10 @@ def run_reduction_kernel(
         logical_q_idx,
         _,
         mapped_query_is_valid,
-    ) = groups_tokens_heads_q_row_state(
+    ) = flat_query_row_state(
         safe_effective_head_idx,
         seq_q_idx,
-        kernel.groups_tokens_heads_q_ratio,
+        cfg.mma_qk_tiler[0],
         kernel.num_heads,
         kernel.seq_len_q,
         cu_seqlens_q,
@@ -129,10 +130,10 @@ def run_reduction_kernel(
             batch_idx,
             kernel.seq_len_q,
         )
-        _, _, group_last_logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-            Int32(kernel.num_heads * kernel.groups_tokens_heads_q_ratio - 1),
+        _, _, group_last_logical_q_idx, _, _ = flat_query_row_state(
+            Int32(cfg.mma_qk_tiler[0] - 1),
             seq_q_idx,
-            kernel.groups_tokens_heads_q_ratio,
+            cfg.mma_qk_tiler[0],
             kernel.num_heads,
             kernel.seq_len_q,
             cu_seqlens_q,

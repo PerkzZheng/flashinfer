@@ -61,11 +61,11 @@ from .config import (
 from ..helpers.constants import TMEM_DEALLOC_MBAR_THREADS
 from ..helpers.mask import MaskType, mask_visible_k_length, normalize_mask_type
 from ..helpers.query import (
+    FlatQueryTileLayout,
+    flat_query_row_state,
     groups_tokens_heads_q_capacity,
-    groups_tokens_heads_q_group_count,
-    groups_tokens_heads_q_row_state,
     query_batch_bounds,
-    runtime_query_group_has_rows,
+    runtime_flat_query_tile_has_rows,
 )
 from .work_partition import (
     runtime_split_kv_cap,
@@ -89,6 +89,7 @@ from ..helpers.math import qkv_dtype
 from ..parallel_reduction_topology import (
     ParallelReductionTopology,
     make_q128_wave_limited_parallel_reduction_topology,
+    should_use_q128_g1_parallel_reducer,
     validate_parallel_reduction_workspace,
 )
 from .parallel_reduction import (
@@ -813,19 +814,21 @@ class MlaDecodeTs:
             raise ValueError("batch_size must be positive")
         self.batch_size = batch_size
         self.mask_type = normalize_mask_type(mask_type)
-        self.groups_tokens_heads_ratio = self.compute_groups_tokens_heads_ratio(
+        self.query_tile_layout = FlatQueryTileLayout.for_tile(
             num_heads, seq_len_q, mma_qk_tiler_mn[0]
         )
-        self.groups_tokens_heads = self.groups_tokens_heads_ratio > 1
+        self.num_q_tiles = self.query_tile_layout.num_tiles
+        self.tail_q_rows = self.query_tile_layout.tail_rows
+        # Retain the legacy attributes for source compatibility with callers
+        # that inspect the object. Device geometry no longer consumes them.
+        self.groups_tokens_heads_ratio = 1
+        self.groups_tokens_heads = False
         self.parallel_reduction_topology: ParallelReductionTopology | None = None
         self.use_parallel_reduction = False
         self._parallel_reduction_shape_is_eligible = (
             not is_var_split_kv
             and static_split_kv is not None
-            # Keep FlashInfer's qualified 512-thread/eight-row reducer for the
-            # normal S<=32 domain.  Split-parallel CTA clusters become useful
-            # only beyond that envelope and are selected automatically.
-            and 32 < static_split_kv <= 128
+            and 2 <= static_split_kv <= 128
             and mma_qk_tiler_mn[0] == 128
             and acc_dtype == _cutlass.Float32
             and lse_dtype == _cutlass.Float32
@@ -834,14 +837,9 @@ class MlaDecodeTs:
         self._configure_parallel_reduction_topology()
 
     def _effective_reduction_shape(self) -> tuple[int, int]:
-        """Return the grouped head and Q extents used by the workspace."""
+        """Return physical row/tile extents used by the split workspace."""
 
-        effective_num_heads = self.num_heads * self.groups_tokens_heads_ratio
-        effective_seq_len_q = groups_tokens_heads_q_group_count(
-            self.seq_len_q,
-            self.groups_tokens_heads_ratio,
-        )
-        return effective_num_heads, effective_seq_len_q
+        return self.mma_qk_tiler_mn[0], self.num_q_tiles
 
     def _configure_parallel_reduction_topology(self) -> None:
         """Refresh reducer topology after any host-side launch-shape update."""
@@ -867,13 +865,34 @@ class MlaDecodeTs:
         assert self.static_split_kv is not None
         topology = make_q128_wave_limited_parallel_reduction_topology(
             self.static_split_kv,
-            logical_rows=(effective_num_heads * effective_seq_len_q * self.batch_size),
+            logical_rows=(self.num_heads * self.seq_len_q * self.batch_size),
             physical_sm_count=self.max_active_clusters * 2,
             max_cluster_size=8,
         )
-        # G1 has no split-rank parallelism and is intentionally handled by the
-        # existing FlashInfer multi-row reducer.
-        if topology is not None and topology.cluster_size > 1:
+        # Small split counts keep the reference reducer unless its row
+        # coarsening leaves a sub-wave grid and the producer generated enough
+        # work to amortize one CTA per physical row.  S17..S32 continue to use
+        # the reference path; high-split clustered reduction begins above it.
+        use_small_split_g1 = (
+            self.static_split_kv <= 16
+            and topology is not None
+            and topology.cluster_size == 1
+            and should_use_q128_g1_parallel_reducer(
+                batch_size=self.batch_size,
+                physical_rows_per_batch=(effective_num_heads * effective_seq_len_q),
+                producer_ctas=(
+                    self.batch_size * effective_seq_len_q * self.static_split_kv * 2
+                ),
+                reference_rows_per_cta=REDUCTION_ROWS_PER_CTA,
+                physical_sm_count=self.max_active_clusters * 2,
+            )
+        )
+        use_high_split_cluster = (
+            self.static_split_kv > 32
+            and topology is not None
+            and topology.cluster_size > 1
+        )
+        if use_small_split_g1 or use_high_split_cluster:
             self.parallel_reduction_topology = topology
             self.use_parallel_reduction = True
 
@@ -894,7 +913,7 @@ class MlaDecodeTs:
 
     @property
     def groups_tokens_heads_q_ratio(self) -> int:
-        """Return the effective groups_tokens_heads_q capacity."""
+        """Return the retired grouping ratio for compatibility."""
 
         return self.groups_tokens_heads_ratio
 
@@ -917,7 +936,7 @@ class MlaDecodeTs:
         is_variable_q = len(q_latent_shape) == 3
         if is_variable_q:
             total_q = int(q_latent_shape[2])
-            groups_tokens_heads_q_ratio = self.compute_groups_tokens_heads_ratio(
+            query_tile_layout = FlatQueryTileLayout.for_tile(
                 num_heads, self.seq_len_q, self.mma_qk_tiler_mn[0]
             )
             for name, shape in (
@@ -952,8 +971,11 @@ class MlaDecodeTs:
                 raise ValueError("cu_seqlens_q must contain at least two offsets")
             self.num_heads = num_heads
             self.batch_size = batch_size
-            self.groups_tokens_heads_ratio = groups_tokens_heads_q_ratio
-            self.groups_tokens_heads = groups_tokens_heads_q_ratio > 1
+            self.query_tile_layout = query_tile_layout
+            self.num_q_tiles = query_tile_layout.num_tiles
+            self.tail_q_rows = query_tile_layout.tail_rows
+            self.groups_tokens_heads_ratio = 1
+            self.groups_tokens_heads = False
             self._configure_parallel_reduction_topology()
             return
 
@@ -964,7 +986,7 @@ class MlaDecodeTs:
             raise ValueError("q_latent must be rank-4 for groups_tokens_heads_q launch")
         seq_len_q = int(q_latent_shape[2])
         batch_size = int(q_latent_shape[3])
-        groups_tokens_heads_q_ratio = self.compute_groups_tokens_heads_ratio(
+        query_tile_layout = FlatQueryTileLayout.for_tile(
             num_heads, seq_len_q, self.mma_qk_tiler_mn[0]
         )
 
@@ -1001,8 +1023,11 @@ class MlaDecodeTs:
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
         self.batch_size = batch_size
-        self.groups_tokens_heads_ratio = groups_tokens_heads_q_ratio
-        self.groups_tokens_heads = groups_tokens_heads_q_ratio > 1
+        self.query_tile_layout = query_tile_layout
+        self.num_q_tiles = query_tile_layout.num_tiles
+        self.tail_q_rows = query_tile_layout.tail_rows
+        self.groups_tokens_heads_ratio = 1
+        self.groups_tokens_heads = False
         self._configure_parallel_reduction_topology()
 
     @cute.jit
@@ -1038,12 +1063,11 @@ class MlaDecodeTs:
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
         )
-        group = self.groups_tokens_heads_q_ratio
-        effective_num_heads_q = self.num_heads * group
-        effective_seq_len_q = groups_tokens_heads_q_group_count(self.seq_len_q, group)
+        effective_num_heads_q = self.mma_qk_tiler_mn[0]
+        effective_seq_len_q = self.num_q_tiles
         # Fixed public tensors retain [H,D,SQ,B]/[H,SQ,B]; variable-Q tensors
         # compact batches into [H,D,totalQ]/[H,totalQ]. The scheduler/workspace
-        # use effective groups_tokens_heads_q coordinates, while resources map
+        # use physical flat-query tile coordinates, while resources map
         # each valid row back to its logical fixed or ragged storage location.
         if cutlass.const_expr(cu_seqlens_q is not None):
             runtime_assert(
@@ -1114,8 +1138,8 @@ class MlaDecodeTs:
         # Create TMA descriptors (same as bare metal)
 
         # Keep the descriptor extent at the logical H*SQ row count.  The final
-        # groups_tokens_heads_q group still requests a full M tile; tensor-map OOB fill supplies
-        # zeros for its tail without changing the public Q tensor shape.
+        # physical query tile still requests a full M tile; tensor-map OOB fill
+        # supplies zeros for its tail without changing the public Q shape.
         q_latent_tma = _flatten_query_rows_for_tma(q_latent)
         if cutlass.const_expr(cu_seqlens_q is not None):
             tma_desc_q_latent = create_tensor_map_ragged_from_tensor(
@@ -1396,10 +1420,7 @@ class MlaDecodeTs:
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
         )
-        effective_seq_len_q = groups_tokens_heads_q_group_count(
-            self.seq_len_q,
-            self.groups_tokens_heads_q_ratio,
-        )
+        effective_seq_len_q = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
         tiled_mma_qk = None
         if cutlass.const_expr(cfg.is_fp8_qkv()):
@@ -1578,9 +1599,10 @@ class MlaDecodeTs:
                 tile_batch_idx,
                 self.seq_len_q,
             )
-            q_group_has_rows = runtime_query_group_has_rows(
+            q_group_has_rows = runtime_flat_query_tile_has_rows(
                 tile_seq_q_idx,
-                self.groups_tokens_heads_q_ratio,
+                self.mma_qk_tiler_mn[0],
+                self.num_heads,
                 self.seq_len_q,
                 cu_seqlens_q,
                 tile_batch_idx,
@@ -1588,10 +1610,10 @@ class MlaDecodeTs:
             if cutlass.const_expr(
                 cfg.mask_type == MaskType.CAUSAL.value and self.seq_len_q > 1
             ):
-                _, _, logical_q_idx, _, _ = groups_tokens_heads_q_row_state(
-                    Int32(self.num_heads * self.groups_tokens_heads_q_ratio - 1),
+                _, _, logical_q_idx, _, _ = flat_query_row_state(
+                    Int32(self.mma_qk_tiler_mn[0] - 1),
                     tile_seq_q_idx,
-                    self.groups_tokens_heads_q_ratio,
+                    self.mma_qk_tiler_mn[0],
                     self.num_heads,
                     self.seq_len_q,
                     cu_seqlens_q,
@@ -1935,7 +1957,6 @@ class MlaDecodeTs:
         )
         topology = self.parallel_reduction_topology
         run_parallel_reduction_kernel(
-            self.groups_tokens_heads_q_ratio,
             self.num_heads,
             self.seq_len_q,
             self.is_var_split_kv,
