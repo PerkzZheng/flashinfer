@@ -215,7 +215,7 @@ class MlaTsWorkTileInfo:
     @property
     @cute.jit
     def k_len(self):
-        """Return the runtime K length associated with this tile."""
+        """Return the request's graph-live K length for this tile."""
         return self._k_len
 
     @property
@@ -444,6 +444,7 @@ class MlaWorkQueue(WorkQueue):
             K = Int32(self.static_seq_len_k)
         else:
             K = Int32(self.cache_seqs[safe_b_idx])
+        sequence_k_len = K
 
         # The launch uses the largest flat-Q tile count in the batch. Shorter
         # variable-Q requests can therefore receive a whole tile containing
@@ -465,8 +466,8 @@ class MlaWorkQueue(WorkQueue):
         if cutlass.const_expr(
             cfg.mask_type == MaskType.CAUSAL.value and self.logical_seq_len_q > 1
         ):
-            # Split partitioning owns the mask-visible CTA domain. The last
-            # The final physical row resolves to the tile's latest valid Q
+            # Split partitioning owns the mask-visible CTA domain. The final
+            # physical row resolves to the tile's latest valid Q
             # token. Row-causal softmax narrows earlier rows without changing
             # producer split geometry.
             _, _, logical_q_idx, _, _ = flat_query_row_state(
@@ -508,7 +509,13 @@ class MlaWorkQueue(WorkQueue):
                 split_kv_cap,
                 split_kv_idx,
             )
-        return MlaTsWorkTileInfo(tile_idx, is_valid, K, k_tile_count, k_index_base)
+        return MlaTsWorkTileInfo(
+            tile_idx,
+            is_valid,
+            sequence_k_len,
+            k_tile_count,
+            k_index_base,
+        )
 
     @cute.jit
     def k_tile_count_for_tile(self, tile_idx):
@@ -1995,7 +2002,6 @@ class TmemSResource(HighThroughputMlaResource):
         needs_row_causal_mask = cutlass.const_expr(
             cfg.mask_type == MaskType.CAUSAL.value and self.logical_seq_len_q > 1
         )
-        min_visible_k_len = K
         if cutlass.const_expr(needs_row_causal_mask):
             batch_idx = Int32(work_tile.tile_idx[2])
             _, logical_seq_len_q = query_batch_bounds(
@@ -2003,26 +2009,26 @@ class TmemSResource(HighThroughputMlaResource):
                 batch_idx,
                 self.logical_seq_len_q,
             )
-            _, _, first_logical_q_idx, _, _ = flat_query_row_state(
-                Int32(0),
-                work_tile.tile_idx[1],
-                cfg.mma_qk_tiler[0],
-                self.logical_num_heads_q,
-                self.logical_seq_len_q,
-                self.cu_seqlens_q,
-                batch_idx,
+            first_flat_query_row = Int32(work_tile.tile_idx[1]) * Int32(
+                cfg.mma_qk_tiler[0]
             )
-            min_visible_k_len = mask_visible_k_length(
-                cfg.mask_type,
-                self.cache_seqs[batch_idx],
-                first_logical_q_idx,
-                logical_seq_len_q,
+            # A row r sees key k iff H * (k - K + SQ) <= r.  Apply the
+            # equivalent boundary test to the first row in this physical tile
+            # so non-power-of-two H never needs a quotient on the softmax path.
+            first_mask_flat_row = Int32(self.logical_num_heads_q) * (
+                tile_offset_k
+                + Int32(cfg.mma_qk_tiler[1])
+                - K
+                + logical_seq_len_q
+                - Int32(1)
             )
-        group_needs_mask = kv_tile_needs_right_mask(
-            tile_offset_k,
-            Int32(cfg.mma_qk_tiler[1]),
-            min_visible_k_len,
-        )
+            group_needs_mask = first_flat_query_row < first_mask_flat_row
+        else:
+            group_needs_mask = kv_tile_needs_right_mask(
+                tile_offset_k,
+                Int32(cfg.mma_qk_tiler[1]),
+                K,
+            )
 
         neg_inf = Float32(-Float32.inf)
         row_max_tile = row_max
@@ -2040,39 +2046,38 @@ class TmemSResource(HighThroughputMlaResource):
             qk_acc_regs.store(loaded, load_idx * TCGEN05_32B_REGS_PER_LOAD)
 
         if group_needs_mask:
-            row_k_len = K
             if cutlass.const_expr(needs_row_causal_mask):
-                # Recover this row's exact endpoint only on a group boundary.
-                batch_idx = Int32(work_tile.tile_idx[2])
-                _, logical_seq_len_q = query_batch_bounds(
-                    self.cu_seqlens_q,
-                    batch_idx,
-                    self.logical_seq_len_q,
-                )
+                # Clamp padded physical tail rows to the request's last real
+                # row. Their Q/output accesses remain independently
+                # predicated, while this keeps the masking arithmetic safe.
                 effective_head_idx = self.cta_rank * Int32(
                     cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
                 ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
-                _, _, logical_q_idx, _, _ = flat_query_row_state(
-                    effective_head_idx,
-                    work_tile.tile_idx[1],
-                    cfg.mma_qk_tiler[0],
-                    self.logical_num_heads_q,
-                    self.logical_seq_len_q,
-                    self.cu_seqlens_q,
-                    batch_idx,
+                flat_query_row = (
+                    Int32(work_tile.tile_idx[1]) * Int32(cfg.mma_qk_tiler[0])
+                    + effective_head_idx
                 )
-                row_k_len = mask_visible_k_length(
-                    cfg.mask_type,
-                    self.cache_seqs[batch_idx],
-                    logical_q_idx,
-                    logical_seq_len_q,
+                last_flat_query_row = cute.math.max(
+                    logical_seq_len_q * Int32(self.logical_num_heads_q) - Int32(1),
+                    Int32(0),
+                )
+                flat_query_row = cute.math.min(
+                    flat_query_row,
+                    last_flat_query_row,
                 )
             tidx_col = (
                 local_tidx >> EPILOGUE_COLUMN_GROUP_SHIFT
             ) << EPILOGUE_COLUMN_GROUP_SHIFT
             for i in cutlass.range_constexpr(64):
                 token_idx = tile_offset_k + tidx_col + Int32(i)
-                qk_acc_regs[i] = qk_acc_regs[i] if token_idx < row_k_len else neg_inf
+                if cutlass.const_expr(needs_row_causal_mask):
+                    mask_flat_row = Int32(self.logical_num_heads_q) * (
+                        token_idx - K + logical_seq_len_q
+                    )
+                    token_is_visible = flat_query_row >= mask_flat_row
+                else:
+                    token_is_visible = token_idx < K
+                qk_acc_regs[i] = qk_acc_regs[i] if token_is_visible else neg_inf
 
         max0 = neg_inf
         max1 = neg_inf

@@ -972,3 +972,101 @@ retained under
 `artifacts/groups_tokens_heads_20260812/h6_zero_q_gpu_ae9bb2c7`. These results
 qualify the H6/zero-length functionality checkpoint for commit on top of
 `4c13b424`; public-auto performance Gate B remains open.
+
+## 14. Gate-B isolated reproduction before further tuning (2026-08-12)
+
+Functionality checkpoint `91cc73df` was measured in fresh Python processes on
+B200 UUID `GPU-ae9bb2c7-bbba-d0e7-ae58-972b3ebd587e`. Five alternating-order,
+CUDA-graph, CUDA-event pairs reproduced the public-auto H48/SQ8, B1/K2048 BF16
+gap. PrimTS selected `throughput_2cta`, split 16, 96 producer CTAs, and the G1
+parallel standalone reducer. Its five campaign medians were 13.6240, 13.5536,
+13.6480, 13.5552, and 13.6272 us. Monolithic CuTe DSL measured 13.0400 us in
+all five processes. The median-of-medians result is therefore 13.6240 versus
+13.0400 us, a 0.5840 us delta and 0.95713447x Gate-B speedup.
+
+This resolves the earlier paired-versus-isolated discrepancy in favor of the
+isolated evidence: the reproducible row is below both the 1.00 parity target
+and the 0.97 per-row guard. No topology change was made for this measurement.
+Raw CSVs, separate JIT caches, the exact runner, source hashes, and environment
+provenance are under
+`artifacts/groups_tokens_heads_20260812/gate_b_resume_gpu_ae9bb2c7_91cc73df`.
+The next diagnostic separates reference/parallel reducer cost from producer
+and launch cost before any policy or kernel edit.
+
+## 15. One-wave 2CTA launch/reducer tuning checkpoint (2026-08-12)
+
+The isolated miss in section 14 was traced to redundant live-metadata work in
+the nonpersistent producer prologue and to serialized producer/reducer launch
+ordering, rather than to the G1 reducer topology. For the same H48/SQ8,
+B1/K2048 row, forcing the reference reducer measured 13.8592 us and forcing
+public auto to 1CTA measured 14.8864 us. A compile-time static-K diagnostic
+that bypassed the live-Q/K producer precheck measured 13.2448 us and identified
+the actionable producer overhead.
+
+The current uncommitted tuning patch therefore:
+
+- lets nonpersistent work items derive their live Q/K/split domain once in the
+  task schedule and skip a zero-domain item there, instead of repeating that
+  metadata calculation in a CTA-wide producer prologue;
+- caches the raw graph-live request K length in the 2CTA work tile while using
+  the causally adjusted endpoint only for split geometry, removing repeated
+  `cache_seqs` loads in TMEM-S;
+- uses PR #4178's division-free flat-row causal predicates for the tile
+  boundary and per-score mask; and
+- enables PDL only for a one-wave, nonpersistent 2CTA producer with a separate
+  reducer. The producer signals dependents only after its CTA-pair TMEM
+  deallocation, and the reducer waits before entering its body. Persistent
+  multi-wave producers and direct-output launches retain ordinary stream
+  ordering.
+
+Nsight Compute showed the producer's global-load count fall from 2,544 at the
+section-14 baseline to 1,392 after the task-owned zero-domain change and to
+1,008 after caching raw K (monolithic CuTe DSL: 1,056). Producer duration in
+the same capture sequence fell from 21,088 ns to 20,640 ns and then 20,512 ns.
+End-to-end latency before PDL stabilized at 13.2448 us. A CTA-wide shared-memory
+metadata cache (13.6448--13.6512 us) and a reducer warp-to-shared row-state
+handoff (13.4528 us) were rejected and fully removed.
+
+Signaling PDL after TMEM deallocation reduced the target row to 12.6304 us.
+Five fresh alternating isolated pairs all measured PrimTS at 12.6304 us and
+CuTe DSL at 13.0400 us, a 1.03242969x speedup. Restricting PDL to the intended
+nonpersistent one-wave path preserved exactly the same 12.6304/13.0400 us
+result. A focused packed-Q/non-power-head/live-metadata set passed all 12 cases,
+including H6/H12/H24/H48/H96, BF16/FP8, mixed zero-length requests, odd split
+17, and persistent CUDA-graph metadata replay.
+
+The first representative public-auto spot matrix is also favorable:
+
+| Dtype | H/SQ | B/K | PrimTS us | CuTe DSL us | Speedup | Auto policy |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| BF16 | 48/8 | 1/2048 | 12.6304 | 13.0400 | 1.03243 | 2CTA, S16, G1, one wave |
+| BF16 | 12/32 | 4/512 | 12.6336 | 12.8352 | 1.01596 | 2CTA, S4, reference, one wave |
+| BF16 | 24/16 | 4/512 | 12.6304 | 12.8352 | 1.01621 | 2CTA, S4, reference, one wave |
+| BF16 | 48/8 | 4/512 | 12.6416 | 12.8352 | 1.01531 | 2CTA, S4, reference, one wave |
+| BF16 | 96/4 | 4/512 | 12.6336 | 12.8352 | 1.01596 | 2CTA, S4, reference, one wave |
+| BF16 | 48/8 | 16/4096 | 58.2944 | 58.9056 | 1.01048 | 2CTA, direct, one wave |
+| FP8 | 48/8 | 16/1024 | 14.4768 | 15.0880 | 1.04222 | 2CTA, direct, one wave |
+| BF16 | 48/8 | 64/8192 | 391.2832 | 391.1616 | 0.99969 | 2CTA, direct, CLC persistent |
+
+Every spot row used CUDA-graph replay, CUDA events, 20 warmups, 100 timed
+iterations, seed 42, and `--refcheck`. The single persistent result is within
+timing noise. Five additional 20/100 campaigns gave PrimTS medians of
+392.8592, 392.6960, 392.3536, 391.4752, and 394.1344 us and CuTe DSL medians
+of 389.8768, 392.7504, 392.4960, 389.9824, and 387.5200 us. The independent
+median-of-medians comparison is 392.6960 versus 389.9824 us, or 0.99308982x:
+above the 0.97 row guard but slightly below strict row parity. A sustained
+100/1000 diagnostic was discarded as a primary gate because both backends
+heated substantially and per-run standard deviation rose to 11--20 us.
+
+A same-GPU, source-isolated A/B against clean functionality commit `91cc73df`
+shows that the tuning patch does not cause the persistent result. Across five
+alternating 20/100 campaigns, clean `91cc73df` had a 399.2608 us
+median-of-medians and the candidate had 396.9008 us, a 1.00594506x candidate
+speedup. The exact tuning tree also passed all 178 PrimTS MLA tests in 618.50 s,
+in addition to the 12-case focused run; Python compilation, Ruff lint/format,
+and `git diff --check` passed.
+
+Gate B remains open until the complete public-auto matrix and campaign
+repetitions meet section 6.3 and Gate A is refreshed against old PrimTS for the
+final patch. Raw CSV, XML, NCU, and Nsight Systems artifacts are in the
+section-14 artifact directory.

@@ -1284,11 +1284,11 @@ class MlaDecodeTs:
             kernel_split_kv,
             workspace,
         )
+        # A one-wave producer can publish its dependent reducer launch while
+        # retiring, hiding launch latency without admitting reducer CTAs into
+        # an actively grid-striding persistent producer.
+        use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
 
-        # Keep the separate reducer ordered after the producer.  A dependent
-        # PDL launch can occupy the SMs left by a one-wave 2CTA grid while the
-        # producer is still streaming paged KV, increasing producer latency
-        # enough to outweigh reducer overlap.
         self.split_kv_kernel(
             tma_desc_q_latent,
             tma_desc_q_rope,
@@ -1316,7 +1316,7 @@ class MlaDecodeTs:
             cluster=cfg.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
-            use_pdl=False,
+            use_pdl=use_one_wave_reducer_pdl,
         )
 
         # Reduction kernel: combine per-split results when split_kv > 1
@@ -1345,11 +1345,9 @@ class MlaDecodeTs:
                     ),
                     block=[PARALLEL_REDUCTION_THREADS, 1, 1],
                     cluster=[topology.cluster_size, 1, 1],
-                    # The 2CTA producer intentionally has no PDL signal; same-
-                    # stream launch ordering keeps this reducer after stores.
                     stream=stream,
                     min_blocks_per_mp=1,
-                    use_pdl=False,
+                    use_pdl=use_one_wave_reducer_pdl,
                 )
             else:
                 self.reduction_kernel(
@@ -1379,7 +1377,7 @@ class MlaDecodeTs:
                     # two resident CTAs keep register allocation from expanding
                     # beyond what this bandwidth-oriented kernel can use.
                     min_blocks_per_mp=2,
-                    use_pdl=False,
+                    use_pdl=use_one_wave_reducer_pdl,
                 )
 
     @cute.kernel
@@ -1582,6 +1580,16 @@ class MlaDecodeTs:
         )
         if cutlass.const_expr(fixed_nonempty_single_split):
             max_split_kv = Int32(1)
+            exit_early = False
+        elif cutlass.const_expr(not self.is_persistent):
+            # Every task already derives its graph-live K/Q domain through the
+            # work queue. Let a zero-domain task skip its data schedule instead
+            # of recomputing the same metadata in an all-warp CTA prologue.
+            max_split_kv = (
+                Int32(self.static_split_kv)
+                if cutlass.const_expr(self.static_split_kv is not None)
+                else split_kv
+            )
             exit_early = False
         else:
             # Compute the initial tile's active Q/split state for static early
@@ -1855,6 +1863,11 @@ class MlaDecodeTs:
                 cfg.num_tmem_cols,
                 group="cta_2",
             )
+            # Each producer CTA publishes completion only after its paired
+            # TMEM lifetime and all scheduled output work have retired.
+            if cutlass.const_expr(acc_o is not None and not self.is_persistent):
+                if prims.elect_sync():
+                    prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
     @cute.jit
     def initialize_workspace(
@@ -1918,6 +1931,8 @@ class MlaDecodeTs:
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
         )
+        if cutlass.const_expr(not self.is_persistent):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         run_reduction_kernel(
             self,
             output,
@@ -1955,6 +1970,8 @@ class MlaDecodeTs:
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
         )
+        if cutlass.const_expr(not self.is_persistent):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         topology = self.parallel_reduction_topology
         run_parallel_reduction_kernel(
             self.num_heads,

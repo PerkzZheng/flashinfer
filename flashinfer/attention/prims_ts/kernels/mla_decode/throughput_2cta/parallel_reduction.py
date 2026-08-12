@@ -202,8 +202,8 @@ def run_parallel_reduction_kernel(
     publishes a neutral-or-valid ``(FP32 LSE, BF16 O[512])`` state to DSMEM and
     rank zero performs the final merge. Arithmetic remains FP32.
 
-    The producer kernel does not emit a PDL signal, so this same-stream launch
-    intentionally contains no ``griddepcontrol`` wait.
+    For a one-wave producer, the caller waits for its post-TMEM dependent-launch
+    signal before entering this body.
     """
 
     block_idx_x, seq_q_idx, batch_idx = cute.arch.block_idx()
