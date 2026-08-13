@@ -647,15 +647,19 @@ the old/new latency geometric mean. Where old PrimTS can launch a different
 family for the same public shape, report that best valid old public result as
 an additional end-to-end comparison, clearly labeled as a family change.
 
-Gate B is the final performance target. Candidate public-auto PrimTS must meet
-or beat monolithic CuTe DSL (speedup at least 1.00) on the geometric mean of
-the complete public-auto primary matrix for each dtype, with no reproducible
-primary row below 0.97. Report 1CTA/2CTA and profile breakdowns to localize
-misses, but do not make a forced family/profile diagnostic an acceptance gate:
-the automatically selected PrimTS implementation is what must match CuTe DSL.
-A miss leaves the performance project open: retain a correctness-qualified
-checkpoint, identify the selected family/profile/reducer gap, and continue
-tuning rather than weakening correctness or silently changing the matrix.
+Gate B is the final performance target. Candidate public-auto PrimTS must stay
+within 5% of monolithic CuTe DSL (speedup at least 0.95) on the geometric mean
+of the complete public-auto primary matrix for each dtype, with no reproducible
+primary row below 0.95. Exact ratios remain visible, and parity-or-better is
+still the optimization target rather than an acceptance requirement. Report
+1CTA/2CTA and profile breakdowns to localize misses, but do not make a forced
+family/profile diagnostic an acceptance gate: the automatically selected
+PrimTS implementation is what is evaluated against CuTe DSL. A miss leaves the
+performance project open: retain a correctness-qualified checkpoint, identify
+the selected family/profile/reducer gap, and continue tuning rather than
+weakening correctness or silently changing the matrix. This 5% tolerance was
+explicitly confirmed by the requester on 2026-08-13; Gate A's old-PrimTS
+regression threshold remains unchanged.
 
 Keep pre/post pairs on the same GPU allocation. If the four-hour Slurm job
 expires, reallocate using the environment skill and rerun both members of any
@@ -782,7 +786,8 @@ The port is complete when all of the following hold:
 - A provenance-complete report compares old PrimTS, packed PrimTS, and
   monolithic CuTe DSL across the expanded batch/K matrix.
 - Gate A meets the old-PrimTS targets before Gate B is evaluated, and Gate B
-  meets the final CuTe DSL parity-or-better targets.
+  keeps public-auto PrimTS within 5% of CuTe DSL for every reproducible row and
+  each dtype-wide geometric mean.
 - The final issue-#4390-shaped H12 comparison reports TRTLLM-GEN, monolithic
   CuTe DSL, and public-auto PrimTS in both eager and CUDA-graph modes for
   Q1/Q8, BF16/FP8, and all three requested context lengths.
@@ -1439,3 +1444,78 @@ The requested terminal deliverable now includes the exact issue-#4390-shaped
 three-backend comparison in section 6.4. It will report TRTLLM-GEN,
 monolithic CuTe DSL, and public-auto PrimTS for H12, Q1/Q8, BF16/FP8, and
 131072/500000/1000000-token contexts in both eager and CUDA-graph modes.
+
+## 22. Equal-work BF16 crossover and logical-row 2CTA reducer (2026-08-13)
+
+The next formal BF16 shard, H12/SQ4, completed all 31 matched rows with a
+1.105557x geometric mean. Its raw minimum was 0.966298x at B16/K8192: public
+auto selected M64 1CTA split 8 with the parallel reducer and measured 42.5376
+us versus 41.1040 us for monolithic CuTe DSL. Five independent repeats were
+0.966150x, 0.966446x, 0.966664x, 0.966516x, and 0.966260x, proving that the row
+was stable rather than an isolated timing sample. It passes the subsequently
+clarified 0.95 Gate-B threshold, but it also exposed a useful family crossover.
+
+At this geometry, M128 2CTA split 4 has the same 128 producer CTAs as M64 1CTA
+split 8. Forced-family diagnostics across H6/SQ8, H12/SQ4, H24/SQ2, and
+H48/SQ1 showed that 2CTA closes the BF16 reducer gap, while FP8 remains faster
+on the 1CTA parallel reducer. The B32/K4096 companion point has the analogous
+split4/split2 relationship. The automatic-policy candidate therefore selects
+2CTA only when all existing 48--64-row M64 conditions hold, the dtype is BF16,
+the 1CTA split is exactly twice the 2CTA split, the 2CTA reference split is at
+most four, and the local 1CTA K span is at most 1024 tokens. Existing direct
+split-1 crossover behavior remains enabled for both BF16 and FP8.
+
+Nsight Systems then identified padding in the 2CTA reference reducer itself.
+For H48/SQ1, its old launch reduced all 128 physical M128 rows even though only
+48 logical rows were public. The candidate now launches over
+`ceil(H * SQ / rows_per_cta)` and decomposes each logical row back into its
+physical producer workspace coordinate. Fixed Q uses its direct flat storage
+coordinate; packed Q retains `qo_indptr` mapping and predicates zero-length
+requests. The last CTA clamps inactive row groups before forming any workspace
+address. Reducer CTAs use four rows when the producer supplies at least half a
+B200 wave and the resulting grid stays within four waves; otherwise they keep
+the established eight-row form. The launch bound preserves 1,024 resident
+threads as CTA size changes. Six BF16/FP8 R4-versus-R8 controls were neutral or
+faster with R4, including H48/SQ1 B16/K8192 and H96/SQ4 B4/K2048.
+
+Correctness completed for kernel checkpoint `97a40ae9`:
+
+- 30 host selector/topology contracts passed, plus Ruff, Python compilation,
+  and `git diff --check`;
+- five forced-reference GPU cases passed across BF16/FP8, H96/SQ2 and
+  H12/SQ11 tails, packed per-request Q lengths including zero, and graph replay;
+- four BF16 public-auto equal-work factorizations all selected 2CTA split 4,
+  the logical-row reference reducer, and four rows per CTA; eager accuracy
+  passed for all four and the H48/SQ1 anchor also passed standalone and graph
+  parity; and
+- the FP8 H12/SQ4 counterpart retained M64 1CTA split 8 and passed accuracy.
+
+The first matched candidate matrix measured the following before final source
+checkpointing:
+
+| B/K | H/SQ | PrimTS us | CuTe DSL us | Speedup | Public policy |
+| --- | --- | ---: | ---: | ---: | --- |
+| 16/8192 | 6/8 | 40.8848 | 41.1040 | 1.005361 | 2CTA, S4, R4 reference |
+| 16/8192 | 12/4 | 40.8160 | 41.1040 | 1.007056 | 2CTA, S4, R4 reference |
+| 16/8192 | 24/2 | 40.8896 | 41.4064 | 1.012639 | 2CTA, S4, R4 reference |
+| 16/8192 | 48/1 | 40.6896 | 39.2752 | 0.965239 | 2CTA, S4, R4 reference |
+| 32/4096 | 6/8 | 41.1040 | 41.7088 | 1.014714 | 2CTA, S2, R4 reference |
+| 32/4096 | 12/4 | 41.1696 | 41.7120 | 1.013175 | 2CTA, S2, R4 reference |
+| 32/4096 | 24/2 | 41.1136 | 41.7136 | 1.014594 | 2CTA, S2, R4 reference |
+| 32/4096 | 48/1 | 40.9024 | 39.7984 | 0.973009 | 2CTA, S2, R4 reference |
+
+The H48/SQ1 B16/K8192 outlier is still within the requester-confirmed 5%
+tolerance. Five exact-candidate PrimTS repeats had a 40.5920 us median; five
+matched CuTe DSL repeats had a 39.2640 us median, or 0.967284x. Experimental PDL
+signal movement improved the ratio slightly but was removed because it changed
+producer/dependent ordering solely to chase the superseded 0.97 threshold.
+The safe post-TMEM signal ordering remains intact.
+
+All diagnostics and profiles are retained below
+`gate_b_formal_public_auto_6e2338db`, including the equal-wave matrices,
+R4/R8 controls, split sweep, Nsight Systems reports, and five-run H48 series.
+The next recovery point is this documentation commit on top of `97a40ae9`,
+followed by a new exact-SHA formal directory with updated dispatch assertions.
+After the 31-point/five-campaign Gate-A/Gate-B qualification, step 12 remains
+the required TRTLLM-GEN/CuTe-DSL/public-auto-PrimTS eager and CUDA-graph
+comparison.
