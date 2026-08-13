@@ -53,10 +53,11 @@ from .config import (
     LOG2_E,
     MAX_SPLITS,
     REDUCTION_ROWS_PER_CTA,
-    REDUCTION_THREADS_PER_CTA,
+    REDUCTION_THREADS_PER_ROW,
     V_TMA_LATENT_ELEMENTS,
     MlaDecodeConfig,
     make_mla_decode_config,
+    select_reference_reduction_rows_per_cta,
 )
 from ..helpers.constants import TMEM_DEALLOC_MBAR_THREADS
 from ..helpers.mask import MaskType, mask_visible_k_length, normalize_mask_type
@@ -819,6 +820,18 @@ class MlaDecodeTs:
         )
         self.num_q_tiles = self.query_tile_layout.num_tiles
         self.tail_q_rows = self.query_tile_layout.tail_rows
+        self.reference_reduction_rows_per_cta = REDUCTION_ROWS_PER_CTA
+        if static_split_kv is not None and static_split_kv > 1:
+            self.reference_reduction_rows_per_cta = (
+                select_reference_reduction_rows_per_cta(
+                    batch_size=batch_size,
+                    logical_query_rows=self.query_tile_layout.total_rows,
+                    producer_ctas=(
+                        batch_size * self.num_q_tiles * static_split_kv * 2
+                    ),
+                    physical_sm_count=max_active_clusters * 2,
+                )
+            )
         # Retain the legacy attributes for source compatibility with callers
         # that inspect the object. Device geometry no longer consumes them.
         self.groups_tokens_heads_ratio = 1
@@ -883,7 +896,7 @@ class MlaDecodeTs:
                 producer_ctas=(
                     self.batch_size * effective_seq_len_q * self.static_split_kv * 2
                 ),
-                reference_rows_per_cta=REDUCTION_ROWS_PER_CTA,
+                reference_rows_per_cta=self.reference_reduction_rows_per_cta,
                 physical_sm_count=self.max_active_clusters * 2,
             )
         )
@@ -1350,6 +1363,11 @@ class MlaDecodeTs:
                     use_pdl=use_one_wave_reducer_pdl,
                 )
             else:
+                logical_query_rows = self.num_heads * self.seq_len_q
+                reduction_rows_per_cta = self.reference_reduction_rows_per_cta
+                reduction_threads_per_cta = (
+                    reduction_rows_per_cta * REDUCTION_THREADS_PER_ROW
+                )
                 self.reduction_kernel(
                     o,
                     lse,
@@ -1361,22 +1379,23 @@ class MlaDecodeTs:
                     block_split_kvs,
                 ).launch(
                     grid=(
-                        ceil_div(effective_num_heads_q, REDUCTION_ROWS_PER_CTA),
-                        effective_seq_len_q,
+                        ceil_div(logical_query_rows, reduction_rows_per_cta),
+                        1,
                         batch_size,
                     ),
-                    block=[REDUCTION_THREADS_PER_CTA, 1, 1],
+                    block=[reduction_threads_per_cta, 1, 1],
                     smem=(
-                        REDUCTION_ROWS_PER_CTA
+                        reduction_rows_per_cta
                         * self.reduction_split_capacity
                         * self.lse_dtype.width
                         // 8
                     ),
                     stream=stream,
-                    # Match the reducer's 512-thread, eight-row resource model:
-                    # two resident CTAs keep register allocation from expanding
-                    # beyond what this bandwidth-oriented kernel can use.
-                    min_blocks_per_mp=2,
+                    # Preserve the established 1,024 resident-thread launch
+                    # bound as row coarsening changes the CTA thread count.
+                    min_blocks_per_mp=(
+                        2 * REDUCTION_ROWS_PER_CTA // reduction_rows_per_cta
+                    ),
                     use_pdl=use_one_wave_reducer_pdl,
                 )
 
@@ -1945,6 +1964,7 @@ class MlaDecodeTs:
             block_split_kvs,
             cfg,
             self.reduction_split_capacity,
+            self.reference_reduction_rows_per_cta,
         )
 
     @cute.kernel

@@ -64,12 +64,13 @@ class _AutomaticMlaWork(TypedDict, total=False):
     one_cta_split_kv: int | None
     two_cta_split_kv: int | None
     seq_len_k: int | None
+    qkv_dtype: str | None
 
 
 _SHORT_K_DIRECT_2CTA_MAX_TOKENS_PER_1CTA_SPLIT = 1024
 
 
-def _prefer_small_flat_direct_2cta(
+def _prefer_small_flat_2cta(
     num_heads: int,
     seq_len_q: int,
     *,
@@ -77,8 +78,9 @@ def _prefer_small_flat_direct_2cta(
     one_cta_split_kv: int | None,
     two_cta_split_kv: int | None,
     seq_len_k: int | None,
+    qkv_dtype: str | None,
 ) -> bool:
-    """Return whether direct 2CTA avoids a short-K M64 split reducer."""
+    """Return whether measured M64 family crossovers prefer 2CTA."""
 
     total_q_rows = num_heads * seq_len_q
     if (
@@ -96,10 +98,23 @@ def _prefer_small_flat_direct_2cta(
     assert one_cta_split_kv is not None
     assert two_cta_split_kv is not None
     assert seq_len_k is not None
-    if one_cta_split_kv <= 1 or two_cta_split_kv != 1:
+    if one_cta_split_kv <= 1:
         return False
     tokens_per_one_cta_split = (seq_len_k + one_cta_split_kv - 1) // one_cta_split_kv
-    return tokens_per_one_cta_split <= _SHORT_K_DIRECT_2CTA_MAX_TOKENS_PER_1CTA_SPLIT
+    if tokens_per_one_cta_split > _SHORT_K_DIRECT_2CTA_MAX_TOKENS_PER_1CTA_SPLIT:
+        return False
+    if two_cta_split_kv == 1:
+        # Direct output removes the 1CTA split reducer for both supported input
+        # dtypes without reducing service-unit fill.
+        return True
+    # With equal producer work, the BF16 M64 parallel reducer is slower than a
+    # small 2CTA reference reduction.  Keep this measured crossover bounded to
+    # split2/split4 reference grids; FP8 retains the faster 1CTA reducer.
+    return (
+        qkv_dtype == "bf16"
+        and two_cta_split_kv <= 4
+        and one_cta_split_kv == 2 * two_cta_split_kv
+    )
 
 
 @dataclass(frozen=True)
@@ -150,13 +165,15 @@ def select_default_mla_kernel_policy(
     one_cta_split_kv: int | None = None,
     two_cta_split_kv: int | None = None,
     seq_len_k: int | None = None,
+    qkv_dtype: str | None = None,
 ) -> MlaKernelPolicy:
     """Choose the default TS MLA family from work and resident capacity.
 
     Logical Q rows up to 64 normally retain the throughput-latency family. A
-    measured full-flat-row exception uses 2CTA when its direct-output wave
-    replaces a short-K M64 split/reducer launch. Larger shapes normally retain
-    2CTA, but an automatic caller may provide projected work for both
+    measured full-flat-row exceptions use 2CTA when its direct-output wave
+    replaces a short-K M64 split/reducer launch, or when a small BF16 reference
+    reduction has equal producer work and beats the M64 parallel reducer.
+    Larger shapes normally retain 2CTA, but an automatic caller may provide projected work for both
     candidates. The established probe requires the complete 2CTA launch to
     occupy at most one quarter of its resident cluster wave and the 1CTA
     candidate to improve normalized occupancy. A separately bounded FP8 Q16
@@ -170,13 +187,14 @@ def select_default_mla_kernel_policy(
     # needs a short-K standalone split reducer but 2CTA fills a direct-output
     # wave, the latter avoids the reducer without losing service-unit fill.
     if num_heads * seq_len_q <= 64:
-        if _prefer_small_flat_direct_2cta(
+        if _prefer_small_flat_2cta(
             num_heads,
             seq_len_q,
             one_cta_tile_size_q=one_cta_tile_size_q,
             one_cta_split_kv=one_cta_split_kv,
             two_cta_split_kv=two_cta_split_kv,
             seq_len_k=seq_len_k,
+            qkv_dtype=qkv_dtype,
         ):
             return "throughput_2cta"
         return "throughput_latency_1cta"

@@ -884,6 +884,7 @@ def _resolve_mla_decode_launch_spec(
                 int(two_cta_split_kv) if family_probe_cfg is not None else None
             ),
             seq_len_k=max_kv_len if family_probe_cfg is not None else None,
+            qkv_dtype=qkv_dtype_name,
         )
         use_throughput_latency = requested_policy == "throughput_latency_1cta"
 
@@ -1037,6 +1038,7 @@ def _resolve_mla_decode_launch_spec(
                 ),
                 ("separate_reducer_impl", separate_reducer_impl),
                 ("reducer_cluster_size", reducer_cluster_size),
+                ("reducer_rows_per_cta", None),
             )
         else:
             max_active_clusters = max_active_two_cta_clusters
@@ -1127,6 +1129,12 @@ def _resolve_mla_decode_launch_spec(
                 ),
                 ("separate_reducer_impl", separate_reducer_impl),
                 ("reducer_cluster_size", reducer_cluster_size),
+                (
+                    "reducer_rows_per_cta",
+                    int(kernel.reference_reduction_rows_per_cta)
+                    if separate_reducer_impl == "reference"
+                    else None,
+                ),
             )
         _validate_mla_policy_coordinate_span(policy)
 

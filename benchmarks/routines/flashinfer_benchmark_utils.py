@@ -51,6 +51,7 @@ output_column_dict = {
         "prims_ts_use_clc_dynamic_persistent_scheduler",
         "prims_ts_separate_reducer_impl",
         "prims_ts_reducer_cluster_size",
+        "prims_ts_reducer_rows_per_cta",
         "prims_ts_kernel_workspace_bytes",
     ],
     "gemm": [

@@ -45,6 +45,7 @@ REDUCTION_VECTOR_BYTES = 16
 REDUCTION_VALUES_PER_THREAD = REDUCTION_VECTOR_BYTES * 8 // PARTIAL_O_BITS
 REDUCTION_THREADS_PER_ROW = 512 // REDUCTION_VALUES_PER_THREAD
 REDUCTION_ROWS_PER_CTA = REDUCTION_THREADS_PER_CTA // REDUCTION_THREADS_PER_ROW
+MIN_REDUCTION_ROWS_PER_CTA = REDUCTION_ROWS_PER_CTA // 2
 
 # PV consumes V from SMEM in 32-token K blocks.  Physical KV pages may be
 # smaller or larger, but TMA must assemble this fixed block geometry before
@@ -61,6 +62,43 @@ def ceil_div(a: int, b: int) -> int:
     if b <= 0:
         raise ValueError(f"divisor must be positive, got {b}")
     return (a + b - 1) // b
+
+
+def select_reference_reduction_rows_per_cta(
+    *,
+    batch_size: int,
+    logical_query_rows: int,
+    producer_ctas: int,
+    physical_sm_count: int,
+) -> int:
+    """Choose four rows for a bounded reducer grid with enough producers.
+
+    Splitting an eight-row CTA in half exposes more independent reducer work
+    without changing total row work.  Require at least half a producer wave and
+    retain the same four-wave pressure bound as the Q128 parallel-reducer
+    selector.  Larger grids keep the established eight-row/512-thread CTA.
+    """
+
+    for value, name in (
+        (batch_size, "batch_size"),
+        (logical_query_rows, "logical_query_rows"),
+        (producer_ctas, "producer_ctas"),
+        (physical_sm_count, "physical_sm_count"),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{name} must be an integer")
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+
+    narrow_ctas = batch_size * ceil_div(
+        logical_query_rows, MIN_REDUCTION_ROWS_PER_CTA
+    )
+    if (
+        producer_ctas >= ceil_div(physical_sm_count, 2)
+        and narrow_ctas <= physical_sm_count * 4
+    ):
+        return MIN_REDUCTION_ROWS_PER_CTA
+    return REDUCTION_ROWS_PER_CTA
 
 
 def compute_split_kv(

@@ -20,7 +20,6 @@ from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
 
 from .config import (
-    REDUCTION_ROWS_PER_CTA,
     REDUCTION_THREADS_PER_ROW,
     REDUCTION_VALUES_PER_THREAD,
     REDUCTION_VECTOR_BYTES,
@@ -54,16 +53,19 @@ def run_reduction_kernel(
     block_split_kvs,
     cfg,
     max_splits: cutlass.Constexpr[int],
+    rows_per_cta: cutlass.Constexpr[int],
 ):
-    """Combine eight grouped-coordinate split rows per 512-thread CTA.
+    """Combine consecutive logical split rows in one reference-reducer CTA.
 
     Each 64-thread row group owns one D512 output row.  Its first warp computes
     FP32 LSE rescale factors, both warps consume one contiguous 16-byte BF16
-    fragment per thread, and the final accumulation remains FP32. Physical
-    tail rows still participate in CTA synchronization but never publish
-    public output.
+    fragment per thread, and the final accumulation remains FP32.  The launch
+    is flattened over logical query rows, then each row is decomposed back into
+    its physical M128 workspace tile and row.  Only the last CTA can contain
+    inactive row groups; those groups still synchronize but never access the
+    workspace or publish public output.
     """
-    effective_head_group_idx, seq_q_idx, batch_idx = cute.arch.block_idx()
+    flat_query_group_idx, _, batch_idx = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     row_in_cta = tidx // Int32(REDUCTION_THREADS_PER_ROW)
     row_thread_idx = tidx - row_in_cta * Int32(REDUCTION_THREADS_PER_ROW)
@@ -73,32 +75,48 @@ def run_reduction_kernel(
     lane_idx = row_thread_idx % Int32(cfg.threads_per_warp)
 
     effective_num_heads_q = Int32(cfg.mma_qk_tiler[0])
-    effective_head_idx = (
-        effective_head_group_idx * Int32(REDUCTION_ROWS_PER_CTA) + row_in_cta
+    logical_query_rows = Int32(kernel.num_heads * kernel.seq_len_q)
+    local_flat_query_row = (
+        flat_query_group_idx * Int32(rows_per_cta) + row_in_cta
     )
-    head_is_valid = effective_head_idx < effective_num_heads_q
-    # The row helper performs control-flow and storage-coordinate arithmetic.
-    # Clamp a tail CTA's inactive rows before calling it, then predicate every
-    # public/workspace access with ``head_is_valid``.
-    safe_effective_head_idx = cute.math.min(
-        effective_head_idx, effective_num_heads_q - Int32(1)
+    row_is_valid = local_flat_query_row < logical_query_rows
+    # Clamp the final CTA's inactive row groups before decomposing the physical
+    # workspace coordinate.  ``rows_per_cta`` divides M128, so every CTA
+    # containing valid rows belongs to exactly one producer query tile.
+    safe_local_flat_query_row = cute.math.min(
+        local_flat_query_row, logical_query_rows - Int32(1)
     )
-    (
-        storage_flat_query_row,
-        _,
-        logical_q_idx,
-        _,
-        mapped_query_is_valid,
-    ) = flat_query_row_state(
-        safe_effective_head_idx,
-        seq_q_idx,
-        cfg.mma_qk_tiler[0],
-        kernel.num_heads,
-        kernel.seq_len_q,
-        cu_seqlens_q,
-        batch_idx,
-    )
-    query_is_valid = head_is_valid and mapped_query_is_valid
+    if cutlass.const_expr(kernel.num_heads * kernel.seq_len_q <= cfg.mma_qk_tiler[0]):
+        query_tile_idx = Int32(0)
+        effective_head_idx = safe_local_flat_query_row
+    else:
+        query_tile_idx = safe_local_flat_query_row // effective_num_heads_q
+        effective_head_idx = (
+            safe_local_flat_query_row - query_tile_idx * effective_num_heads_q
+        )
+    if cutlass.const_expr(cu_seqlens_q is None):
+        # Fixed Q storage is already flat in the producer's logical row order;
+        # bypass packed-offset clamping on this latency-sensitive reducer path.
+        storage_flat_query_row = safe_local_flat_query_row
+        logical_q_idx = storage_flat_query_row // Int32(kernel.num_heads)
+        mapped_query_is_valid = True
+    else:
+        (
+            storage_flat_query_row,
+            _,
+            logical_q_idx,
+            _,
+            mapped_query_is_valid,
+        ) = flat_query_row_state(
+            effective_head_idx,
+            query_tile_idx,
+            cfg.mma_qk_tiler[0],
+            kernel.num_heads,
+            kernel.seq_len_q,
+            cu_seqlens_q,
+            batch_idx,
+        )
+    query_is_valid = row_is_valid and mapped_query_is_valid
     public_flat_query_row = storage_flat_query_row
     if cutlass.const_expr(cu_seqlens_q is None):
         public_flat_query_row = public_flat_query_row + batch_idx * Int32(
@@ -132,7 +150,7 @@ def run_reduction_kernel(
         )
         _, _, group_last_logical_q_idx, _, _ = flat_query_row_state(
             Int32(cfg.mma_qk_tiler[0] - 1),
-            seq_q_idx,
+            query_tile_idx,
             cfg.mma_qk_tiler[0],
             kernel.num_heads,
             kernel.seq_len_q,
@@ -163,13 +181,15 @@ def run_reduction_kernel(
 
     smem_lse_scale = cutlass.Array(
         kernel.lse_dtype,
-        REDUCTION_ROWS_PER_CTA * max_splits,
+        rows_per_cta * max_splits,
         space=cutlass.AddressSpace.smem,
         alignment=16,
     )
     row_scale_offset = row_in_cta * Int32(max_splits)
 
-    acc_lse_tile = acc_lse[safe_effective_head_idx, None, seq_q_idx, batch_idx]
+    acc_lse_tile = acc_lse[
+        effective_head_idx, None, query_tile_idx, batch_idx
+    ]
     if row_warp_idx == 0:
         # The first warp for each row owns its log-sum-exp merge.  It publishes
         # one rescale factor per active split for the row's second warp too.
@@ -212,7 +232,7 @@ def run_reduction_kernel(
                     else kernel.lse_dtype(0.0)
                 )
 
-    # Eight independent writer warps publish scales before any row consumes
+    # Independent writer warps publish scales before any row consumes
     # them.  Invalid/padded rows participate so this remains a full CTA barrier.
     prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
 
@@ -238,11 +258,11 @@ def run_reduction_kernel(
             * Int64(effective_num_heads_q)
             * Int64(split_kv)
             * Int64(cfg.latent_dim)
-            + Int64(seq_q_idx)
+            + Int64(query_tile_idx)
             * Int64(effective_num_heads_q)
             * Int64(split_kv)
             * Int64(cfg.latent_dim)
-            + Int64(safe_effective_head_idx) * Int64(split_kv) * Int64(cfg.latent_dim)
+            + Int64(effective_head_idx) * Int64(split_kv) * Int64(cfg.latent_dim)
             + Int64(element_idx)
         )
         partial_output_ptr = acc_output_ptr + partial_elem_offset_base
