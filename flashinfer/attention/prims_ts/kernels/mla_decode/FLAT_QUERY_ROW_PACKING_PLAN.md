@@ -1462,7 +1462,10 @@ on the 1CTA parallel reducer. The B32/K4096 companion point has the analogous
 split4/split2 relationship. The automatic-policy candidate therefore selects
 2CTA only when all existing 48--64-row M64 conditions hold, the dtype is BF16,
 the 1CTA split is exactly twice the 2CTA split, the 2CTA reference split is at
-most four, and the local 1CTA K span is at most 1024 tokens. Existing direct
+most four, and the local 1CTA K span is 513--1024 tokens. The lower bound comes
+from a measured tile boundary: at B16/K4096, 1CTA's 512-token local span was
+26.2528 us versus 26.5600 us for 2CTA, while at B16/K4097 the extra local tile
+reversed the five-run medians to 28.2048 us versus 27.5904 us. Existing direct
 split-1 crossover behavior remains enabled for both BF16 and FP8.
 
 Nsight Systems then identified padding in the 2CTA reference reducer itself.
@@ -1519,3 +1522,10 @@ followed by a new exact-SHA formal directory with updated dispatch assertions.
 After the 31-point/five-campaign Gate-A/Gate-B qualification, step 12 remains
 the required TRTLLM-GEN/CuTe-DSL/public-auto-PrimTS eager and CUDA-graph
 comparison.
+
+The first complete test-file run after `97a40ae9` passed 230/231 cases. Its
+only failure was the pre-crossover BF16 family assertion at H6/SQ8,
+B16/K4097; the planned 2CTA output was not executed because the assertion ran
+first. All other correctness cases passed. The 513-token lower boundary and
+dtype-specific assertion above are the follow-up patch; rerun that two-dtype
+case first, then rerun the complete file before creating the formal directory.
