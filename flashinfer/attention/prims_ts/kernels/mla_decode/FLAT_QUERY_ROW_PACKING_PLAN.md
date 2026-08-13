@@ -1135,3 +1135,66 @@ provenance are retained under
 This is the documented 1CTA policy checkpoint on top of `0cfd4866`. The full
 public-auto matrix, complete exact-tree correctness suite, refreshed Gate A,
 and formal multi-campaign section-6 signoff remain outstanding.
+
+## 17. Exact `738ea7d3` validation and complete 1CTA spot matrix (2026-08-13)
+
+The full-row promotion in section 16 is committed as `738ea7d3`
+(`perf(mla): promote filled flat query rows`). The source worktree was clean
+for the complete validation and expanded performance runs. They used NVIDIA
+B200 UUID `GPU-3a152337-616f-84c8-e9f2-5f7ed45a6c56`, container hostname
+`c27f46ee8010`, PyTorch `2.10.0+cu128`, CUDA runtime 12.8, and compute
+capability 10.0.
+
+Exact-source correctness and regression results were:
+
+- `tests/attention/test_attention_ts_mla_decode.py`: 191/191 passed in
+  622.32 seconds. This is the prior 178-case suite plus 13 host/GPU contracts
+  for full-row promotion, split rounding, and legacy split preservation.
+- `tests/attention/test_cute_dsl_mla_decode.py -k monolithic`: all 274
+  selected cases passed; 404 non-monolithic cases were deselected.
+- `tests/trace/test_fi_trace_template_consistency.py`: 629/629 passed.
+- Trace consistency plus template init and registry: 981 passed and 168
+  skipped, matching the established registry result.
+- Ruff format/lint, Python compilation, and `git diff --check` passed before
+  the `738ea7d3` checkpoint commit.
+
+JUnit XML is retained under
+`artifacts/groups_tokens_heads_20260812/full_validation_738ea7d3_gpu_3a152`.
+No numerical, packed-Q, H6, zero-length request, reducer, public-path,
+CUDA-graph, runtime-pruning, 1CTA, or 2CTA regression was observed.
+
+The exact-source public-auto 1CTA spot campaign was expanded to all seven
+section-6.2 shapes `(6,8)`, `(12,4)`, `(24,2)`, `(48,1)`, `(6,1)`, `(12,1)`,
+and `(24,1)` at B/K points `1/2048`, `4/512`, `16/4096`, and `64/8192`, in
+both BF16 and FP8. All 56 PrimTS/CuTe DSL pairs passed `--refcheck`, and every
+PrimTS row satisfied the fail-closed `throughput_latency_1cta` dispatch
+assertion. The aggregate results were:
+
+| Dtype/cohort | Rows | Geomean speedup | Raw minimum |
+| --- | ---: | ---: | ---: |
+| BF16 overall | 28 | 1.133396 | 0.967192 |
+| BF16 B1/K2048 | 7 | 1.241395 | 1.020199 |
+| BF16 B4/K512 | 7 | 1.280066 | 1.238608 |
+| BF16 B16/K4096 | 7 | 1.000202 | 0.975326 |
+| BF16 B64/K8192 | 7 | 1.038235 | 0.967192 |
+| FP8 overall | 28 | 1.130757 | 0.991069 |
+| FP8 B1/K2048 | 7 | 1.174970 | 1.123177 |
+| FP8 B4/K512 | 7 | 1.238905 | 1.162979 |
+| FP8 B16/K4096 | 7 | 1.045285 | 1.011534 |
+| FP8 B64/K8192 | 7 | 1.074427 | 0.991069 |
+
+The raw BF16 minimum is the H24/SQ1 B64/K8192 outlier already repeated in
+section 16. Its five-pair median speedup is 1.005754x. The other long-B
+borderline row, H48/SQ1 B64/K8192, has a five-pair median speedup of 0.992263x.
+Those repeat medians, rather than the isolated fast CuTe DSL samples, clear the
+0.97 row guard. The only unrepeated BF16 row below parity by more than noise is
+H12/SQ1 B16/K4096 at 0.975326x, still above the guard; the seven-row B16
+geometric mean is 1.000202x.
+
+The complete per-row table and resumable exact-source runner are in
+`gate_b_public_auto_1cta_policy_20260813/FULL_SUMMARY.txt` and
+`run_full_spot_matrix.sh`. This closes the four-point public-auto 1CTA spot
+gate with positive dtype-wide geometric means and no repeat-confirmed row
+below 0.97. It does not replace the larger 31-point/five-campaign formal matrix
+in section 6.2. Refreshed old-PrimTS Gate A for the final source and the broader
+multi-campaign signoff remain outstanding.
