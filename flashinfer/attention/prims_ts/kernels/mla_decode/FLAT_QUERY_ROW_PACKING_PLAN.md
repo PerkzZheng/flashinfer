@@ -1534,3 +1534,26 @@ two-dtype GPU gate passed 15/15. The complete exact-checkpoint rerun then passed
 `full_validation_12dc0e4f_gpu_3f241`. This closes exact-tree correctness for
 the logical-row reducer and bounded family crossover; create the formal
 directory pinned to `12dc0e4f` next.
+
+## 23. Exact-source formal Gate-B campaign (2026-08-13)
+
+The acceptance campaign is now running under
+`gate_b_formal_public_auto_12dc0e4f`, pinned to kernel checkpoint `12dc0e4f`.
+Every backend/row is a fresh process with explicit candidate `PYTHONPATH`, a
+backend-specific JIT cache, refcheck, CUDA-event graph timing, 20 warmups, 100
+measured iterations, seed 42, alternating backend order, and an explicit
+completion marker. The runner rejects source changes after the kernel
+checkpoint except commits to this recovery plan. Its analyzer independently
+checks public-auto family dispatch, requires all 31 pairs and their `.ok`
+markers, and fails if the shard geometric mean or any measured row is below
+the requester-confirmed 0.95 Gate-B floor.
+
+The first BF16 H6/SQ8 shard completed all 31 pairs. Public-auto selected 2CTA
+at B64/K512, B64/K2048, B16/K8192, and B32/K4096 and throughput-latency 1CTA
+on the other 27 points, exactly matching the checked-in campaign expectation.
+The CuTeDSL/PrimTS geometric-mean speedup was 1.100814x. The minimum was
+0.961794x at B16/K128 (8.3376 us CuTe DSL versus 8.6688 us PrimTS), so this
+first-coverage shard passes the 0.95 pointwise and geometric-mean requirements.
+BF16 H12/SQ4 is the next active shard on the same B200 allocation. These are
+first-coverage results; the required multi-campaign aggregation and dispersion
+report remain open.
