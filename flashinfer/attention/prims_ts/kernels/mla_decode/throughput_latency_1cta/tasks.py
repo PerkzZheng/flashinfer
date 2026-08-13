@@ -19,7 +19,11 @@ from cutlass import Int32
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.resources import WorkQueue
-from cutlass.experimental.task_scheduling.schedule_builder import domain_loop, schedule
+from cutlass.experimental.task_scheduling.schedule_builder import (
+    domain_loop,
+    schedule,
+    work_tile_loop,
+)
 from cutlass.experimental.task_scheduling.task import Task
 
 from ..helpers.constants import (
@@ -1372,19 +1376,30 @@ def create_throughput_latency_scheduler_task(
 ) -> Task:
     """Create the CLC dynamic persistent scheduler task."""
 
+    work_tile_skip_if = runtime_work_tile_skip_if(work_queue)
+
     @schedule
     def scheduler_schedule(work_queue, schedule_token_throttle=None):
         """Fetch and publish the next dynamic persistent work tile."""
-        _work_tile, _ = work_queue.init_work_tile()
-        with domain_loop(0, 0, 1):
-            pass
-        schedule_token_throttle_tail(schedule_token_throttle)
-        work_queue.acquire()
-        work_queue.fetch_work_tile()
-        work_queue.commit()
-        work_queue.wait()
-        work_queue.get_and_advance_work_tile()
-        work_queue.release()
+
+        with work_tile_loop(work_queue, skip_if=work_tile_skip_if) as work_tiles:
+            if work_tile_skip_if is None:
+                with domain_loop(0, 0, 1):
+                    pass
+                schedule_token_throttle_tail(schedule_token_throttle)
+            else:
+                # Runtime-empty packed-Q tiles do not publish a load token, but
+                # the scheduler must still fetch and advance past them.
+                with work_tiles.skippable():
+                    with domain_loop(0, 0, 1):
+                        pass
+                    schedule_token_throttle_tail(schedule_token_throttle)
+            work_queue.acquire()
+            work_queue.fetch_work_tile()
+            work_queue.commit()
+            work_queue.wait()
+            work_queue.get_and_advance_work_tile()
+            work_queue.release()
 
     captured_schedule = (
         scheduler_schedule(work_queue)

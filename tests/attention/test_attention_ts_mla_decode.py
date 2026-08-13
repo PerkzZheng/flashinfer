@@ -290,6 +290,25 @@ def test_attention_ts_mla_legacy_auto_split_is_not_rounded():
     assert profile.num_ctas_per_seq_kv == 9
 
 
+def test_attention_ts_mla_keeps_multiwave_auto_uses_direct_grid():
+    """Do not select an unqualified persistent M64 grid beyond one wave."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+        keeps_mma_ab_profiles,
+    )
+
+    profiles = keeps_mma_ab_profiles(
+        num_heads_q=64,
+        batch_size=160,
+        seq_len_q=1,
+        max_active_clusters=148,
+    )
+    assert profiles[0].name == "h64_keeps_mma_ab"
+    assert profiles[0].use_persistent_scheduler == 0
+    assert profiles[0].use_clc_dynamic_persistent_scheduler == 0
+    assert "h64_keeps_mma_ab_clc" not in {profile.name for profile in profiles}
+
+
 @pytest.mark.parametrize(
     "layout_args,query_tile_idx,row_in_tile,expected",
     (
@@ -2340,6 +2359,70 @@ def test_attention_ts_mla_decode_non_power_heads_1cta_throughput_promotion(
     )
     assert policy["logical_num_heads_q"] == 6
     assert policy["logical_seq_len_q"] == 8
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_m64_multiwave_uses_complete_direct_grid():
+    """Execute every H6/Q8 request when M64 work exceeds the resident wave."""
+
+    case = _make_mla_case(
+        batch_size=160,
+        num_qo_heads=6,
+        max_seq_len=129,
+        seq_len_q=8,
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=40564,
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_latency_1cta",
+            "profile": "h64_keeps_mma_ab",
+            "tile_size_q": 64,
+            "num_q_tiles": 1,
+            "producer_ctas": 160,
+            "use_persistent_scheduler": False,
+            "use_clc_dynamic_persistent_scheduler": False,
+        },
+        device=case.query.device,
+    )
+    _exercise_public_paths(wrapper, case, policy, exercise_all_paths=True)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_swaps_clc_advances_past_two_waves():
+    """Keep fetching M8 CLC work after both the initial and second waves."""
+
+    case = _make_mla_case(
+        batch_size=320,
+        num_qo_heads=8,
+        max_seq_len=129,
+        seq_len_q=1,
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=40508,
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_latency_1cta",
+            "profile": "h8_clc",
+            "tile_size_q": 8,
+            "num_q_tiles": 1,
+            "producer_ctas": 320,
+            "use_persistent_scheduler": True,
+            "use_clc_dynamic_persistent_scheduler": True,
+        },
+        device=case.query.device,
+    )
+    _exercise_public_paths(wrapper, case, policy, exercise_all_paths=True)
 
 
 @pytest.mark.parametrize(

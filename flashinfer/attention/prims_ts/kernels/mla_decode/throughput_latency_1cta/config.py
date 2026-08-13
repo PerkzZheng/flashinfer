@@ -1442,7 +1442,12 @@ def keeps_mma_ab_profiles(
     )
     base_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 64)
     if base_work > max_active_clusters:
-        return clc, nonpersistent, split
+        # The Keeps-MMA-AB task graph does not yet retire a second persistent
+        # work tile reliably. A persistent launch therefore cancels the grid
+        # suffix once work exceeds the resident wave. Do not enumerate that
+        # candidate for a multi-wave shape; the direct grid is the complete
+        # automatic path until multi-tile persistence is qualified here.
+        return nonpersistent, split
     return nonpersistent, clc, split
 
 
