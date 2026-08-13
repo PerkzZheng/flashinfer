@@ -338,6 +338,26 @@ def test_attention_ts_mla_keeps_multiwave_auto_uses_direct_grid():
             8,
             8,
             4,
+            4096,
+            "bf16",
+            "throughput_latency_1cta",
+            id="equal-wave-local-k-lower-bound",
+        ),
+        pytest.param(
+            6,
+            8,
+            8,
+            4,
+            4097,
+            "bf16",
+            "throughput_2cta",
+            id="equal-wave-extra-local-k-tile",
+        ),
+        pytest.param(
+            6,
+            8,
+            8,
+            4,
             8192,
             "e4m3",
             "throughput_latency_1cta",
@@ -2502,16 +2522,48 @@ def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
 
 
 @pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
+    "qkv_dtype,expected_b200",
+    (
+        pytest.param(
+            torch.bfloat16,
+            {
+                "kernel": "throughput_2cta",
+                "tile_size_q": 128,
+                "total_q_rows": 48,
+                "num_q_tiles": 1,
+                "tail_q_rows": 48,
+                "split_kv": 4,
+                "producer_ctas": 128,
+                "separate_reducer_impl": "reference",
+                "reducer_rows_per_cta": 4,
+            },
+            id="bf16",
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            {
+                "kernel": "throughput_latency_1cta",
+                "profile": "h64_keeps_mma_ab_splitkv8_gmem",
+                "tile_size_q": 64,
+                "total_q_rows": 48,
+                "num_q_tiles": 1,
+                "tail_q_rows": 48,
+                "split_kv": 8,
+                "producer_ctas": 128,
+                "separate_reducer_impl": "parallel",
+                "reducer_rows_per_cta": None,
+            },
+            id="fp8",
+        ),
+    ),
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_non_power_heads_1cta_throughput_promotion(
+def test_attention_ts_mla_decode_non_power_heads_throughput_promotion(
     qkv_dtype: torch.dtype,
+    expected_b200: dict[str, object],
 ):
-    """A filled wave collapses the H6/Q8 workload to one M64 query tile."""
+    """A filled wave uses the measured dtype-specific H6/Q8 family."""
 
     case = _make_mla_case(
         batch_size=16,
@@ -2524,17 +2576,7 @@ def test_attention_ts_mla_decode_non_power_heads_1cta_throughput_promotion(
     )
     policy = _exercise_auto_mla_case(
         case,
-        expected_b200={
-            "kernel": "throughput_latency_1cta",
-            "profile": "h64_keeps_mma_ab_splitkv8_gmem",
-            "tile_size_q": 64,
-            "total_q_rows": 48,
-            "num_q_tiles": 1,
-            "tail_q_rows": 48,
-            "split_kv": 8,
-            "producer_ctas": 128,
-            "separate_reducer_impl": "parallel",
-        },
+        expected_b200=expected_b200,
     )
     assert policy["logical_num_heads_q"] == 6
     assert policy["logical_seq_len_q"] == 8

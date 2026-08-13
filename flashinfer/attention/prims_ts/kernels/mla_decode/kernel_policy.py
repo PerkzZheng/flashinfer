@@ -68,6 +68,7 @@ class _AutomaticMlaWork(TypedDict, total=False):
 
 
 _SHORT_K_DIRECT_2CTA_MAX_TOKENS_PER_1CTA_SPLIT = 1024
+_SMALL_REFERENCE_2CTA_MIN_TOKENS_PER_1CTA_SPLIT = 513
 
 
 def _prefer_small_flat_2cta(
@@ -112,6 +113,8 @@ def _prefer_small_flat_2cta(
     # split2/split4 reference grids; FP8 retains the faster 1CTA reducer.
     return (
         qkv_dtype == "bf16"
+        and tokens_per_one_cta_split
+        >= _SMALL_REFERENCE_2CTA_MIN_TOKENS_PER_1CTA_SPLIT
         and two_cta_split_kv <= 4
         and one_cta_split_kv == 2 * two_cta_split_kv
     )
