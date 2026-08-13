@@ -1527,5 +1527,10 @@ The first complete test-file run after `97a40ae9` passed 230/231 cases. Its
 only failure was the pre-crossover BF16 family assertion at H6/SQ8,
 B16/K4097; the planned 2CTA output was not executed because the assertion ran
 first. All other correctness cases passed. The 513-token lower boundary and
-dtype-specific assertion above are the follow-up patch; rerun that two-dtype
-case first, then rerun the complete file before creating the formal directory.
+dtype-specific assertion are committed in `12dc0e4f`. The focused selector and
+two-dtype GPU gate passed 15/15. The complete exact-checkpoint rerun then passed
+233/233 cases in 744.92 seconds on B200 UUID
+`GPU-3f241fbe-8ae5-204d-35a7-8f613c2a22f0`. Its JUnit report is under
+`full_validation_12dc0e4f_gpu_3f241`. This closes exact-tree correctness for
+the logical-row reducer and bounded family crossover; create the formal
+directory pinned to `12dc0e4f` next.
