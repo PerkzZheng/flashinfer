@@ -1307,3 +1307,53 @@ header-only output from being mistaken for a completed row. Formal Gate B
 must restart from a clean documentation checkpoint containing `319dfd05`,
 rerun all rows on that exact source, and retain the five-campaign repetition
 rule from section 6.3.
+
+## 20. Public-auto short-K direct-2CTA crossover (2026-08-13)
+
+The clean `4188a8c6` restart completed its first 31-point H6/SQ8 BF16 shard
+with all 62 backend subprocesses refchecked and marked successful. Its
+geometric-mean speedup was 1.091554x, but two reproducible rows violated the
+0.97 guard. At B64/K512, the M64 split-2 1CTA path measured 17.9648 us versus
+16.9408 us, or 0.94299962x across five alternating-order repeats. At
+B64/K2048 it measured 42.5520 us versus 38.6192 us, or 0.90757663x. Both used
+128 producer CTAs plus the standalone parallel reducer.
+
+Profile isolation ruled out split-1 and smaller 1CTA tiles: they removed the
+reducer but rescanned K and were slower. A direct-output 2CTA launch used the
+same 128 producer CTAs as one full resident cluster wave and measured
+16.3296 us at K512 and 37.9648 us at K2048. Monolithic CuTe DSL speedups became
+1.03742893x and 1.01723704x. FP8 improved from 14.4832 and 25.1264 us on the
+split 1CTA path to 11.6128 and 22.0672 us on direct 2CTA, producing
+1.08845409x and 0.98600639x speedups.
+
+Commit `66024fbf` (`perf(mla): route short flat rows to direct 2CTA`) adds a
+bounded automatic family probe. It selects 2CTA only when all of the following
+are true:
+
+- the logical head count is non-power-of-two and the launch has 48--64 flat
+  query rows in one M64 tile;
+- the projected M64 1CTA profile needs split-KV while M128 2CTA has a
+  direct-output split-1 wave; and
+- the planned K extent per 1CTA split is at most 1024 tokens.
+
+The rule preserves smaller partial tails, direct 1CTA cases, longer local K,
+2CTA split cases, and legacy power-of-two heads. Six host boundary contracts
+cover those decisions. Public B200 accuracy then passed all eight combinations
+of H6/SQ8, H12/SQ4, H24/SQ2, and H48/SQ1 with BF16/FP8 at the short-K
+crossover. Every case selected 2CTA split 1 with zero kernel workspace and
+passed the existing reference path.
+
+A matched H12/H24/H48 B64, K512/K2048 matrix gave a 1.017958x BF16 geometric
+mean and a 1.036133x FP8 geometric mean. Eleven of twelve raw rows cleared the
+guard. The isolated H48/SQ1 BF16 K2048 sample was 0.968150x, so it was repeated
+five times with alternating order. Every repeat was at least 0.970680x and the
+median comparison was 37.7152 versus 36.7456 us, or 0.97429155x. A diagnostic
+H24/SQ1 tail did not meet the guard under 2CTA, confirming why the 48-row lower
+bound is required.
+
+The `gate_b_formal_1cta_4188a8c6` shard is retained as the exact evidence that
+found this policy miss, but it is superseded for acceptance by `66024fbf`.
+Formal public-auto qualification must restart from a clean documentation
+checkpoint on top of that commit. Its dispatch assertion must accept the
+checked 2CTA crossover at B64/K512 and B64/K2048 for the four 48-row shapes,
+while continuing to require 1CTA for the other points in this cohort.
