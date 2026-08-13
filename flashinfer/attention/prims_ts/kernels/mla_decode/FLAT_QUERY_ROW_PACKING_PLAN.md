@@ -1070,3 +1070,68 @@ Gate B remains open until the complete public-auto matrix and campaign
 repetitions meet section 6.3 and Gate A is refreshed against old PrimTS for the
 final patch. Raw CSV, XML, NCU, and Nsight Systems artifacts are in the
 section-14 artifact directory.
+
+## 16. Public-auto 1CTA full-row promotion checkpoint (2026-08-13)
+
+The first complete public-auto 1CTA spot matrix on `0cfd4866` exposed a
+schedule-level performance problem rather than a flat-row correctness issue.
+For the 48-row H6/SQ8, H12/SQ4, and H24/SQ2 products, the latency-oriented
+M8/M16 profiles scanned long K six or three times. At B16/K4096 their BF16
+speedups versus monolithic CuTe DSL were 0.3307x, 0.6482x, and 0.6510x; their
+FP8 speedups were 0.4712x, 0.7801x, and 0.7804x. H24/SQ1 similarly used two
+M16 scans and measured 0.8207x BF16 at B16 and 0.8024x at B64. One-query-tile
+profiles and the B1/B4 latency points were otherwise broadly healthy.
+
+Forced-profile diagnostics showed that long-K work should collapse the flat
+row product to one M64 keeps-MMA-AB tile. For H6/SQ8 at B16/K4096, M64 reduced
+BF16 latency from 80.9344 us to about 27.37 us, and selecting split 8 instead
+of the ordinary split 9 reduced it again to about 26.3 us. FP8 followed the
+same crossover. At the 24-row H24/SQ1 boundary, M64 split 8 measured
+24.7168 us BF16 and 16.3200 us FP8, while M32 split 8 measured 25.9424 us and
+16.9312 us. M64 is therefore the measured throughput tile for 17--64 flat
+rows even when M32 would be the smallest covering tile.
+
+The automatic 1CTA policy now promotes a non-power-of-two logical-head launch
+with at most 64 flat rows only when the projected split-KV/V decomposition
+fills at least five sixths of a resident 1CTA wave. This retains M8/M16 for
+short underfilled latency work and preserves every legacy power-of-two-head
+tile choice. Promoted 17--64-row work uses one M64 tile. If its ordinary
+high-M split count is not a power of two, the public planner rounds down only
+when the rounded producer grid still meets the same five-sixths occupancy
+guard. The adjustment is applied as an explicit split only to the promoted
+non-power-of-two launch; a host contract confirms that legacy H64 continues
+to choose its established automatic split 9.
+
+On replacement B200 UUID `GPU-3a152337-616f-84c8-e9f2-5f7ed45a6c56`, the
+five shape-resolution cases and six split-policy cases passed. GPU correctness
+then passed all ten focused cases: the two BF16/FP8 H6/SQ8 B16/K4097 promoted
+launches plus the existing eight-case short-K H6/H12/H24/H48 product. The
+promoted cases selected one M64 tile, split 8, 128 producer CTAs, and the
+parallel standalone reducer; all short cases retained their previous tiles.
+
+A fresh 24-pair target gate used public-auto PrimTS versus monolithic CuTe DSL,
+CUDA graphs/events, 20 warmups, 100 iterations, seed 42, alternating process
+order, and `--refcheck` for every row. It covered all promoted 48-row shapes
+and H24/SQ1 at B16/K4096 and B64/K8192, plus H6/SQ8 B1/K2048 and B4/K512
+latency controls, in BF16 and FP8. Results were:
+
+- BF16 geometric-mean speedup 1.053815x. The initial minimum was 0.967192x at
+  H24/SQ1 B64/K8192, while the next minimum was 0.9707x at H48/SQ1.
+- FP8 geometric-mean speedup 1.064841x and minimum 0.991069x.
+- The short BF16 controls retained 1.2577x and 1.2769x speedups; FP8 retained
+  1.2210x and 1.2646x.
+
+Because long B64 timings varied materially between fresh CuTe DSL processes,
+the two borderline BF16 rows were repeated five times with alternating order.
+H24/SQ1 had a 130.2816 us PrimTS median and 130.9808 us CuTe DSL median, with
+a 1.005754x median paired speedup. H48/SQ1 had 134.8384 us versus 133.7952 us,
+or 0.992263x. The repeat medians clear the 0.97 guard and identify the single
+126.7904 us CuTe DSL sample in the target matrix as a non-representative
+outlier.
+
+Raw target and repeat CSVs, logs, scripts, summaries, and environment
+provenance are retained under
+`artifacts/groups_tokens_heads_20260812/gate_b_public_auto_1cta_policy_20260813`.
+This is the documented 1CTA policy checkpoint on top of `0cfd4866`. The full
+public-auto matrix, complete exact-tree correctness suite, refreshed Gate A,
+and formal multi-campaign section-6 signoff remain outstanding.

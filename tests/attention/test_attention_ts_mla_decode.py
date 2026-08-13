@@ -182,6 +182,115 @@ def test_attention_ts_mla_flat_query_tile_layout_rejects_invalid_extent(
 
 
 @pytest.mark.parametrize(
+    "case_kwargs,expected_tile_size_q,expected_num_q_tiles",
+    (
+        pytest.param(
+            dict(batch_size=4, num_heads_q=6, seq_len_q=8, seq_len_kv=512),
+            8,
+            6,
+            id="short-underfilled-retains-m8",
+        ),
+        pytest.param(
+            dict(batch_size=16, num_heads_q=6, seq_len_q=8, seq_len_kv=4096),
+            64,
+            1,
+            id="h6-q8-promotes-m64",
+        ),
+        pytest.param(
+            dict(batch_size=16, num_heads_q=12, seq_len_q=4, seq_len_kv=4096),
+            64,
+            1,
+            id="h12-q4-promotes-m64",
+        ),
+        pytest.param(
+            dict(batch_size=16, num_heads_q=24, seq_len_q=1, seq_len_kv=4096),
+            64,
+            1,
+            id="h24-q1-promotes-m64",
+        ),
+        pytest.param(
+            dict(batch_size=16, num_heads_q=32, seq_len_q=1, seq_len_kv=4096),
+            16,
+            2,
+            id="legacy-power-of-two-retains-m16",
+        ),
+    ),
+)
+def test_attention_ts_mla_auto_flat_tile_throughput_promotion(
+    case_kwargs,
+    expected_tile_size_q,
+    expected_num_q_tiles,
+):
+    """Promote non-power heads only when the full-row tile fills a wave."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+        resolve_auto_mla_gen_groups_tokens_heads_q_shape,
+    )
+
+    shape = resolve_auto_mla_gen_groups_tokens_heads_q_shape(
+        **case_kwargs,
+        qkv_dtype="bf16",
+        max_active_clusters=148,
+    )
+    assert shape.tile_size_q == expected_tile_size_q
+    assert shape.seq_len_q == expected_num_q_tiles
+
+
+@pytest.mark.parametrize(
+    "split_kv,base_work,tile_size_q,expected",
+    (
+        pytest.param(9, 16, 64, 8, id="m64-rounds-nine-to-eight"),
+        pytest.param(9, 16, 32, 8, id="m32-rounds-nine-to-eight"),
+        pytest.param(9, 16, 16, 9, id="m16-retains-nine"),
+        pytest.param(12, 12, 64, 12, id="rounded-work-underfills"),
+        pytest.param(8, 16, 64, 8, id="already-power-of-two"),
+    ),
+)
+def test_attention_ts_mla_auto_split_power_of_two_wave_guard(
+    split_kv,
+    base_work,
+    tile_size_q,
+    expected,
+):
+    """Round high-M split counts only while preserving near-wave occupancy."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+        round_auto_split_kv_for_wave,
+    )
+
+    assert (
+        round_auto_split_kv_for_wave(
+            split_kv=split_kv,
+            base_work=base_work,
+            target_work=148,
+            tile_size_q=tile_size_q,
+        )
+        == expected
+    )
+
+
+def test_attention_ts_mla_legacy_auto_split_is_not_rounded():
+    """Keep the measured split policy unchanged for legacy H64 launches."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+        auto_split_profile,
+    )
+
+    profile = auto_split_profile(
+        batch_size=16,
+        num_heads_q=64,
+        seq_len_q=1,
+        seq_len_kv=4096,
+        latent_dim=512,
+        max_active_clusters=148,
+        tile_size_q=64,
+        qkv_dtype="bf16",
+    )
+    assert profile is not None
+    assert profile.num_ctas_per_seq_kv == 9
+
+
+@pytest.mark.parametrize(
     "layout_args,query_tile_idx,row_in_tile,expected",
     (
         ((96, 2, 128), 0, 127, (127, 1, 31, True)),
@@ -2192,6 +2301,45 @@ def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
     )
     assert policy["logical_num_heads_q"] == num_qo_heads
     assert policy["logical_seq_len_q"] == seq_len_q
+
+
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_non_power_heads_1cta_throughput_promotion(
+    qkv_dtype: torch.dtype,
+):
+    """A filled wave collapses the H6/Q8 workload to one M64 query tile."""
+
+    case = _make_mla_case(
+        batch_size=16,
+        num_qo_heads=6,
+        max_seq_len=4097,
+        seq_len_q=8,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=40500 + (1 if qkv_dtype == _FP8 else 0),
+    )
+    policy = _exercise_auto_mla_case(
+        case,
+        expected_b200={
+            "kernel": "throughput_latency_1cta",
+            "profile": "h64_keeps_mma_ab_splitkv8_gmem",
+            "tile_size_q": 64,
+            "total_q_rows": 48,
+            "num_q_tiles": 1,
+            "tail_q_rows": 48,
+            "split_kv": 8,
+            "producer_ctas": 128,
+            "separate_reducer_impl": "parallel",
+        },
+    )
+    assert policy["logical_num_heads_q"] == 6
+    assert policy["logical_seq_len_q"] == 8
 
 
 @pytest.mark.parametrize(

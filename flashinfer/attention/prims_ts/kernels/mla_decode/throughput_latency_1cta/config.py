@@ -55,6 +55,13 @@ AUTO_SWAPS_TILE_SIZE_Q = (8, 16)
 SWAPS_MMA_AB_KV_STEP_TOKENS = 256
 SWAPS_MMA_AB_MAX_SEQ_LEN_PER_CTA_KV = 768
 
+# A promoted full-row tile trades the small-M latency schedule for one KV scan.
+# Require its complete producer decomposition to fill at least five sixths of
+# a resident wave before making that trade. On B200 this admits the measured
+# 128-CTA M32/M64 schedules while retaining M8/M16 for short underfilled work.
+FULL_ROW_PROMOTION_WAVE_NUMERATOR = 5
+FULL_ROW_PROMOTION_WAVE_DENOMINATOR = 6
+
 # SM100A exposes 227 KiB of dynamic SMEM.  Keep a small TS metadata reservation
 # when deciding whether the automatic cluster-reduction scratch can fit.
 SM100A_SMEM_CAPACITY_BYTES = 232448
@@ -740,6 +747,92 @@ def auto_tile_size_q_for_mla_gen(
     return base_tile_size_q
 
 
+def projected_auto_profile_producer_work(
+    *,
+    batch_size: int,
+    num_heads_q: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    qkv_dtype: str,
+    tile_size_q: int,
+    max_active_clusters: int,
+) -> int:
+    """Project producer CTAs after automatic split-KV and V slicing."""
+
+    base_work = q_tile_work_count(
+        batch_size,
+        num_heads_q,
+        seq_len_q,
+        tile_size_q,
+    )
+    split_kv_step_tokens = automatic_split_kv_step_tokens(
+        qkv_dtype=qkv_dtype,
+        tile_size_q=tile_size_q,
+        base_work=base_work,
+    )
+    max_split_kv = max(1, ceil(seq_len_kv / split_kv_step_tokens))
+    split_kv = min(max_split_kv, max(1, max_active_clusters // base_work))
+    split_kv = round_auto_split_kv_for_wave(
+        split_kv=split_kv,
+        base_work=base_work,
+        target_work=max_active_clusters,
+        tile_size_q=tile_size_q,
+    )
+    work_after_kv = base_work * split_kv
+    head_dim_split = head_dim_split_for_work(
+        work_after_kv=work_after_kv,
+        target_work=max_active_clusters,
+        latent_dim=MlaConfig.latent_dim,
+    )
+    return work_after_kv * head_dim_split
+
+
+def throughput_full_flat_query_tile_size_q(total_q_rows: int) -> int:
+    """Return the measured one-scan tile for a promoted flat-row launch.
+
+    M32 covers 17--32 rows, but the M64 keeps-MMA-AB schedule is faster for
+    the measured long-K H24/Q1 boundary.  Smaller row products retain their
+    ordinary M8/M16 latency tiles.
+    """
+
+    if 16 < total_q_rows <= 64:
+        return 64
+    return tile_size_q_for_tokens_heads(total_q_rows)
+
+
+def should_promote_full_flat_query_tile(
+    *,
+    batch_size: int,
+    num_heads_q: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    qkv_dtype: str,
+    current_tile_size_q: int,
+    max_active_clusters: int,
+) -> bool:
+    """Return whether one full flat-row tile has enough throughput work."""
+
+    total_q_rows = num_heads_q * seq_len_q
+    if total_q_rows > 64:
+        return False
+    full_row_tile_size_q = throughput_full_flat_query_tile_size_q(total_q_rows)
+    if full_row_tile_size_q <= current_tile_size_q:
+        return False
+    producer_work = projected_auto_profile_producer_work(
+        batch_size=batch_size,
+        num_heads_q=num_heads_q,
+        seq_len_q=seq_len_q,
+        seq_len_kv=seq_len_kv,
+        qkv_dtype=qkv_dtype,
+        tile_size_q=full_row_tile_size_q,
+        max_active_clusters=max_active_clusters,
+    )
+    return (
+        producer_work * FULL_ROW_PROMOTION_WAVE_DENOMINATOR
+        >= max_active_clusters * FULL_ROW_PROMOTION_WAVE_NUMERATOR
+    )
+
+
 def resolve_auto_mla_gen_groups_tokens_heads_q_shape(
     *,
     batch_size: int,
@@ -787,6 +880,16 @@ def resolve_auto_mla_gen_groups_tokens_heads_q_shape(
         seq_len_kv=seq_len_kv,
         multi_processor_count=max_active_clusters,
     )
+    if not legacy_power_of_two_heads and should_promote_full_flat_query_tile(
+        batch_size=batch_size,
+        num_heads_q=num_heads_q,
+        seq_len_q=seq_len_q,
+        seq_len_kv=seq_len_kv,
+        qkv_dtype=qkv_dtype,
+        current_tile_size_q=tile_size_q,
+        max_active_clusters=max_active_clusters,
+    ):
+        tile_size_q = throughput_full_flat_query_tile_size_q(num_heads_q * seq_len_q)
     if legacy_grouped_shape is not None:
         per_tile_work = q_tile_work_count(
             batch_size,
@@ -876,6 +979,27 @@ def automatic_split_kv_step_tokens(
     if tile_size_q == 16 and base_work == 2:
         return steady_step_tokens * 2
     return steady_step_tokens
+
+
+def round_auto_split_kv_for_wave(
+    *,
+    split_kv: int,
+    base_work: int,
+    target_work: int,
+    tile_size_q: int,
+) -> int:
+    """Prefer a power-of-two high-M split when it still nearly fills a wave."""
+
+    if tile_size_q < 32 or split_kv <= 1 or is_power_of_two(split_kv):
+        return split_kv
+    rounded_split_kv = 1 << (split_kv.bit_length() - 1)
+    rounded_work = base_work * rounded_split_kv
+    if (
+        rounded_work * FULL_ROW_PROMOTION_WAVE_DENOMINATOR
+        >= target_work * FULL_ROW_PROMOTION_WAVE_NUMERATOR
+    ):
+        return rounded_split_kv
+    return split_kv
 
 
 def is_power_of_two(value: int) -> bool:

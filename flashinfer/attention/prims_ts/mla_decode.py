@@ -585,8 +585,10 @@ def _resolve_mla_decode_launch_spec(
         auto_tile_size_q_for_mla_gen,
         compute_workspace_size as compute_1cta_workspace_size,
         fp8_q16_extended_family_probe_split_kv,
+        q_tile_work_count,
         resolve_auto_mla_gen_groups_tokens_heads_q_shape,
         resolve_runtime_cluster_reduction_mode,
+        round_auto_split_kv_for_wave,
         wave_fill_split_kv,
     )
     from .kernels.mla_decode.throughput_latency_1cta.kernel import (
@@ -819,6 +821,50 @@ def _resolve_mla_decode_launch_spec(
                     throughput_latency_split_kv=None,
                     throughput_latency_persistent=None,
                 )
+                initial_config = decision.config
+                total_q_rows = num_heads * seq_len_q
+                is_promoted_non_power_flat_launch = (
+                    num_heads & (num_heads - 1) != 0
+                    and 16 < total_q_rows <= 64
+                    and launch_shape.tile_size_q == 64
+                    and launch_shape.seq_len_q == 1
+                )
+                if (
+                    decision.implementation_ready
+                    and initial_config is not None
+                    and is_promoted_non_power_flat_launch
+                ):
+                    base_work = q_tile_work_count(
+                        batch_size,
+                        launch_shape.num_heads_q,
+                        launch_shape.seq_len_q,
+                        launch_shape.tile_size_q,
+                    )
+                    rounded_split_kv = round_auto_split_kv_for_wave(
+                        split_kv=int(initial_config.num_ctas_per_seq_kv),
+                        base_work=base_work,
+                        target_work=max_active_clusters,
+                        tile_size_q=launch_shape.tile_size_q,
+                    )
+                    if rounded_split_kv != initial_config.num_ctas_per_seq_kv:
+                        family_probe_split_kv = rounded_split_kv
+                        decision = select_mla_ts_kernel(
+                            requested_policy=requested_policy,
+                            batch_size=batch_size,
+                            num_heads=launch_shape.num_heads_q,
+                            seq_len_q=launch_shape.seq_len_q,
+                            seq_len_k=max_kv_len,
+                            latent_dim=kv_lora_rank,
+                            rope_dim=qk_rope_head_dim,
+                            page_size=page_size,
+                            dtype=qkv_dtype_name,
+                            out_dtype=output_dtype_name,
+                            throughput_latency_profile=None,
+                            throughput_latency_tile_size_q=(launch_shape.tile_size_q),
+                            max_active_clusters=max_active_clusters,
+                            throughput_latency_split_kv=rounded_split_kv,
+                            throughput_latency_persistent=None,
+                        )
             if not decision.implementation_ready or decision.config is None:
                 raise NotImplementedError(decision.reason)
             reduction_mode = resolve_runtime_cluster_reduction_mode(
