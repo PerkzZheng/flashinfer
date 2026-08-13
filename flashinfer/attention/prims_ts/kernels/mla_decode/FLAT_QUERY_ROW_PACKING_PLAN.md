@@ -1198,3 +1198,59 @@ gate with positive dtype-wide geometric means and no repeat-confirmed row
 below 0.97. It does not replace the larger 31-point/five-campaign formal matrix
 in section 6.2. Refreshed old-PrimTS Gate A for the final source and the broader
 multi-campaign signoff remain outstanding.
+
+## 18. Refreshed old-PrimTS Gate A (2026-08-13)
+
+The final kernel source (`738ea7d3`, with documentation commit `234889ed` on
+top) was compared against a freshly created detached worktree at the immutable
+upstream baseline `065971254bca6ad0509d775e5806de53b64ac7b9`. The campaign
+covered all four 384-row shapes H12/SQ32, H24/SQ16, H48/SQ8, and H96/SQ4 at
+B/K points `1/2048`, `4/512`, `16/1024`, `16/4096`, and `64/8192`, in BF16
+and FP8. Every one of the 40 source pairs ran in fresh processes with separate
+JIT caches, alternating source order, seed 42, CUDA graph/event timing, 20
+warmups, 100 iterations, and `--refcheck`.
+
+An initial campaign was rejected before analysis because installing the old
+checkout editable changed the global package mapping. Invoking a benchmark
+script by path placed its `benchmarks/` directory, but not its repository root,
+ahead of that mapping; both nominal source sides consequently imported old
+PrimTS. The invalid directory is retained with a prominent warning. The valid
+`_v2` campaign explicitly set `PYTHONPATH` to the intended worktree in every
+subprocess, and independent probes verified both `flashinfer.__file__` and
+PrimTS `mla_decode.__file__` under their exact source roots. The main checkout
+was restored as the editable package after the comparison.
+
+The corrected public-auto results were:
+
+| Dtype/cohort | Rows | Geomean candidate speedup | Minimum |
+| --- | ---: | ---: | ---: |
+| BF16 overall | 20 | 1.107425 | 0.999380 |
+| BF16 B1/K2048 | 4 | 1.101244 | 1.097215 |
+| BF16 B4/K512 | 4 | 1.081139 | 1.081013 |
+| BF16 B16/K1024 | 4 | 0.999845 | 0.999380 |
+| BF16 B16/K4096 | 4 | 1.104019 | 1.046083 |
+| BF16 B64/K8192 | 4 | 1.267353 | 1.231896 |
+| FP8 overall | 20 | 1.162874 | 1.000224 |
+| FP8 B1/K2048 | 4 | 1.204395 | 1.190745 |
+| FP8 B4/K512 | 4 | 1.267862 | 1.267158 |
+| FP8 B16/K1024 | 4 | 1.010905 | 1.000224 |
+| FP8 B16/K4096 | 4 | 1.082120 | 1.075971 |
+| FP8 B64/K8192 | 4 | 1.273022 | 1.260036 |
+
+BF16 public auto selected 2CTA throughout. FP8 public auto selected 1CTA at
+B1/B4 and 2CTA at B16/B64; this family switch is part of the accepted public
+policy and improved the small-batch rows by roughly 19--27% over old PrimTS.
+The 2CTA flat geometry reduced the old four padded M128 query tiles to three
+physical tiles. The largest benefits appeared at B64, where eliminating that
+fourth tile improved BF16 and FP8 cohort geometric means by 26.7% and 27.3%.
+The no-layout-change B16/K1024 controls remained at parity, and no row was more
+than 0.062% below old PrimTS.
+
+Complete corrected CSVs, logs, the exact table, import-isolated runner, and
+provenance are under
+`artifacts/groups_tokens_heads_20260812/gate_a_refresh_234889ed_v2`. The
+sibling directory without `_v2` is invalid by construction and must not be
+used. This closes the refreshed five-point Gate-A checkpoint with no measured
+old-PrimTS regression. The full 31-point and five-campaign formal expansion in
+section 6.2 remains resumable future qualification rather than a completed
+claim.
