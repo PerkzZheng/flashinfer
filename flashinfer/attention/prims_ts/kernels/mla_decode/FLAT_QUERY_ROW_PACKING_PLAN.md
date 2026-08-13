@@ -1,7 +1,7 @@
 # PrimTS MLA Decode Flat Query-Row Packing Port Plan
 
-- Status: functional checkpoint implemented; exact-tree revalidation and performance signoff in progress
-- Date: 2026-08-12
+- Status: exact-tree validation complete; formal public-auto performance signoff in progress
+- Date: 2026-08-13
 - Working branch: `port/pr4178-groups-tokens-heads-prims-ts`
 - Upstream baseline: `065971254bca6ad0509d775e5806de53b64ac7b9`
 - Reference change: FlashInfer [PR #4178](https://github.com/flashinfer-ai/flashinfer/pull/4178), PR head `78dfa5c1186aa80a66d0f1375a93c089c2775145`, squash commit `4890932d`
@@ -666,6 +666,43 @@ Record Slurm job ID, hostname, GPU UUID and power limit, Docker image ID, Git
 SHA and diff state, PyTorch/CUDA versions, exact command, warmup/repetition
 counts, CUDA-graph state, and cache policy with every CSV/report.
 
+### 6.4 Final issue-#4390 three-backend comparison
+
+After Gate B is correctness-qualified and its primary campaign is complete,
+run a final public-path comparison modeled on
+[issue #4390 comment 5239925531](https://github.com/flashinfer-ai/flashinfer/issues/4390#issuecomment-5239925531).
+The comparison adds public-auto PrimTS to the comment's TRTLLM-GEN and
+monolithic CuTe DSL columns; it must not substitute a forced PrimTS family or
+profile.
+
+Match the comment's B200, batch-1, TP8/H12 workload:
+
+- query length in `{1, 8}`;
+- context length in `{131072, 500000, 1000000}`;
+- KV/query dtype in `{BF16, FP8 E4M3}` with BF16 output;
+- one MQA KV head, latent rank 512, RoPE dimension 64, QK dimension 576,
+  QK-NOPE dimension 128, and page size 64;
+- `bmm1_scale = 1 / sqrt(192)` and `bmm2_scale = 1.0`;
+- backends `trtllm-gen`, monolithic `cute-dsl`, and public-auto `prims-ts`;
+- TRTLLM-GEN PDL enabled with the required multi-CTA counter buffer; and
+- separate eager and CUDA-graph timings for every row.
+
+Use identical seeded tensors and metadata for all three backends, run the
+same correctness/reference check before retaining a timing, compile and warm
+all runners before measurement, alternate backend order across repetitions,
+and keep all three members of a row on one GPU allocation. Mirror the
+comment's eight warmups and 30 measured calls for a direct reproduction, then
+run the normal campaign repetition policy from section 6.3 so the final table
+reports median-of-campaign-medians and dispersion rather than one sample.
+
+Report microseconds per call for all six backend/mode columns, PrimTS family,
+profile, split-KV, reducer, and CUDA-graph compatibility, plus ratios of
+PrimTS to CuTe DSL, TRTLLM-GEN, and the faster non-PrimTS backend. This final
+comparison is a required deliverable and crossover diagnostic. Gate B's
+public-auto PrimTS-versus-CuTe-DSL threshold remains the performance
+acceptance rule; TRTLLM-GEN is reported as an additional production baseline
+unless acceptance scope is explicitly expanded.
+
 ## 7. Implementation sequence and gates
 
 1. **Freeze baseline:** create/verify the immutable old-PrimTS checkout, run
@@ -704,7 +741,11 @@ counts, CUDA-graph state, and cache policy with every CSV/report.
 11. **Performance Gate B:** only after Gate A passes, run candidate PrimTS
     against monolithic CuTe DSL, tune remaining family/profile/reducer gaps,
     and meet the final criteria in section 6.3.
-12. **Documentation/cleanup:** publish raw CSV and a concise comparison report,
+12. **Final three-backend comparison:** reproduce the issue-#4390 B200
+    eager/CUDA-graph matrix with TRTLLM-GEN, monolithic CuTe DSL, and
+    public-auto PrimTS as specified in section 6.4. Publish matched raw rows,
+    ratios, dispatch metadata, and provenance.
+13. **Documentation/cleanup:** publish raw CSV and a concise comparison report,
     update the MLA README, and remove superseded MLA grouping terminology/code
     only after correctness, both performance gates, and source review agree.
 
@@ -742,6 +783,9 @@ The port is complete when all of the following hold:
   monolithic CuTe DSL across the expanded batch/K matrix.
 - Gate A meets the old-PrimTS targets before Gate B is evaluated, and Gate B
   meets the final CuTe DSL parity-or-better targets.
+- The final issue-#4390-shaped H12 comparison reports TRTLLM-GEN, monolithic
+  CuTe DSL, and public-auto PrimTS in both eager and CUDA-graph modes for
+  Q1/Q8, BF16/FP8, and all three requested context lengths.
 - Any performance loss is reported by shape and investigated; correctness is
   never relaxed to recover throughput.
 
@@ -1357,3 +1401,41 @@ Formal public-auto qualification must restart from a clean documentation
 checkpoint on top of that commit. Its dispatch assertion must accept the
 checked 2CTA crossover at B64/K512 and B64/K2048 for the four 48-row shapes,
 while continuing to require 1CTA for the other points in this cohort.
+
+## 21. Formal public-auto Gate-B restart and final-comparison addition (2026-08-13)
+
+Formal qualification restarted from clean commit `6e2338db`, which contains
+the short-K family crossover and its documentation. The resumable campaign is
+under `gate_b_formal_public_auto_6e2338db`. Each backend row runs in a fresh
+process with a backend-specific JIT cache, CUDA-graph/event timing, 20 warmups,
+100 iterations, seed 42, `--refcheck`, and an explicit `.ok` marker. Backend
+order alternates within the 31-point B/K matrix. Dispatch assertions require
+direct 2CTA only for 48 total rows at B64/K512 and B64/K2048; all other rows
+in the seven-shape cohort must select throughput-latency 1CTA.
+
+The first H6/SQ8 coverage pass is complete in both dtypes:
+
+| Dtype | Matched pairs | Geomean speedup vs CuTe DSL | Raw minimum | Worst row |
+| --- | ---: | ---: | ---: | --- |
+| BF16 | 31 | 1.096186 | 0.973400 | B16/K8192 |
+| FP8 E4M3 | 31 | 1.137953 | 0.975843 | B1/K32768 |
+
+All 124 backend rows passed reference checking and wrote completion markers.
+BF16 direct-2CTA crossover speedups were 1.0376x at B64/K512 and 1.0122x at
+B64/K2048. FP8 crossover speedups were 1.0882x and 0.9823x. Public auto chose
+the asserted family on every row, each dtype geometric mean is above parity,
+and neither raw minimum falls below the 0.97 guard. These are first-pass
+coverage results, not the final five-campaign signoff required by section 6.3.
+
+Cases 0--11 of the BF16 shard ran on B200 UUID
+`GPU-3a152337-616f-84c8-e9f2-5f7ed45a6c56`. That allocation expired before
+case 12 initialized CUDA, so the header-only failed attempt is excluded.
+Case 12 onward and the complete FP8 shard ran as matched pairs on replacement
+B200 UUID `GPU-3f241fbe-8ae5-204d-35a7-8f613c2a22f0`. The runner now resolves
+the single currently visible GPU with `nvidia-smi`, optionally validates an
+explicit UUID, and never resumes a row without its `.ok` marker.
+
+The requested terminal deliverable now includes the exact issue-#4390-shaped
+three-backend comparison in section 6.4. It will report TRTLLM-GEN,
+monolithic CuTe DSL, and public-auto PrimTS for H12, Q1/Q8, BF16/FP8, and
+131072/500000/1000000-token contexts in both eager and CUDA-graph modes.
