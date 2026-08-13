@@ -1254,3 +1254,56 @@ used. This closes the refreshed five-point Gate-A checkpoint with no measured
 old-PrimTS regression. The full 31-point and five-campaign formal expansion in
 section 6.2 remains resumable future qualification rather than a completed
 claim.
+
+## 19. Formal Gate-B multi-wave scheduler recovery (2026-08-13)
+
+The first section-6.2 formal 1CTA shard caught a pre-existing persistent-work
+completion bug at H6/SQ8, B256/K512 BF16. Public auto selected the promoted
+M64 Keeps-MMA-AB profile with one physical query tile per batch. The launch
+reported CUDA-graph/eager mismatch, and an exact comparison with monolithic
+CuTe DSL localized wrong output to batches 148--255. B200 admitted 148 of
+these 1CTA clusters in the resident wave, so the failure boundary showed that
+only the first wave completed. H64/SQ1 and forced static-persistent M64
+diagnostics reproduced the same boundary, proving that this was not caused by
+H6 or the new flat-row mapping.
+
+Two independent scheduler issues were separated:
+
+- the general 1CTA CLC scheduler task initialized and fetched only once
+  because its body was not enclosed in `work_tile_loop`; and
+- the M64 Keeps-MMA-AB task graph still does not reliably retire a second
+  persistent work tile even after the scheduler loop is repaired.
+
+Commit `319dfd05` (`fix(mla): complete multiwave 1CTA scheduling`) wraps the
+CLC scheduler in the standard persistent work-tile loop. Runtime-empty packed
+Q tiles skip only the throttle-token body; queue fetch, wait, advance, and
+release remain unconditionally outside the skip guard so all tasks progress in
+lockstep. Public automatic M64 Keeps-MMA-AB enumeration now omits the
+unqualified persistent candidate whenever work exceeds the resident capacity
+and uses the complete direct grid instead. Smaller M8/M16/M32 CLC profiles
+retain dynamic persistence and use the repaired loop.
+
+Focused B200 qualification passed four scheduler-sensitive tests, including
+the existing runtime-skipped packed-Q CLC case and two new public-path
+regressions. B160 H6/SQ8/K129 exercised M64 work beyond the resident wave and
+passed eager, standalone-workspace, CUDA-graph, and sampled FP32 reference
+checks with a 160-CTA direct grid. B320 H8/SQ1/K129 exercised M8 CLC beyond two
+resident waves and passed the same paths. A direct exact comparison for the
+latter produced zero mismatches after the loop repair.
+
+The original failing public benchmark then passed `--refcheck` and CUDA-graph
+replay at B256/H6/SQ8/K512. It selected profile `h64_keeps_mma_ab` with 256
+producer CTAs and persistence disabled, measuring 46.0224 us versus
+45.1024 us for monolithic CuTe DSL, or 0.98000972x. This clears the 0.97
+reproducible-row guard but remains a row to repeat. The repaired persistent
+path also passed H6/SQ1, B512/K4096 and measured 449.2192 us versus
+535.3840 us, or 1.19181011x.
+
+The interrupted formal directory
+`gate_b_formal_1cta_d8129703` is not an acceptance dataset: it mixes the
+pre-fix source with failure diagnostics. Its runner now requires an explicit
+`.ok` marker in addition to a two-line CSV, preventing a refcheck failure's
+header-only output from being mistaken for a completed row. Formal Gate B
+must restart from a clean documentation checkpoint containing `319dfd05`,
+rerun all rows on that exact source, and retain the five-campaign repetition
+rule from section 6.3.
