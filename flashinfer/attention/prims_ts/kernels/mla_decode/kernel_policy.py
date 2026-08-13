@@ -60,6 +60,46 @@ class _AutomaticMlaWork(TypedDict, total=False):
     two_cta_cluster_work: int | None
     two_cta_cluster_capacity: int | None
     one_cta_is_extended_fp8_swaps: bool
+    one_cta_tile_size_q: int | None
+    one_cta_split_kv: int | None
+    two_cta_split_kv: int | None
+    seq_len_k: int | None
+
+
+_SHORT_K_DIRECT_2CTA_MAX_TOKENS_PER_1CTA_SPLIT = 1024
+
+
+def _prefer_small_flat_direct_2cta(
+    num_heads: int,
+    seq_len_q: int,
+    *,
+    one_cta_tile_size_q: int | None,
+    one_cta_split_kv: int | None,
+    two_cta_split_kv: int | None,
+    seq_len_k: int | None,
+) -> bool:
+    """Return whether direct 2CTA avoids a short-K M64 split reducer."""
+
+    total_q_rows = num_heads * seq_len_q
+    if (
+        num_heads & (num_heads - 1) == 0
+        or not 48 <= total_q_rows <= 64
+        or one_cta_tile_size_q != 64
+    ):
+        return False
+    inputs = (one_cta_split_kv, two_cta_split_kv, seq_len_k)
+    if any(value is None for value in inputs):
+        return False
+    if any(int(value) <= 0 for value in inputs):
+        raise ValueError("automatic MLA split counts and K length must be positive")
+
+    assert one_cta_split_kv is not None
+    assert two_cta_split_kv is not None
+    assert seq_len_k is not None
+    if one_cta_split_kv <= 1 or two_cta_split_kv != 1:
+        return False
+    tokens_per_one_cta_split = (seq_len_k + one_cta_split_kv - 1) // one_cta_split_kv
+    return tokens_per_one_cta_split <= _SHORT_K_DIRECT_2CTA_MAX_TOKENS_PER_1CTA_SPLIT
 
 
 @dataclass(frozen=True)
@@ -106,24 +146,39 @@ def select_default_mla_kernel_policy(
     two_cta_cluster_work: int | None = None,
     two_cta_cluster_capacity: int | None = None,
     one_cta_is_extended_fp8_swaps: bool = False,
+    one_cta_tile_size_q: int | None = None,
+    one_cta_split_kv: int | None = None,
+    two_cta_split_kv: int | None = None,
+    seq_len_k: int | None = None,
 ) -> MlaKernelPolicy:
     """Choose the default TS MLA family from work and resident capacity.
 
-    Logical Q rows up to 64 retain the throughput-latency family.  Larger
-    shapes normally retain 2CTA, but an automatic caller may provide projected
-    work for both candidates.  The established probe requires the complete
-    2CTA launch to occupy at most one quarter of its resident cluster wave and
-    the 1CTA candidate to improve normalized occupancy.  A separately bounded
-    FP8 Q16 Swaps probe may use the whole 2CTA wave and accept equal normalized
+    Logical Q rows up to 64 normally retain the throughput-latency family. A
+    measured full-flat-row exception uses 2CTA when its direct-output wave
+    replaces a short-K M64 split/reducer launch. Larger shapes normally retain
+    2CTA, but an automatic caller may provide projected work for both
+    candidates. The established probe requires the complete 2CTA launch to
+    occupy at most one quarter of its resident cluster wave and the 1CTA
+    candidate to improve normalized occupancy. A separately bounded FP8 Q16
+    Swaps probe may use the whole 2CTA wave and accept equal normalized
     occupancy: its caller has already proved a two-step local K bound, and the
-    1CTA schedule avoids 2CTA coordination at equal service-unit fill.  No
-    shape or device-name whitelist participates in either decision.
+    1CTA schedule avoids 2CTA coordination at equal service-unit fill. No
+    device-name whitelist participates in any decision.
     """
 
-    # Above 64 logical token-head rows, the 2CTA M128 schedule has enough Q work
-    # to amortize the extra CTA and reduction coordination.  Smaller rows prefer
-    # the 1CTA throughput-latency schedule.
+    # A filled non-power-of-two M64 tile is the small-row exception: when 1CTA
+    # needs a short-K standalone split reducer but 2CTA fills a direct-output
+    # wave, the latter avoids the reducer without losing service-unit fill.
     if num_heads * seq_len_q <= 64:
+        if _prefer_small_flat_direct_2cta(
+            num_heads,
+            seq_len_q,
+            one_cta_tile_size_q=one_cta_tile_size_q,
+            one_cta_split_kv=one_cta_split_kv,
+            two_cta_split_kv=two_cta_split_kv,
+            seq_len_k=seq_len_k,
+        ):
+            return "throughput_2cta"
         return "throughput_latency_1cta"
 
     occupancy_inputs = (

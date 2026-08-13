@@ -56,6 +56,7 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.resources 
     MlaWorkQueue,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.kernel_policy import (
+    select_default_mla_kernel_policy,
     select_mla_ts_kernel,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.helpers.query import (
@@ -307,6 +308,46 @@ def test_attention_ts_mla_keeps_multiwave_auto_uses_direct_grid():
     assert profiles[0].use_persistent_scheduler == 0
     assert profiles[0].use_clc_dynamic_persistent_scheduler == 0
     assert "h64_keeps_mma_ab_clc" not in {profile.name for profile in profiles}
+
+
+@pytest.mark.parametrize(
+    "num_heads,seq_len_q,one_cta_split,two_cta_split,seq_len_k,expected",
+    (
+        pytest.param(6, 8, 2, 1, 2048, "throughput_2cta", id="flat-short-k"),
+        pytest.param(
+            6, 8, 2, 1, 2049, "throughput_latency_1cta", id="local-k-boundary"
+        ),
+        pytest.param(6, 8, 2, 2, 2048, "throughput_latency_1cta", id="two-cta-split"),
+        pytest.param(6, 8, 1, 1, 2048, "throughput_latency_1cta", id="one-cta-direct"),
+        pytest.param(24, 1, 2, 1, 2048, "throughput_latency_1cta", id="small-tail"),
+        pytest.param(64, 1, 2, 1, 2048, "throughput_latency_1cta", id="legacy-h64"),
+    ),
+)
+def test_attention_ts_mla_small_flat_direct_2cta_crossover(
+    num_heads: int,
+    seq_len_q: int,
+    one_cta_split: int,
+    two_cta_split: int,
+    seq_len_k: int,
+    expected: str,
+):
+    """Use 2CTA only for the measured short-K full-flat-row crossover."""
+
+    assert (
+        select_default_mla_kernel_policy(
+            num_heads,
+            seq_len_q,
+            one_cta_work=128,
+            one_cta_capacity=148,
+            two_cta_cluster_work=64,
+            two_cta_cluster_capacity=74,
+            one_cta_tile_size_q=64,
+            one_cta_split_kv=one_cta_split,
+            two_cta_split_kv=two_cta_split,
+            seq_len_k=seq_len_k,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -2359,6 +2400,55 @@ def test_attention_ts_mla_decode_non_power_heads_1cta_throughput_promotion(
     )
     assert policy["logical_num_heads_q"] == 6
     assert policy["logical_seq_len_q"] == 8
+
+
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.parametrize(
+    "num_qo_heads,seq_len_q",
+    (
+        pytest.param(6, 8, id="h6-sq8"),
+        pytest.param(12, 4, id="h12-sq4"),
+        pytest.param(24, 2, id="h24-sq2"),
+        pytest.param(48, 1, id="h48-sq1"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_short_k_full_flat_rows_use_direct_2cta(
+    qkv_dtype: torch.dtype,
+    num_qo_heads: int,
+    seq_len_q: int,
+):
+    """Avoid the M64 split reducer when a direct 2CTA wave covers the grid."""
+
+    case = _make_mla_case(
+        batch_size=64,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=513,
+        seq_len_q=seq_len_q,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=40520 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    policy = _exercise_auto_mla_case(
+        case,
+        expected_b200={
+            "kernel": "throughput_2cta",
+            "tile_size_q": 128,
+            "total_q_rows": 48,
+            "num_q_tiles": 1,
+            "tail_q_rows": 48,
+            "split_kv": 1,
+            "producer_ctas": 128,
+            "separate_reducer_impl": "none",
+        },
+    )
+    assert policy["logical_num_heads_q"] == num_qo_heads
+    assert policy["logical_seq_len_q"] == seq_len_q
 
 
 @pytest.mark.arch_blackwell

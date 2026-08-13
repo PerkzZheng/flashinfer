@@ -650,9 +650,17 @@ def _resolve_mla_decode_launch_spec(
         family_probe_launch_shape = None
         family_probe_is_extended_fp8_swaps = False
         one_cta_work = None
+        total_q_rows = num_heads * seq_len_q
         use_established_family_probe = (
-            num_heads * seq_len_q > 64
+            total_q_rows > 64
             and two_cta_cluster_work * 4 <= max_active_two_cta_clusters
+        )
+        use_small_flat_family_probe = (
+            num_heads & (num_heads - 1) != 0
+            and 48 <= total_q_rows <= 64
+            and one_cta_launch_shape.enabled
+            and one_cta_launch_shape.tile_size_q == 64
+            and one_cta_launch_shape.seq_len_q == 1
         )
         if use_established_family_probe:
             family_probe_launch_shape = one_cta_launch_shape
@@ -712,7 +720,7 @@ def _resolve_mla_decode_launch_spec(
                         * family_cfg.num_ctas_per_head_dim
                     )
         elif (
-            num_heads * seq_len_q > 64
+            total_q_rows > 64
             and qkv_dtype_name == "e4m3"
             and two_cta_cluster_work <= max_active_two_cta_clusters
         ):
@@ -778,6 +786,74 @@ def _resolve_mla_decode_launch_spec(
                             * extended_cfg.num_ctas_per_seq_kv
                             * extended_cfg.num_ctas_per_head_dim
                         )
+        elif use_small_flat_family_probe:
+            family_probe_launch_shape = one_cta_launch_shape
+            initial_probe = select_mla_ts_kernel(
+                requested_policy="throughput_latency_1cta",
+                batch_size=batch_size,
+                num_heads=family_probe_launch_shape.num_heads_q,
+                seq_len_q=family_probe_launch_shape.seq_len_q,
+                seq_len_k=max_kv_len,
+                latent_dim=kv_lora_rank,
+                rope_dim=qk_rope_head_dim,
+                page_size=page_size,
+                dtype=qkv_dtype_name,
+                out_dtype=output_dtype_name,
+                throughput_latency_profile=None,
+                throughput_latency_tile_size_q=family_probe_launch_shape.tile_size_q,
+                max_active_clusters=max_active_one_cta_clusters,
+                throughput_latency_split_kv=None,
+                throughput_latency_persistent=None,
+            )
+            initial_cfg = initial_probe.config
+            if initial_probe.implementation_ready and initial_cfg is not None:
+                base_work = q_tile_work_count(
+                    batch_size,
+                    family_probe_launch_shape.num_heads_q,
+                    family_probe_launch_shape.seq_len_q,
+                    family_probe_launch_shape.tile_size_q,
+                )
+                rounded_split_kv = round_auto_split_kv_for_wave(
+                    split_kv=int(initial_cfg.num_ctas_per_seq_kv),
+                    base_work=base_work,
+                    target_work=max_active_one_cta_clusters,
+                    tile_size_q=family_probe_launch_shape.tile_size_q,
+                )
+                family_probe_decision = initial_probe
+                if rounded_split_kv != initial_cfg.num_ctas_per_seq_kv:
+                    family_probe_split_kv = rounded_split_kv
+                    family_probe_decision = select_mla_ts_kernel(
+                        requested_policy="throughput_latency_1cta",
+                        batch_size=batch_size,
+                        num_heads=family_probe_launch_shape.num_heads_q,
+                        seq_len_q=family_probe_launch_shape.seq_len_q,
+                        seq_len_k=max_kv_len,
+                        latent_dim=kv_lora_rank,
+                        rope_dim=qk_rope_head_dim,
+                        page_size=page_size,
+                        dtype=qkv_dtype_name,
+                        out_dtype=output_dtype_name,
+                        throughput_latency_profile=None,
+                        throughput_latency_tile_size_q=(
+                            family_probe_launch_shape.tile_size_q
+                        ),
+                        max_active_clusters=max_active_one_cta_clusters,
+                        throughput_latency_split_kv=rounded_split_kv,
+                        throughput_latency_persistent=None,
+                    )
+                family_cfg = family_probe_decision.config
+                if family_cfg is not None:
+                    one_cta_work = (
+                        family_cfg.batch_size
+                        * family_cfg.num_ctas_per_seq_q
+                        * family_cfg.num_ctas_for_all_heads
+                        * family_cfg.num_ctas_per_seq_kv
+                        * family_cfg.num_ctas_per_head_dim
+                    )
+
+        family_probe_cfg = (
+            family_probe_decision.config if family_probe_decision is not None else None
+        )
 
         requested_policy, policy_source = resolve_mla_kernel_policy(
             None,
@@ -794,6 +870,20 @@ def _resolve_mla_decode_launch_spec(
                 max_active_two_cta_clusters if one_cta_work is not None else None
             ),
             one_cta_is_extended_fp8_swaps=(family_probe_is_extended_fp8_swaps),
+            one_cta_tile_size_q=(
+                int(family_probe_cfg.tile_size_q)
+                if family_probe_cfg is not None
+                else None
+            ),
+            one_cta_split_kv=(
+                int(family_probe_cfg.num_ctas_per_seq_kv)
+                if family_probe_cfg is not None
+                else None
+            ),
+            two_cta_split_kv=(
+                int(two_cta_split_kv) if family_probe_cfg is not None else None
+            ),
+            seq_len_k=max_kv_len if family_probe_cfg is not None else None,
         )
         use_throughput_latency = requested_policy == "throughput_latency_1cta"
 
@@ -822,7 +912,6 @@ def _resolve_mla_decode_launch_spec(
                     throughput_latency_persistent=None,
                 )
                 initial_config = decision.config
-                total_q_rows = num_heads * seq_len_q
                 is_promoted_non_power_flat_launch = (
                     num_heads & (num_heads - 1) != 0
                     and 16 < total_q_rows <= 64
