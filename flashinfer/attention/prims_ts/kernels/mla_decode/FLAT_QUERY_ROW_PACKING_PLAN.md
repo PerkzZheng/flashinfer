@@ -1836,3 +1836,42 @@ Next, run the complete MLA test file and refreshed Gate A on exact
 `e85d52a2`, then complete all BF16/FP8 Gate-B shards and same-GPU campaign
 repetitions.  The terminal issue-#4390-shaped TRTLLM-GEN/CuTeDSL/public-auto
 PrimTS eager/CUDA-graph comparison remains required afterward.
+
+## 29. Replacement-GPU correctness qualification (2026-08-14)
+
+The first single-process full-file run at `e85d52a2` completed 232 cases before
+a CUDA illegal address appeared in the packed FP8 section.  The resulting
+poisoned context made the remaining 14 cases fail, so that run is diagnostic
+and is not accepted as a 232/246 partial pass.  Fresh-process isolation showed
+the first reported FP8 H6 case and its BF16 H96 predecessor both pass, and a
+synchronous reduction isolated a seven-case order trigger: four FP8 packed
+dtype/mask/page cases, the BF16 H6 packed graph anchor, the FP8 H6 packed graph
+anchor, then FP8 H12 packed eager.
+
+The identical seven-case sequence was rerun with `CUDA_LAUNCH_BLOCKING=1`
+against unchanged prior checkpoint `69161c6c` on the same replacement B200.
+It produced six passes followed by the same FP8 H12 illegal address.  This
+proves that the failure was not introduced by the generalized split-rounding
+change in `e85d52a2`.  The exact log, JUnit XML, exit status, dedicated JIT
+cache, and provenance are under
+`preexisting_graph_order_reproducer_69161c6c_gpu_4883`.  Do not mask this with
+a shape-specific dispatch or kernel exception; it is a prior-source,
+single-process captured-graph/resource-order interaction on this allocation.
+
+Formal `e85d52a2` qualification therefore ran all 246 collected cases in three
+non-overlapping fresh pytest/CUDA processes, still with
+`CUDA_LAUNCH_BLOCKING=1` and a dedicated empty JIT cache:
+
+| Process | Coverage | Result | Time |
+| --- | --- | ---: | ---: |
+| Prefix | all cases through packed dtype/mask/page, excluding the final four test groups | 227/227 passed | 669.06 s |
+| Packed non-power | BF16/FP8 H6/H12/H24/H48/H96 fixed/packed anchors | 10/10 passed | 66.76 s |
+| Tail | packed zero length, all-empty no-op, runtime-K pruning | 9/9 passed | 52.61 s |
+
+The aggregate is 246/246 passed with complete case coverage and synchronous
+error attribution.  Logs, three JUnit files, per-process exit statuses,
+aggregate summary, runner, and provenance are under
+`full_validation_e85d52a2_gpu_4883_process_isolated`.  No production or test
+source was changed to obtain this result.  The next acceptance step is the
+same-GPU exact-source Gate-A refresh, followed by the remaining public-auto
+Gate-B shards and repeats.
