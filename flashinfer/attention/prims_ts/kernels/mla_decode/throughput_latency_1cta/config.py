@@ -62,6 +62,14 @@ SWAPS_MMA_AB_MAX_SEQ_LEN_PER_CTA_KV = 768
 FULL_ROW_PROMOTION_WAVE_NUMERATOR = 5
 FULL_ROW_PROMOTION_WAVE_DENOMINATOR = 6
 
+# Small Swaps Q tiles expose less useful row work per producer CTA than the
+# M32/M64 schedules.  Keep their single-digit split counts occupancy-first;
+# once at least 16 K partitions feed the standalone reducer, the measured
+# reduction/workspace saving from a power-of-two split wins across M8/M16,
+# BF16/FP8, and H6/H12.  The common five-sixths wave guard below still decides
+# whether the rounded producer grid is sufficiently full.
+SMALL_Q_TILE_SPLIT_ROUNDING_MIN_SPLITS = 16
+
 # SM100A exposes 227 KiB of dynamic SMEM.  Keep a small TS metadata reservation
 # when deciding whether the automatic cluster-reduction scratch can fit.
 SM100A_SMEM_CAPACITY_BYTES = 232448
@@ -988,9 +996,16 @@ def round_auto_split_kv_for_wave(
     target_work: int,
     tile_size_q: int,
 ) -> int:
-    """Prefer a power-of-two high-M split when it still nearly fills a wave."""
+    """Prefer a power-of-two split when it still nearly fills a wave.
 
-    if tile_size_q < 32 or split_kv <= 1 or is_power_of_two(split_kv):
+    M32/M64 schedules benefit even at small split counts.  M8/M16 schedules
+    retain single-digit splits, where producer occupancy matters more than the
+    smaller standalone-reduction domain.
+    """
+
+    if split_kv <= 1 or is_power_of_two(split_kv):
+        return split_kv
+    if tile_size_q < 32 and split_kv < SMALL_Q_TILE_SPLIT_ROUNDING_MIN_SPLITS:
         return split_kv
     rounded_split_kv = 1 << (split_kv.bit_length() - 1)
     rounded_work = base_work * rounded_split_kv

@@ -913,16 +913,13 @@ def _resolve_mla_decode_launch_spec(
                     throughput_latency_persistent=None,
                 )
                 initial_config = decision.config
-                is_promoted_non_power_flat_launch = (
-                    num_heads & (num_heads - 1) != 0
-                    and 16 < total_q_rows <= 64
-                    and launch_shape.tile_size_q == 64
-                    and launch_shape.seq_len_q == 1
+                is_non_power_flat_launch = (
+                    num_heads & (num_heads - 1) != 0 and launch_shape.enabled
                 )
                 if (
                     decision.implementation_ready
                     and initial_config is not None
-                    and is_promoted_non_power_flat_launch
+                    and is_non_power_flat_launch
                 ):
                     base_work = q_tile_work_count(
                         batch_size,

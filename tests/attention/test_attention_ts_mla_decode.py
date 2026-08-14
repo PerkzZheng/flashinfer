@@ -244,6 +244,9 @@ def test_attention_ts_mla_auto_flat_tile_throughput_promotion(
         pytest.param(9, 16, 64, 8, id="m64-rounds-nine-to-eight"),
         pytest.param(9, 16, 32, 8, id="m32-rounds-nine-to-eight"),
         pytest.param(9, 16, 16, 9, id="m16-retains-nine"),
+        pytest.param(37, 4, 8, 32, id="m8-rounds-thirty-seven-to-thirty-two"),
+        pytest.param(18, 8, 16, 16, id="m16-rounds-eighteen-to-sixteen"),
+        pytest.param(15, 9, 8, 15, id="m8-retains-sub-sixteen-split"),
         pytest.param(12, 12, 64, 12, id="rounded-work-underfills"),
         pytest.param(8, 16, 64, 8, id="already-power-of-two"),
     ),
@@ -2549,6 +2552,59 @@ def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
     )
     assert policy["logical_num_heads_q"] == num_qo_heads
     assert policy["logical_seq_len_q"] == seq_len_q
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,expected_tile_size_q",
+    (
+        pytest.param(6, 8, id="h6-m8"),
+        pytest.param(12, 16, id="h12-m16"),
+    ),
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_small_non_power_heads_round_split_for_wave(
+    num_qo_heads: int,
+    expected_tile_size_q: int,
+    qkv_dtype: torch.dtype,
+):
+    """Small flat-Q launches use the common near-wave power-of-two split."""
+
+    case = _make_mla_case(
+        batch_size=4,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=32769,
+        seq_len_q=1,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=40200 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_latency_1cta",
+            "tile_size_q": expected_tile_size_q,
+            "total_q_rows": num_qo_heads,
+            "num_q_tiles": 1,
+            "split_kv": 32,
+            "producer_ctas": 128,
+            "separate_reducer_impl": "parallel",
+        },
+        device=case.query.device,
+    )
+    _exercise_public_paths(
+        wrapper,
+        case,
+        policy,
+        exercise_all_paths=(num_qo_heads == 6 and qkv_dtype == torch.bfloat16),
+    )
 
 
 @pytest.mark.parametrize(
