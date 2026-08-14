@@ -1875,3 +1875,31 @@ aggregate summary, runner, and provenance are under
 source was changed to obtain this result.  The next acceptance step is the
 same-GPU exact-source Gate-A refresh, followed by the remaining public-auto
 Gate-B shards and repeats.
+
+## 30. Replacement-GPU exact-source Gate A (2026-08-14)
+
+Checkpoint `e85d52a2` was compared with immutable old PrimTS
+`065971254bca6ad0509d775e5806de53b64ac7b9` on replacement B200 UUID
+`GPU-48834f9f-5e2e-4a49-15e1-3ededce56259`.  The established matrix contains
+the four matched 384-row factorizations H12/SQ32, H24/SQ16, H48/SQ8, and
+H96/SQ4; BF16 and FP8 E4M3; and B/K points `1/2048`, `4/512`, `16/1024`,
+`16/4096`, and `64/8192`.  All 40 candidate/old pairs used isolated source
+imports, distinct persistent JIT caches, alternating source order, CUDA graph
+event timing, 20 warmups, 100 iterations, seed 42, refcheck, public-auto
+dispatch assertions, and completion markers.
+
+| Dtype | Pairs | Geomean old/candidate | Minimum |
+| --- | ---: | ---: | ---: |
+| BF16 | 20 | 1.106271 | 0.990073 |
+| FP8 E4M3 | 20 | 1.185664 | 1.014318 |
+
+The BF16 minimum was the no-layout-change H12/SQ32 B16/K1024 control at
+20.6304 us candidate versus 20.4256 us old.  FP8's minimum was H96/SQ4
+B16/K1024 at 14.0800 us candidate versus 14.2816 us old.  Both dtype geometric
+means exceed `1.00x` and every row exceeds the unchanged `0.97x` floor, so
+exact-source Gate A passes.  CSVs, logs, analyzer output, resumable runner,
+and provenance are under `gate_a_exact_e85d52a2_gpu_4883`.
+
+Continue with the remaining exact public-auto Gate-B shards and repeats at the
+requester-approved `0.94x` CuTeDSL/PrimTS pointwise floor.  Do not merge old-
+GPU rows into the replacement-GPU acceptance aggregate.
