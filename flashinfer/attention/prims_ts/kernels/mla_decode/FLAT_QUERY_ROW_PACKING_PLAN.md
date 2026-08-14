@@ -648,18 +648,19 @@ family for the same public shape, report that best valid old public result as
 an additional end-to-end comparison, clearly labeled as a family change.
 
 Gate B is the final performance target. Candidate public-auto PrimTS must stay
-within 5% of monolithic CuTe DSL (speedup at least 0.95) on the geometric mean
+within 6% of monolithic CuTe DSL (speedup at least 0.94) on the geometric mean
 of the complete public-auto primary matrix for each dtype, with no reproducible
-primary row below 0.95. Exact ratios remain visible, and parity-or-better is
+primary row below 0.94. Exact ratios remain visible, and parity-or-better is
 still the optimization target rather than an acceptance requirement. Report
 1CTA/2CTA and profile breakdowns to localize misses, but do not make a forced
 family/profile diagnostic an acceptance gate: the automatically selected
 PrimTS implementation is what is evaluated against CuTe DSL. A miss leaves the
 performance project open: retain a correctness-qualified checkpoint, identify
 the selected family/profile/reducer gap, and continue tuning rather than
-weakening correctness or silently changing the matrix. This 5% tolerance was
-explicitly confirmed by the requester on 2026-08-13; Gate A's old-PrimTS
-regression threshold remains unchanged.
+weakening correctness or silently changing the matrix. The requester expanded
+the tolerance from 5% to 6% on 2026-08-14; this `0.94` floor supersedes the
+earlier `0.95` floor, while Gate A's old-PrimTS regression threshold remains
+unchanged.
 
 Keep pre/post pairs on the same GPU allocation. If the four-hour Slurm job
 expires, reallocate using the environment skill and rerun both members of any
@@ -786,7 +787,7 @@ The port is complete when all of the following hold:
 - A provenance-complete report compares old PrimTS, packed PrimTS, and
   monolithic CuTe DSL across the expanded batch/K matrix.
 - Gate A meets the old-PrimTS targets before Gate B is evaluated, and Gate B
-  keeps public-auto PrimTS within 5% of CuTe DSL for every reproducible row and
+  keeps public-auto PrimTS within 6% of CuTe DSL for every reproducible row and
   each dtype-wide geometric mean.
 - The final issue-#4390-shaped H12 comparison reports TRTLLM-GEN, monolithic
   CuTe DSL, and public-auto PrimTS in both eager and CUDA-graph modes for
@@ -1658,11 +1659,68 @@ Artifacts are under `current_gpu_baseline_n1_c574`,
 `diagnostic_long_2cta_gpu_c574`, `diagnostic_active_row_warps_gpu_c574`,
 `diagnostic_2cta_stages_gpu_c574`, and `diagnostic_1cta_split_gpu_c574`.
 
-Next, continue bounded 2CTA register/schedule diagnostics for B256/K512. If no
-candidate robustly clears the 0.95 floor, preserve the current correctness and
-long-K improvement as a documented near miss rather than accepting an unsafe
-or noisy optimization. Once a source candidate is selected, run the complete
-PrimTS MLA test file, commit an exact kernel checkpoint, restart all Gate-A and
-Gate-B evidence under that SHA, and finally run the issue-#4390-shaped
-TRTLLM-GEN/CuTeDSL/public-auto-PrimTS comparison in both eager and CUDA-graph
-modes.
+The next-action paragraph originally recorded here used the then-current 0.95
+floor and the uncommitted long-K candidate. Section 25 supersedes both that
+acceptance floor and that candidate.
+
+## 25. Six-percent Gate B and general-policy candidate (2026-08-14)
+
+The requester expanded the allowed pointwise CuTe DSL gap to 6%, so the
+normative Gate-B floor in section 6.3 is now `CuTeDSL / PrimTS >= 0.94`. Gate A
+remains unchanged: no reproducible old-PrimTS regression beyond 3%. Under the
+new floor, the exact `12dc0e4f` runtime passes every measured first-campaign
+BF16 48-row point. Its previously flagged H48/SQ1 rows were `0.941957x` at
+B256/K512 and `0.947125x` at B4/K32768. The H6/SQ8, H12/SQ4, H24/SQ2, and
+H48/SQ1 shard geometric means were `1.100814x`, `1.107340x`, `1.104245x`, and
+`1.088510x`, respectively. Required repeated-campaign aggregation is still
+open; this threshold change reclassifies the known rows but does not replace
+the remaining qualification runs.
+
+The requester also required general, defensible policy changes rather than
+shape-only heuristics. The uncommitted BF16 B4/K32768 long-one-wave 2CTA branch
+from section 24 and its dedicated assertions were therefore removed. Although
+it raised that row to roughly `0.952x`, its split-count and local-span bounds
+were fitted to one topology and are not an acceptable public dispatch rule.
+The checked-in topology-derived direct-output and equal-producer-work
+crossovers from `12dc0e4f` remain unchanged.
+
+The remaining BF16 page-offset-depth candidate was tested before retention.
+One complete, alternating-order, refchecked CUDA-event pass compared four
+stages against the established six stages across direct/split, short/long,
+full-48-row, and low-row shapes:
+
+| Shape | Four stages (us) | Six stages (us) | Six/four |
+| --- | ---: | ---: | ---: |
+| H48/Q1 B256/K512 | 45.8240 | 45.9264 | 1.002235 |
+| H48/Q1 B4/K32768 | 42.9568 | 42.9536 | 0.999926 |
+| H6/Q8 B16/K128 | 8.5536 | 8.5504 | 0.999626 |
+| H6/Q8 B16/K65536 | 260.6176 | 259.4496 | 0.995518 |
+| H12/Q4 B16/K4096 | 26.1632 | 26.1632 | 1.000000 |
+| H24/Q2 B64/K8192 | 137.1904 | 136.1216 | 0.992209 |
+| H6/Q1 B16/K4096 | 23.2992 | 23.2992 | 1.000000 |
+| H24/Q1 B128/K4096 | 131.3056 | 130.3840 | 0.992981 |
+
+Four stages had no broad advantage and regressed several long/throughput rows,
+so the additional repeats were stopped and the production setting was restored
+to six. Artifacts are under `page_stage4_vs6_general_gpu_c574`. The retained
+source is therefore runtime-equivalent to `12dc0e4f`; its only config edit is a
+comment that records the single-instruction Keeps correctness invariant.
+Stronger tests retain direct and split K tails, graph replay, packed zero-length
+Q, BF16/FP8 config contracts, and the BF16 M64 product. Static checks passed,
+the config contract passed 2/2, and the focused GPU set passed 5/5 on B200 UUID
+`GPU-c574acab-9bdc-aadc-b45c-57d9489db33f`.
+
+Nsight profiling of the remaining H48/Q1 B256/K512 gap points to the
+MMA-to-softmax chain rather than flat-row padding. The public 1CTA kernel had
+14.07% eligible warps, 21.79 cycles per issued instruction, and 12.88 cycles of
+long-scoreboard stall, while monolithic CuTe DSL had 17.38%, 15.42, and 9.15,
+respectively. Source sampling placed the largest stalls at TMEM-score,
+softmax-local-stat, and output-correction barriers. A tuned 2CTA register layout
+remained slower at about 46.02 us; static persistent, static-K, and direct
+nonpersistent 2CTA variants measured about 46.33, 46.23, and 56 us and were
+rejected. No profiling-only schedule or register heuristic remains in source.
+
+Next, run the complete PrimTS MLA test file on this general-policy tree, commit
+an exact source/test checkpoint, and run formal Gate A plus repeated Gate B
+under that identity. The terminal deliverable remains the issue-#4390-shaped
+TRTLLM-GEN/CuTeDSL/public-auto-PrimTS comparison in eager and CUDA-graph modes.
