@@ -1557,3 +1557,26 @@ first-coverage shard passes the 0.95 pointwise and geometric-mean requirements.
 BF16 H12/SQ4 is the next active shard on the same B200 allocation. These are
 first-coverage results; the required multi-campaign aggregation and dispersion
 report remain open.
+
+The remaining three 48-row BF16 factorizations then completed. H12/SQ4 had a
+1.107340x geometric mean and 0.980895x minimum; H24/SQ2 had a 1.104245x
+geometric mean and 0.979954x minimum. H48/SQ1 had a 1.088510x geometric mean,
+but its first pass exposed two pointwise misses. Five alternating-order pairs
+confirmed B256/K512 at 45.8144 us PrimTS versus 43.1552 us CuTe DSL
+(0.941957x ratio, 0.942696x pair geomean) and B4/K32768 at 42.9696 us versus
+40.6976 us (0.947125x ratio, 0.947111x pair geomean). The `12dc0e4f`
+checkpoint therefore remains correctness-qualified but does not pass formal
+Gate B.
+
+Forced M8/M16/M32 1CTA profiles were materially slower on both rows. Forced
+2CTA was also slower at B256/K512 and only barely sufficient at B4/K32768.
+Multi-wave CLC and static-persistent M64 variants failed refcheck, preserving
+their existing safety exclusion. Dense-equivalent SQ1 planning was neutral.
+The M64 pipeline sweep instead isolated an unadopted existing dimension:
+four KV stages with two instructions per loop passed refcheck and reduced the
+two PrimTS rows to 31.2832 us and 27.1872 us. Two and three stages were slower,
+while five and six exceed B200 SMEM capacity. Before adopting the two-
+instruction form, qualify BF16 and FP8 K tails, split reduction, fixed and
+packed Q (including zero-length requests), graph replay, page sizes, and the
+complete PrimTS MLA test file. Any source change invalidates the current
+acceptance directory; restart formal performance under a new exact kernel SHA.
