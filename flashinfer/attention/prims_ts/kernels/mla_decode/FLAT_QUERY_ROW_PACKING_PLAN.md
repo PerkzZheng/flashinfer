@@ -1580,3 +1580,89 @@ instruction form, qualify BF16 and FP8 K tails, split reduction, fixed and
 packed Q (including zero-length requests), graph replay, page sizes, and the
 complete PrimTS MLA test file. Any source change invalidates the current
 acceptance directory; restart formal performance under a new exact kernel SHA.
+
+## 24. Replacement-GPU tuning and current candidate (2026-08-14)
+
+The two-instruction result in section 23 was a false performance signal from
+an insufficient reference check. Keeps-MMA-AB has one QK/PV instruction
+stream; setting `num_insts_kv=2` changed the loop-domain partition without
+adding the second stream used by the swaps schedule and therefore skipped
+alternating KV tiles. New product tests with K tails, split KV, graph replay,
+packed Q, and zero-length requests exposed the error. The production candidate
+retains one KV instruction, and the config now documents why that value is a
+correctness invariant. Do not revive the two-instruction experiment without a
+real second Keeps QK/PV stream.
+
+The replacement B200 is UUID
+`GPU-c574acab-9bdc-aadc-b45c-57d9489db33f`, container hostname
+`a95ef9b435cc`, driver 595.58.03, PyTorch 2.10.0+cu128, runtime CUDA 12.8,
+compute capability 10.0, and a 1000 W power limit. Results from the expired
+GPU are not combined with this allocation. A fresh same-GPU one-instruction
+baseline measured H48/SQ1 B256/K512 at 46.0192 us PrimTS versus 43.5616 us
+CuTe DSL (`0.946596x`) and B4/K32768 at 42.9568 us versus 40.7072 us
+(`0.947631x`).
+
+The following diagnostics were rejected:
+
+- Keeps M64 KV depths 2 and 3 were slower; depth 5 exceeds shared-memory
+  capacity. Register redistributions did not beat the accepted configuration.
+- Persistent CLC/static scheduling was correct in eager execution but about
+  55 us and produced stale graph-replay output. The direct multi-wave grid
+  remains required.
+- Removing the nominally idle twelfth warp produced an invalid task/register
+  grouping; launching the retained task with 352 threads deadlocked. Keep the
+  qualified 384-thread CTA.
+- Three active softmax/correction row warps passed direct, split, graph,
+  packed-zero, and FP8 controls, but measured 45.926 us. A normal-order repeat
+  restored CuTe DSL to 43.464 us, only `0.94634x`, so the prototype was removed.
+- A fixed-SQ1 flat-index fast path was correct but performance-neutral at
+  45.8256 us and was removed.
+- Forced 1CTA split 2 was correct but 65.5696 us. Throughput-2CTA combined K/V
+  depths 5, 6, and 7 measured 48.0736, 47.0560, and 46.2304 us. Depth 8 needs
+  238,960 bytes versus the 232,448-byte SM100a limit; exchanging one P stage
+  for the eighth K/V stage was legal but remained about 46.24 us.
+
+Two bounded changes remain in the uncommitted source candidate on top of the
+exact `12dc0e4f` kernel checkpoint:
+
+1. BF16 Keeps uses four page-offset stages instead of six; FP8 retains six.
+   The same-GPU sweep found depths 1--4 near the minimum, while 5--8 were
+   slower. Four matches the BF16 KV pipeline depth and keeps more latency
+   tolerance than the equivalent one/two-stage points.
+2. Public auto selects throughput 2CTA for the BF16 48-row, one-wave,
+   1024-token-local-span topology when 1CTA has at least 32 splits, 2CTA has
+   more than four splits, and both producer grids fit one resident wave. This
+   is the measured B4/K32768 family; FP8 and all other topology boundaries
+   retain their previous choice.
+
+Five alternating-order same-GPU repeats under graph/event timing, 20 warmups,
+100 iterations, seed 42, and refcheck produced:
+
+| H48/SQ1 point | PrimTS median (us) | CuTe DSL median (us) | median ratio | pair geomean | minimum pair |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| B4/K32768 | 42.7552 | 40.7040 | 0.952025 | 0.951932 | 0.951668 |
+| B256/K512 | 45.8240 | 43.3696 | 0.946439 | 0.947110 | 0.946372 |
+
+The bounded long-K 2CTA rule therefore robustly closes one of the two original
+Gate-B misses. B256/K512 remains the only known failure and needs roughly
+0.4% additional improvement for a robust `>=0.95` result. Focused validation
+for the retained source passed 17/17 host selector/config cases and 11/11 GPU
+cases across all four 48-row factorizations, direct/split K tails, fixed and
+packed Q, zero-length requests, graph replay, and an FP8 control. A later
+9/9 stress subset independently repeated the key GPU coverage while testing
+the now-rejected active-row prototype.
+
+Artifacts are under `current_gpu_baseline_n1_c574`,
+`candidate_public_auto_repeats_gpu_c574`, `diagnostic_keep_page_stages_gpu_c574`,
+`diagnostic_keep_registers_gpu_c574`, `diagnostic_keep_combined_stages_gpu_c574`,
+`diagnostic_long_2cta_gpu_c574`, `diagnostic_active_row_warps_gpu_c574`,
+`diagnostic_2cta_stages_gpu_c574`, and `diagnostic_1cta_split_gpu_c574`.
+
+Next, continue bounded 2CTA register/schedule diagnostics for B256/K512. If no
+candidate robustly clears the 0.95 floor, preserve the current correctness and
+long-K improvement as a documented near miss rather than accepting an unsafe
+or noisy optimization. Once a source candidate is selected, run the complete
+PrimTS MLA test file, commit an exact kernel checkpoint, restart all Gate-A and
+Gate-B evidence under that SHA, and finally run the issue-#4390-shaped
+TRTLLM-GEN/CuTeDSL/public-auto-PrimTS comparison in both eager and CUDA-graph
+modes.
