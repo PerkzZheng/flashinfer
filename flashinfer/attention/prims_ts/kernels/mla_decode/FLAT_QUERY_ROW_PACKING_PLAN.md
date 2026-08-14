@@ -1776,3 +1776,63 @@ and provenance are under `gate_a_exact_69161c6c_gpu_c574`. Continue with
 public-auto Gate B at the requester-confirmed 0.94 floor. The broader 31-point
 and five-campaign expansion remains separate from this refreshed primary
 checkpoint and must not be implied by these 40 pairs.
+
+## 28. Small-flat split rounding and allocation-correct Gate-B restart (2026-08-14)
+
+The first `69161c6c` Gate-B run exposed both a real policy gap and an allocation
+provenance boundary.  Container `/etc/hostname` changed at 05:36:59 UTC from
+`a95ef9b435cc`/B200 UUID `GPU-c574acab-9bdc-aadc-b45c-57d9489db33f` to
+`fbb367eb5138`/B200 UUID
+`GPU-48834f9f-5e2e-4a49-15e1-3ededce56259`.  Of the old artifact root's `.ok`
+backend rows, 82 predate the transition and 228 postdate it.  H6/Q8 completed
+on the old GPU, H12/Q4 straddled the transition, and the later H24/Q2, H48/Q1,
+and H6/Q1 rows ran on the replacement GPU despite the legacy directory suffix.
+That root is therefore diagnostic-only; `ALLOCATION_TRANSITION.md` records the
+audit, and no acceptance aggregate combines its rows.
+
+On the replacement GPU, exact `69161c6c` BF16 H6/Q1 B4/K32768 reproducibly
+missed Gate B.  Its first ratio was `0.933670x`, and four additional
+alternating-order pairs had a `0.933383x` median with a
+`0.933283x`--`0.933646x` range.  A B sweep at K32768 showed this was a
+wave-fill/reducer crossover rather than a general long-K failure: B1, B2, B8,
+and B16 repeat medians were `1.365343x`, `1.025075x`, `0.982276x`, and
+`1.173840x` versus CuTe DSL.
+
+The accepted policy change extends the existing power-of-two split rounding
+instead of naming H6, B4, or K32768.  Every enabled non-power flat launch may
+round down when the resulting producer grid retains the common five-sixths
+resident-wave fill.  M8/M16 keep single-digit splits, because a forced
+split9-to-split8 diagnostic slowed PrimTS from a 120.1912 us repeat median to
+122.9208 us.  At split counts 16 and above, the same general rule maps
+74/37/18 to 64/32/16 and reduces standalone-reducer/workspace work while
+retaining 128 of 148 producer slots.
+
+Four-repeat BF16 H6/Q1 candidate medians versus matched CuTe DSL were
+`1.051306x` at B2/split64, `0.952619x` at B4/split32, and `1.004113x` at
+B8/split16.  A separate ten-point H6/H12 BF16/FP8 current-versus-rounded sweep
+covered split64, split32, and split16 topologies; every candidate improved,
+with a `1.018450x` geometric mean and `1.004737x` minimum.  These are general
+cross-shape diagnostics, not substitutes for the formal public-auto gate.
+
+Production checkpoint `e85d52a2` contains that rule plus host contracts for
+37-to-32, 18-to-16, retaining split15, and retaining legacy split9.  Four new
+BF16/FP8 H6/H12 GPU cases passed, including a 32769-token K tail and H6
+eager/graph execution.  The surrounding non-power 1CTA/2CTA, packed-Q,
+zero-length-Q, and split-policy subset passed 41/41 in 167.34 seconds.  Static
+Python, Ruff, formatting, and diff checks passed.
+
+Formal evidence now restarts under the GPU-correct root
+`gate_b_exact_e85d52a2_gpu_4883`.  Its first exact public-auto BF16 H6/Q1
+31-point shard passed:
+
+- geometric mean `1.160920x`;
+- minimum `0.950290x` at B64/K2048;
+- former B4/K32768 failure `0.952619x` (37.2192 us CuTe DSL / 39.0720 us
+  PrimTS);
+- production metadata `source=auto`, profile `h8_splitkv32`, split 32, and 128
+  producer CTAs.
+
+Next, run the complete MLA test file and refreshed Gate A on exact
+`e85d52a2`, then complete all BF16/FP8 Gate-B shards and same-GPU campaign
+repetitions.  The terminal issue-#4390-shaped TRTLLM-GEN/CuTeDSL/public-auto
+PrimTS eager/CUDA-graph comparison remains required afterward.
