@@ -1724,3 +1724,25 @@ Next, run the complete PrimTS MLA test file on this general-policy tree, commit
 an exact source/test checkpoint, and run formal Gate A plus repeated Gate B
 under that identity. The terminal deliverable remains the issue-#4390-shaped
 TRTLLM-GEN/CuTeDSL/public-auto-PrimTS comparison in eager and CUDA-graph modes.
+
+## 26. General-policy exact-tree correctness (2026-08-14)
+
+The general-policy source/test checkpoint is `69161c6c`. It is runtime-equivalent
+to the qualified `12dc0e4f` kernel: the only production-source delta is the
+comment documenting why Keeps-MMA-AB must retain one KV instruction. The
+shape-specific long-K dispatch and the BF16 page-depth experiment are absent.
+
+The complete PrimTS MLA test file passed 239/239 cases in 751.05 seconds on
+B200 UUID `GPU-c574acab-9bdc-aadc-b45c-57d9489db33f` at 1000 W, with PyTorch
+2.10.0+cu128, CUDA runtime 12.8, and compute capability 10.0. This includes all
+233 cases from the prior exact checkpoint plus two BF16/FP8 Keeps configuration
+contracts, three BF16 M64 direct/split/tail cases, and one packed zero-length-Q
+case with eager, standalone, or CUDA-graph coverage as applicable. The JUnit
+report and dedicated JIT cache are under
+`full_validation_69161c6c_gpu_c574`. Ruff, Python compilation, formatting, and
+`git diff --check` also passed before the checkpoint.
+
+The next acceptance work is formal Gate A against the immutable old-PrimTS
+baseline and repeated Gate B at the new 0.94 floor. Performance evidence must
+identify `69161c6c` even though its generated kernel is identical to
+`12dc0e4f`; do not mix results from the removed long-K/page-depth candidate.
