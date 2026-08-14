@@ -312,6 +312,38 @@ def test_attention_ts_mla_keeps_multiwave_auto_uses_direct_grid():
 
 
 @pytest.mark.parametrize(
+    "qkv_dtype,expected_num_insts,expected_kv_stages,expected_q_stages",
+    (
+        pytest.param("bf16", 1, 4, 1, id="bf16-one-instruction"),
+        pytest.param("e4m3", 1, 8, 2, id="fp8-one-instruction"),
+    ),
+)
+def test_attention_ts_mla_keeps_kv_instruction_policy(
+    qkv_dtype,
+    expected_num_insts,
+    expected_kv_stages,
+    expected_q_stages,
+):
+    """Keep the single-pipe schedule's KV work partition at one instruction."""
+
+    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
+        keeps_mma_ab_config_kwargs,
+        keeps_mma_ab_profiles,
+    )
+
+    profile = keeps_mma_ab_profiles(
+        num_heads_q=64,
+        batch_size=16,
+        seq_len_q=1,
+        max_active_clusters=148,
+    )[0]
+    config_kwargs = keeps_mma_ab_config_kwargs(profile, qkv_dtype)
+    assert config_kwargs["num_insts_kv"] == expected_num_insts
+    assert config_kwargs["kv_stages"] == expected_kv_stages
+    assert config_kwargs["q_stages"] == expected_q_stages
+
+
+@pytest.mark.parametrize(
     "num_heads,seq_len_q,one_cta_split,two_cta_split,seq_len_k,dtype,expected",
     (
         pytest.param(
@@ -330,9 +362,7 @@ def test_attention_ts_mla_keeps_multiwave_auto_uses_direct_grid():
             "throughput_latency_1cta",
             id="local-k-boundary",
         ),
-        pytest.param(
-            6, 8, 8, 4, 8192, "bf16", "throughput_2cta", id="equal-wave-bf16"
-        ),
+        pytest.param(6, 8, 8, 4, 8192, "bf16", "throughput_2cta", id="equal-wave-bf16"),
         pytest.param(
             6,
             8,
@@ -2715,6 +2745,57 @@ def test_attention_ts_mla_decode_fp8_equal_wave_flat_rows_stay_1cta():
     assert policy["logical_seq_len_q"] == 4
 
 
+@pytest.mark.parametrize(
+    "batch_size,num_qo_heads,seq_len_q,max_seq_len,page_size,exercise_all_paths",
+    (
+        pytest.param(16, 6, 8, 4096, 32, False, id="h6-sq8-split-causal"),
+        pytest.param(256, 48, 1, 513, 64, False, id="h48-sq1-direct-tail"),
+        pytest.param(4, 48, 1, 32769, 64, True, id="h48-sq1-split-tail-graph"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_bf16_m64_product(
+    batch_size: int,
+    num_qo_heads: int,
+    seq_len_q: int,
+    max_seq_len: int,
+    page_size: int,
+    exercise_all_paths: bool,
+):
+    """Stress the BF16 M64 product across direct and split KV tails."""
+
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=max_seq_len,
+        seq_len_q=seq_len_q,
+        qkv_dtype=torch.bfloat16,
+        page_size=page_size,
+        device="cuda",
+        seed=40600 + batch_size + num_qo_heads,
+    )
+    if seq_len_q > 1:
+        case = _apply_mla_tail_markers(case)
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_latency_1cta",
+            "tile_size_q": 64,
+            "num_insts_kv": 1,
+        },
+        device=case.query.device,
+    )
+    _exercise_public_paths(
+        wrapper,
+        case,
+        policy,
+        exercise_all_paths=exercise_all_paths,
+    )
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_m64_multiwave_uses_complete_direct_grid():
@@ -3189,6 +3270,51 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
         )
         _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
         torch.testing.assert_close(one_shot, eager, rtol=0, atol=0)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_bf16_m64_packed_zero_length():
+    """Keep packed zero-length requests safe on the BF16 M64 product."""
+
+    q_lens = (8, 1, 0, 3) * 4
+    max_seq_len_q = max(q_lens)
+    case = _make_mla_case(
+        batch_size=len(q_lens),
+        num_qo_heads=6,
+        max_seq_len=4096,
+        seq_len_q=max_seq_len_q,
+        qkv_dtype=torch.bfloat16,
+        mask_type="causal",
+        page_size=64,
+        device="cuda",
+        seed=43100,
+    )
+    case = _apply_mla_tail_markers(case)
+    case, qo_indptr = _pack_mla_case(case, q_lens)
+    wrapper = _plan_case(
+        case,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+    )
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_latency_1cta",
+            "tile_size_q": 64,
+            "num_insts_kv": 1,
+        },
+        device=case.query.device,
+    )
+    _exercise_public_paths(
+        wrapper,
+        case,
+        policy,
+        exercise_all_paths=True,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+    )
 
 
 @pytest.mark.parametrize(

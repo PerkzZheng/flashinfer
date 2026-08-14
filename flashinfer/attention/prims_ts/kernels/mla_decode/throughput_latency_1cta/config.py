@@ -1099,6 +1099,9 @@ def keeps_mma_ab_config_kwargs(profile: MlaProfile, qkv_dtype: str) -> dict[str,
         use_clc_dynamic_persistent_scheduler = 0
 
     return {
+        # Keeps-MMA-AB has one QK/PV pipe.  Raising this value would change the
+        # KV work partition without adding the second stream used by the swaps
+        # schedule, and would therefore skip every other KV tile.
         "num_insts_kv": 1,
         "kv_stages": kv_stages,
         "q_stages": q_stages,
