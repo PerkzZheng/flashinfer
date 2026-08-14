@@ -1746,3 +1746,33 @@ The next acceptance work is formal Gate A against the immutable old-PrimTS
 baseline and repeated Gate B at the new 0.94 floor. Performance evidence must
 identify `69161c6c` even though its generated kernel is identical to
 `12dc0e4f`; do not mix results from the removed long-K/page-depth candidate.
+
+## 27. Exact-source refreshed Gate A (2026-08-14)
+
+Checkpoint `69161c6c` was compared with immutable old PrimTS
+`065971254bca6ad0509d775e5806de53b64ac7b9` on the four matched 384-row
+factorizations H12/SQ32, H24/SQ16, H48/SQ8, and H96/SQ4. Each BF16 and FP8
+shape used B/K anchors `1/2048`, `4/512`, `16/1024`, `16/4096`, and `64/8192`.
+All 40 candidate/old pairs ran in fresh processes with explicit source-root
+`PYTHONPATH`, separate persistent JIT caches, alternating source order,
+CUDA-event graph timing, 20 warmups, 100 iterations, seed 42, `--refcheck`,
+checked public-auto candidate dispatch, and `.ok` completion markers.
+
+| Dtype | Pairs | Geomean old/candidate | Minimum |
+| --- | ---: | ---: | ---: |
+| BF16 | 20 | 1.112757 | 0.994985 |
+| FP8 E4M3 | 20 | 1.178127 | 1.014425 |
+
+The BF16 minimum was the no-layout-change H12/SQ32 B16/K1024 control; its
+candidate and old medians were 20.7376 and 20.6336 us. The corresponding
+four-shape control geometric mean was 0.996197x. FP8's minimum was 1.014425x.
+The B64/K8192 cohort geometric means were 1.251220x BF16 and 1.275951x FP8,
+where flat packing removes the fourth padded M128 tile. No row approaches the
+0.97 no-regression floor, and both dtype means are above 1.00, so refreshed
+Gate A passes for this exact-source primary checkpoint.
+
+CSV rows, logs, the analyzer, import-isolated resumable runner, exact aggregate,
+and provenance are under `gate_a_exact_69161c6c_gpu_c574`. Continue with
+public-auto Gate B at the requester-confirmed 0.94 floor. The broader 31-point
+and five-campaign expansion remains separate from this refreshed primary
+checkpoint and must not be implied by these 40 pairs.
