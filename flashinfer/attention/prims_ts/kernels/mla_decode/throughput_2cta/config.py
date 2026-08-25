@@ -33,6 +33,14 @@ LOG2_E = 1.4426950408889634074
 # standalone reducer's qualified workspace and launch capacity.
 MAX_SPLITS = 128
 
+# Automatic 2CTA split selection fills clusters rather than individual CTAs.
+# A power-of-two split removes reduction/workspace work and enables cheaper
+# compile-time divmods, but only when the rounded cluster grid retains at least
+# five sixths of a resident wave.  This is the same occupancy contract used by
+# the throughput-latency 1CTA split policy.
+SPLIT_ROUNDING_WAVE_NUMERATOR = 5
+SPLIT_ROUNDING_WAVE_DENOMINATOR = 6
+
 # The separate reducer follows the public MLA output contract: partial O is
 # stored as BF16 while LSE and the final accumulation remain FP32.  One
 # 512-thread CTA owns eight D512 rows, with each thread moving one 16-byte
@@ -90,9 +98,7 @@ def select_reference_reduction_rows_per_cta(
         if value <= 0:
             raise ValueError(f"{name} must be positive")
 
-    narrow_ctas = batch_size * ceil_div(
-        logical_query_rows, MIN_REDUCTION_ROWS_PER_CTA
-    )
+    narrow_ctas = batch_size * ceil_div(logical_query_rows, MIN_REDUCTION_ROWS_PER_CTA)
     if (
         producer_ctas >= ceil_div(physical_sm_count, 2)
         and narrow_ctas <= physical_sm_count * 4
@@ -136,7 +142,20 @@ def compute_split_kv(
     split_wave_aware = ceil_div(max_splits, k_waves)
     # The 2CTA reduction workspace supports more split slots, but the automatic
     # scheduler caps launch-time splits at 32 to avoid excessive reduction work.
-    return min(split_wave_aware, 32)
+    split_kv = min(split_wave_aware, 32)
+    if split_kv <= 1 or split_kv & (split_kv - 1) == 0:
+        return split_kv
+
+    rounded_split_kv = 1 << (split_kv.bit_length() - 1)
+    base_clusters = batch_size * num_q_tiles
+    target_clusters = max(1, max_active_blocks // 2)
+    rounded_clusters = base_clusters * rounded_split_kv
+    if (
+        rounded_clusters * SPLIT_ROUNDING_WAVE_DENOMINATOR
+        >= target_clusters * SPLIT_ROUNDING_WAVE_NUMERATOR
+    ):
+        return rounded_split_kv
+    return split_kv
 
 
 def compute_workspace_size(

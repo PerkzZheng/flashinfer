@@ -826,9 +826,7 @@ class MlaDecodeTs:
                 select_reference_reduction_rows_per_cta(
                     batch_size=batch_size,
                     logical_query_rows=self.query_tile_layout.total_rows,
-                    producer_ctas=(
-                        batch_size * self.num_q_tiles * static_split_kv * 2
-                    ),
+                    producer_ctas=(batch_size * self.num_q_tiles * static_split_kv * 2),
                     physical_sm_count=max_active_clusters * 2,
                 )
             )
@@ -882,14 +880,21 @@ class MlaDecodeTs:
             physical_sm_count=self.max_active_clusters * 2,
             max_cluster_size=8,
         )
+        parallel_g1_grid_has_no_padded_rows = (
+            self.query_tile_layout.total_rows
+            == effective_num_heads * effective_seq_len_q
+        )
         # Small split counts keep the reference reducer unless its row
         # coarsening leaves a sub-wave grid and the producer generated enough
-        # work to amortize one CTA per physical row.  S17..S32 continue to use
-        # the reference path; high-split clustered reduction begins above it.
+        # work to amortize one CTA per physical row. Do not replace the compact
+        # logical-row reference grid with a G1 launch padded to physical M128
+        # rows. S17..S32 continue to use the reference path; high-split
+        # clustered reduction retains its established selection above it.
         use_small_split_g1 = (
             self.static_split_kv <= 16
             and topology is not None
             and topology.cluster_size == 1
+            and parallel_g1_grid_has_no_padded_rows
             and should_use_q128_g1_parallel_reducer(
                 batch_size=self.batch_size,
                 physical_rows_per_batch=(effective_num_heads * effective_seq_len_q),

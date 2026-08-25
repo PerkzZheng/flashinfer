@@ -2069,3 +2069,80 @@ runtime remains exact `e85d52a2`.  Next, implement the four topology-derived
 conditions as one reversible candidate, add host contracts across boundaries,
 then run focused BF16/FP8 fixed/packed/graph correctness and paired performance
 before accepting the source.
+
+## 34. General topology candidate and exact no-regression gate (2026-08-25)
+
+The four section-33 conditions were implemented together on top of runtime
+checkpoint `e85d52a2`.  At measurement time the uncommitted full source/test
+diff SHA256 was
+`c4a5582c6d0efa03f6c3fa143a51d77e577710111ef60a390865e58256241f13`;
+the five runtime files alone had SHA256
+`dcf4e75a983f689ccb9d3197f342654575c4792c75ffc8173f8e385f0987c28d`.
+The implementation contains no head-, batch-, or sequence-length identity
+exception:
+
+- automatic 2CTA cluster splits round down to a power of two only when the
+  resulting cluster grid retains at least five sixths of a resident wave;
+- small-split G1 parallel reduction is used only when logical rows exactly fill
+  the physical M128 grid, so padded tails retain the compact logical reference
+  reducer;
+- non-power BF16 flat rows through M64 select 2CTA only when direct output or a
+  power-of-two split gives equal normalized producer-wave work, while retaining
+  the measured 513--1024 local-token interval; and
+- short BF16 17--32-row direct work uses the one-scan M32 profile only when its
+  unsplit base grid exceeds one resident wave.  FP8, one-wave, long-K, and
+  legacy power-of-two-head choices retain their independently qualified paths.
+
+Host contracts cover the M32 wave/dtype/K boundaries, split18-to-16 and
+split9-to-8 cluster rounding plus its underfill guard, M8/M16/M32/M64 family
+selection, and padded-versus-full M128 reducer grids.  The complete selected
+host block passed 100/100.  The impacted B200 public-path suite passed 37/37,
+including fixed and packed non-power heads, BF16 and FP8, 1CTA and 2CTA,
+reference and parallel reducers, eager and captured graph replay, the new M32
+profile, and M8/M16/M64 equal-wave controls.  Ruff check, Ruff format check,
+`py_compile`, and `git diff --check` all passed.
+
+One public-auto candidate pass over all 14 repeat-confirmed BF16 boundaries
+passed the `0.94x` CuTe-DSL/PrimTS floor.  The former worst H24/Q1 B64/K2048
+row improved from `0.8692x` to `0.9663x`; H24/Q1 B4/K32768 improved to
+`0.9495x`; and no row failed.  Because three accepted rows remained narrow, a
+new five-pair alternating-order campaign reran them in fresh processes with
+monolithic CuTe DSL, graph/event timing, 20 warmups, 100 iterations, seed 42,
+and refcheck:
+
+| H/Q | B/K | Median CuTe/PrimTS | Five-pair range | PrimTS topology |
+| --- | --- | ---: | ---: | --- |
+| 6/1 | 4/32768 | 0.9437 | 0.9425--0.9468 | 2CTA M128, split16, compact reference |
+| 24/1 | 256/512 | 0.9457 | 0.9445--0.9468 | 1CTA M32 direct |
+| 48/1 | 256/512 | 0.9422 | 0.9422--0.9425 | unchanged 1CTA M64 direct |
+
+The three-target median geometric mean was `0.943881x`; all three medians and
+all 15 individual ratios exceeded `0.94x`.  H6's prior 1CTA result is faster
+than its candidate 2CTA result, but the general equal-wave policy still clears
+the accepted bound reproducibly.  No M8/high-split exception was added.
+Candidate boundary artifacts are under `candidate_topology_policy_gpu_f044`;
+the paired repeat campaign, exact summary, runner, and provenance are under
+`candidate_boundary_repeats_gpu_f044`.
+
+Finally, the dirty candidate was compared on the same GPU with immutable old
+PrimTS `065971254bca6ad0509d775e5806de53b64ac7b9` using the established Gate-A
+matrix: four 384-row factorizations, five B/K points, BF16 and FP8, fresh
+processes, alternating source order, separate JIT caches, graph/event timing,
+20 warmups, 100 iterations, seed 42, refcheck, and candidate dispatch
+assertions.  All 40 pairs completed:
+
+| Dtype | Pairs | Geomean old/candidate | Minimum | Gate |
+| --- | ---: | ---: | ---: | --- |
+| BF16 | 20 | 1.106032 | 0.999690 | pass |
+| FP8 E4M3 | 20 | 1.168351 | 1.000448 | pass |
+
+This clears the unchanged Gate-A `0.97x` point floor and `1.00x` per-dtype
+geometric-mean floor.  Raw data and resumable provenance are under
+`gate_a_candidate_topology_gpu_f044`.
+
+The candidate is ready for an exact source/test/documentation commit.  After
+that checkpoint, rerun the complete process-isolated correctness file and
+continue formal BF16/FP8 public-auto Gate-B coverage from clean, commit-stamped
+artifact roots.  The final acceptance campaign must still run the issue-#4390
+TRTLLM-GEN, monolithic CuTe-DSL, and PrimTS eager/graph comparison at B1/H12,
+Q1 and Q8, BF16 and FP8, and K131072/500000/1000000.

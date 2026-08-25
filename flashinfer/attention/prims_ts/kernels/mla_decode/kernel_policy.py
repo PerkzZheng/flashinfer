@@ -81,13 +81,13 @@ def _prefer_small_flat_2cta(
     seq_len_k: int | None,
     qkv_dtype: str | None,
 ) -> bool:
-    """Return whether measured M64 family crossovers prefer 2CTA."""
+    """Return whether equal normalized small-flat producer waves prefer 2CTA."""
 
     total_q_rows = num_heads * seq_len_q
     if (
         num_heads & (num_heads - 1) == 0
-        or not 48 <= total_q_rows <= 64
-        or one_cta_tile_size_q != 64
+        or not 1 <= total_q_rows <= 64
+        or one_cta_tile_size_q not in (8, 16, 32, 64)
     ):
         return False
     inputs = (one_cta_split_kv, two_cta_split_kv, seq_len_k)
@@ -105,18 +105,25 @@ def _prefer_small_flat_2cta(
     if tokens_per_one_cta_split > _SHORT_K_DIRECT_2CTA_MAX_TOKENS_PER_1CTA_SPLIT:
         return False
     if two_cta_split_kv == 1:
-        # Direct output removes the 1CTA split reducer for both supported input
-        # dtypes without reducing service-unit fill.
-        return True
-    # With equal producer work, the BF16 M64 parallel reducer is slower than a
-    # small 2CTA reference reduction.  Keep this measured crossover bounded to
-    # split2/split4 reference grids; FP8 retains the faster 1CTA reducer.
+        # BF16 benefits across M8--M64 when an equal normalized 2CTA wave can
+        # write directly.  Retain the separately qualified FP8 crossover only
+        # for the established full M64 flat-row cohort.
+        return qkv_dtype == "bf16" or (
+            qkv_dtype == "e4m3"
+            and 48 <= total_q_rows <= 64
+            and one_cta_tile_size_q == 64
+        )
+    # A power-of-two 2CTA split supplies the same normalized producer-wave work
+    # when the 1CTA split is twice as large. Integer capacity fill may leave one
+    # residual 1CTA split (for example split9 versus split4). BF16 benefits from
+    # the smaller reducer domain; FP8 retains its faster 1CTA reducer. Preserve
+    # the measured local-K lower boundary where 1CTA wins at 512 tokens/split.
+    two_cta_is_power_of_two = two_cta_split_kv & (two_cta_split_kv - 1) == 0
     return (
         qkv_dtype == "bf16"
-        and tokens_per_one_cta_split
-        >= _SMALL_REFERENCE_2CTA_MIN_TOKENS_PER_1CTA_SPLIT
-        and two_cta_split_kv <= 4
-        and one_cta_split_kv == 2 * two_cta_split_kv
+        and tokens_per_one_cta_split >= _SMALL_REFERENCE_2CTA_MIN_TOKENS_PER_1CTA_SPLIT
+        and two_cta_is_power_of_two
+        and one_cta_split_kv in (2 * two_cta_split_kv, 2 * two_cta_split_kv + 1)
     )
 
 
@@ -172,10 +179,9 @@ def select_default_mla_kernel_policy(
 ) -> MlaKernelPolicy:
     """Choose the default TS MLA family from work and resident capacity.
 
-    Logical Q rows up to 64 normally retain the throughput-latency family. A
-    measured full-flat-row exceptions use 2CTA when its direct-output wave
-    replaces a short-K M64 split/reducer launch, or when a small BF16 reference
-    reduction has equal producer work and beats the M64 parallel reducer.
+    Logical Q rows up to 64 normally retain the throughput-latency family.
+    Non-power flat rows use 2CTA when its direct-output or smaller reference
+    reduction has equal normalized producer-wave work to the 1CTA candidate.
     Larger shapes normally retain 2CTA, but an automatic caller may provide projected work for both
     candidates. The established probe requires the complete 2CTA launch to
     occupy at most one quarter of its resident cluster wave and the 1CTA

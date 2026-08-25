@@ -755,7 +755,7 @@ def auto_tile_size_q_for_mla_gen(
     return base_tile_size_q
 
 
-def projected_auto_profile_producer_work(
+def projected_auto_profile_split_kv(
     *,
     batch_size: int,
     num_heads_q: int,
@@ -765,7 +765,7 @@ def projected_auto_profile_producer_work(
     tile_size_q: int,
     max_active_clusters: int,
 ) -> int:
-    """Project producer CTAs after automatic split-KV and V slicing."""
+    """Project the automatic split count for one explicit Q tile."""
 
     base_work = q_tile_work_count(
         batch_size,
@@ -786,6 +786,36 @@ def projected_auto_profile_producer_work(
         target_work=max_active_clusters,
         tile_size_q=tile_size_q,
     )
+    return split_kv
+
+
+def projected_auto_profile_producer_work(
+    *,
+    batch_size: int,
+    num_heads_q: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    qkv_dtype: str,
+    tile_size_q: int,
+    max_active_clusters: int,
+) -> int:
+    """Project producer CTAs after automatic split-KV and V slicing."""
+
+    base_work = q_tile_work_count(
+        batch_size,
+        num_heads_q,
+        seq_len_q,
+        tile_size_q,
+    )
+    split_kv = projected_auto_profile_split_kv(
+        batch_size=batch_size,
+        num_heads_q=num_heads_q,
+        seq_len_q=seq_len_q,
+        seq_len_kv=seq_len_kv,
+        qkv_dtype=qkv_dtype,
+        tile_size_q=tile_size_q,
+        max_active_clusters=max_active_clusters,
+    )
     work_after_kv = base_work * split_kv
     head_dim_split = head_dim_split_for_work(
         work_after_kv=work_after_kv,
@@ -793,6 +823,53 @@ def projected_auto_profile_producer_work(
         latent_dim=MlaConfig.latent_dim,
     )
     return work_after_kv * head_dim_split
+
+
+def should_use_short_bf16_m32_flat_query_tile(
+    *,
+    batch_size: int,
+    num_heads_q: int,
+    seq_len_q: int,
+    seq_len_kv: int,
+    qkv_dtype: str,
+    max_active_clusters: int,
+) -> bool:
+    """Keep the smallest one-scan tile for short BF16 multiwave direct work.
+
+    The M32 Swaps schedule is useful only when 17--32 logical rows already
+    expose more than one resident wave without split-KV.  Underfilled grids
+    retain the faster M64 profile, long local K retains the measured Keeps
+    schedule, and FP8 retains its independently tuned M64 path.
+    """
+
+    total_q_rows = num_heads_q * seq_len_q
+    if (
+        qkv_dtype != "bf16"
+        or not 16 < total_q_rows <= 32
+        or seq_len_kv > SWAPS_MMA_AB_MAX_SEQ_LEN_PER_CTA_KV
+    ):
+        return False
+
+    m32_base_work = q_tile_work_count(
+        batch_size,
+        num_heads_q,
+        seq_len_q,
+        32,
+    )
+    if m32_base_work <= max_active_clusters:
+        return False
+    return (
+        projected_auto_profile_split_kv(
+            batch_size=batch_size,
+            num_heads_q=num_heads_q,
+            seq_len_q=seq_len_q,
+            seq_len_kv=seq_len_kv,
+            qkv_dtype=qkv_dtype,
+            tile_size_q=32,
+            max_active_clusters=max_active_clusters,
+        )
+        == 1
+    )
 
 
 def throughput_full_flat_query_tile_size_q(total_q_rows: int) -> int:
@@ -888,16 +965,28 @@ def resolve_auto_mla_gen_groups_tokens_heads_q_shape(
         seq_len_kv=seq_len_kv,
         multi_processor_count=max_active_clusters,
     )
-    if not legacy_power_of_two_heads and should_promote_full_flat_query_tile(
-        batch_size=batch_size,
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        qkv_dtype=qkv_dtype,
-        current_tile_size_q=tile_size_q,
-        max_active_clusters=max_active_clusters,
-    ):
-        tile_size_q = throughput_full_flat_query_tile_size_q(num_heads_q * seq_len_q)
+    if not legacy_power_of_two_heads:
+        if should_use_short_bf16_m32_flat_query_tile(
+            batch_size=batch_size,
+            num_heads_q=num_heads_q,
+            seq_len_q=seq_len_q,
+            seq_len_kv=seq_len_kv,
+            qkv_dtype=qkv_dtype,
+            max_active_clusters=max_active_clusters,
+        ):
+            tile_size_q = 32
+        elif should_promote_full_flat_query_tile(
+            batch_size=batch_size,
+            num_heads_q=num_heads_q,
+            seq_len_q=seq_len_q,
+            seq_len_kv=seq_len_kv,
+            qkv_dtype=qkv_dtype,
+            current_tile_size_q=tile_size_q,
+            max_active_clusters=max_active_clusters,
+        ):
+            tile_size_q = throughput_full_flat_query_tile_size_q(
+                num_heads_q * seq_len_q
+            )
     if legacy_grouped_shape is not None:
         per_tile_work = q_tile_work_count(
             batch_size,

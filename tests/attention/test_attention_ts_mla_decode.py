@@ -46,6 +46,7 @@ from flashinfer.attention.prims_ts import (
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
     MAX_SPLITS,
+    compute_split_kv,
     make_mla_decode_config,
     select_reference_reduction_rows_per_cta,
 )
@@ -184,42 +185,83 @@ def test_attention_ts_mla_flat_query_tile_layout_rejects_invalid_extent(
 
 
 @pytest.mark.parametrize(
-    "case_kwargs,expected_tile_size_q,expected_num_q_tiles",
+    "case_kwargs,qkv_dtype,expected_tile_size_q,expected_num_q_tiles",
     (
         pytest.param(
             dict(batch_size=4, num_heads_q=6, seq_len_q=8, seq_len_kv=512),
+            "bf16",
             8,
             6,
             id="short-underfilled-retains-m8",
         ),
         pytest.param(
             dict(batch_size=16, num_heads_q=6, seq_len_q=8, seq_len_kv=4096),
+            "bf16",
             64,
             1,
             id="h6-q8-promotes-m64",
         ),
         pytest.param(
             dict(batch_size=16, num_heads_q=12, seq_len_q=4, seq_len_kv=4096),
+            "bf16",
             64,
             1,
             id="h12-q4-promotes-m64",
         ),
         pytest.param(
             dict(batch_size=16, num_heads_q=24, seq_len_q=1, seq_len_kv=4096),
+            "bf16",
             64,
             1,
             id="h24-q1-promotes-m64",
         ),
         pytest.param(
             dict(batch_size=16, num_heads_q=32, seq_len_q=1, seq_len_kv=4096),
+            "bf16",
             16,
             2,
             id="legacy-power-of-two-retains-m16",
+        ),
+        pytest.param(
+            dict(batch_size=256, num_heads_q=24, seq_len_q=1, seq_len_kv=512),
+            "bf16",
+            32,
+            1,
+            id="short-bf16-multiwave-direct-uses-m32",
+        ),
+        pytest.param(
+            dict(batch_size=256, num_heads_q=12, seq_len_q=2, seq_len_kv=512),
+            "bf16",
+            32,
+            1,
+            id="short-bf16-grouped-multiwave-direct-uses-m32",
+        ),
+        pytest.param(
+            dict(batch_size=64, num_heads_q=24, seq_len_q=1, seq_len_kv=256),
+            "bf16",
+            64,
+            1,
+            id="short-bf16-one-wave-retains-m64",
+        ),
+        pytest.param(
+            dict(batch_size=256, num_heads_q=24, seq_len_q=1, seq_len_kv=769),
+            "bf16",
+            64,
+            1,
+            id="long-bf16-multiwave-retains-m64",
+        ),
+        pytest.param(
+            dict(batch_size=256, num_heads_q=24, seq_len_q=1, seq_len_kv=512),
+            "e4m3",
+            64,
+            1,
+            id="short-fp8-multiwave-retains-m64",
         ),
     ),
 )
 def test_attention_ts_mla_auto_flat_tile_throughput_promotion(
     case_kwargs,
+    qkv_dtype,
     expected_tile_size_q,
     expected_num_q_tiles,
 ):
@@ -231,7 +273,7 @@ def test_attention_ts_mla_auto_flat_tile_throughput_promotion(
 
     shape = resolve_auto_mla_gen_groups_tokens_heads_q_shape(
         **case_kwargs,
-        qkv_dtype="bf16",
+        qkv_dtype=qkv_dtype,
         max_active_clusters=148,
     )
     assert shape.tile_size_q == expected_tile_size_q
@@ -269,6 +311,31 @@ def test_attention_ts_mla_auto_split_power_of_two_wave_guard(
             base_work=base_work,
             target_work=148,
             tile_size_q=tile_size_q,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size,seq_len_kv,expected",
+    (
+        pytest.param(4, 32768, 16, id="split18-rounds-to-split16"),
+        pytest.param(8, 32768, 8, id="split9-rounds-to-split8"),
+        pytest.param(16, 8192, 4, id="power-of-two-is-retained"),
+        pytest.param(3, 32768, 24, id="rounded-grid-would-underfill"),
+    ),
+)
+def test_attention_ts_mla_2cta_auto_split_power_of_two_wave_guard(
+    batch_size: int,
+    seq_len_kv: int,
+    expected: int,
+):
+    assert (
+        compute_split_kv(
+            batch_size=batch_size,
+            num_q_tiles=1,
+            seq_len_kv=seq_len_kv,
+            max_active_blocks=148,
         )
         == expected
     )
@@ -443,8 +510,48 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
             1,
             2048,
             "bf16",
+            "throughput_2cta",
+            id="small-bf16-tail-direct",
+        ),
+        pytest.param(
+            24,
+            1,
+            8,
+            4,
+            8192,
+            "bf16",
+            "throughput_2cta",
+            id="small-bf16-tail-equal-wave",
+        ),
+        pytest.param(
+            12,
+            1,
+            9,
+            4,
+            8192,
+            "bf16",
+            "throughput_2cta",
+            id="small-bf16-tail-residual-wave-split",
+        ),
+        pytest.param(
+            24,
+            1,
+            32,
+            16,
+            32768,
+            "bf16",
+            "throughput_2cta",
+            id="small-bf16-tail-long-equal-wave",
+        ),
+        pytest.param(
+            24,
+            1,
+            2,
+            1,
+            2048,
+            "e4m3",
             "throughput_latency_1cta",
-            id="small-tail",
+            id="small-fp8-tail-retains-1cta",
         ),
         pytest.param(
             64,
@@ -467,7 +574,7 @@ def test_attention_ts_mla_small_flat_direct_2cta_crossover(
     dtype: str,
     expected: str,
 ):
-    """Use 2CTA only for the measured short-K full-flat-row crossover."""
+    """Use 2CTA only for equal normalized small-flat producer waves."""
 
     assert (
         select_default_mla_kernel_policy(
@@ -616,6 +723,36 @@ def test_attention_ts_mla_reference_reducer_row_policy_rejects_invalid_extent(
     kwargs.update(bad_kwargs)
     with pytest.raises((TypeError, ValueError)):
         select_reference_reduction_rows_per_cta(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "num_heads,seq_len_q,expected_parallel",
+    (
+        pytest.param(24, 1, False, id="padded-m128-tail-uses-logical-reference"),
+        pytest.param(48, 1, False, id="padded-m128-half-tile-uses-reference"),
+        pytest.param(128, 1, True, id="full-m128-tile-may-use-parallel-g1"),
+    ),
+)
+def test_attention_ts_mla_2cta_small_split_avoids_padded_parallel_grid(
+    num_heads: int,
+    seq_len_q: int,
+    expected_parallel: bool,
+):
+    kernel = MlaDecodeTs(
+        max_active_clusters=74,
+        is_persistent=False,
+        static_split_kv=16,
+        num_heads=num_heads,
+        seq_len_q=seq_len_q,
+        batch_size=4,
+    )
+    assert kernel.use_parallel_reduction is expected_parallel
+    if expected_parallel:
+        assert kernel.parallel_reduction_topology is not None
+        assert kernel.parallel_reduction_topology.cluster_size == 1
+    else:
+        assert kernel.parallel_reduction_topology is None
+        assert kernel.reference_reduction_rows_per_cta == 4
 
 
 @dataclass(frozen=True)
@@ -2799,6 +2936,149 @@ def test_attention_ts_mla_decode_fp8_equal_wave_flat_rows_stay_1cta():
     )
     assert policy["logical_num_heads_q"] == 12
     assert policy["logical_seq_len_q"] == 4
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,batch_size,max_seq_len,expected_split",
+    (
+        pytest.param(6, 16, 8193, 4, id="m8-residual-wave-split"),
+        pytest.param(12, 16, 8193, 4, id="m16-residual-wave-split"),
+        pytest.param(24, 32, 4096, 2, id="m64-equal-wave-split"),
+    ),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_bf16_small_flat_equal_wave_uses_2cta(
+    num_qo_heads: int,
+    batch_size: int,
+    max_seq_len: int,
+    expected_split: int,
+):
+    """Use 2CTA across Q tiles when normalized BF16 producer waves match."""
+
+    case = _make_mla_case(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=max_seq_len,
+        seq_len_q=1,
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=40570 + num_qo_heads,
+    )
+    policy = _exercise_auto_mla_case(
+        case,
+        expected_b200={
+            "kernel": "throughput_2cta",
+            "tile_size_q": 128,
+            "total_q_rows": num_qo_heads,
+            "num_q_tiles": 1,
+            "tail_q_rows": num_qo_heads,
+            "split_kv": expected_split,
+            "producer_ctas": batch_size * expected_split * 2,
+            "separate_reducer_impl": "reference",
+            "reducer_rows_per_cta": 4,
+        },
+    )
+    assert policy["logical_num_heads_q"] == num_qo_heads
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_bf16_small_flat_long_split_uses_compact_2cta():
+    """Round a filled long-K wave and reduce only logical M128 tail rows."""
+
+    case = _make_mla_case(
+        batch_size=4,
+        num_qo_heads=24,
+        max_seq_len=32768,
+        seq_len_q=1,
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=40600,
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_2cta",
+            "tile_size_q": 128,
+            "total_q_rows": 24,
+            "num_q_tiles": 1,
+            "tail_q_rows": 24,
+            "split_kv": 16,
+            "producer_ctas": 128,
+            "separate_reducer_impl": "reference",
+            "reducer_rows_per_cta": 4,
+        },
+        device=case.query.device,
+    )
+    _exercise_public_paths(wrapper, case, policy, exercise_all_paths=True)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_bf16_short_multiwave_direct_uses_m32():
+    """Use the one-scan M32 CLC profile for short BF16 multiwave work."""
+
+    case = _make_mla_case(
+        batch_size=256,
+        num_qo_heads=24,
+        max_seq_len=513,
+        seq_len_q=1,
+        qkv_dtype=torch.bfloat16,
+        device="cuda",
+        seed=40610,
+    )
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_latency_1cta",
+            "profile": "h32_clc",
+            "tile_size_q": 32,
+            "total_q_rows": 24,
+            "num_q_tiles": 1,
+            "tail_q_rows": 24,
+            "split_kv": 1,
+            "producer_ctas": 256,
+            "separate_reducer_impl": "none",
+        },
+        device=case.query.device,
+    )
+    _exercise_public_paths(wrapper, case, policy, exercise_all_paths=True)
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_fp8_small_flat_retains_m64_1cta():
+    """Keep the independently tuned FP8 family and profile decisions."""
+
+    case = _make_mla_case(
+        batch_size=64,
+        num_qo_heads=24,
+        max_seq_len=2049,
+        seq_len_q=1,
+        qkv_dtype=torch.float8_e4m3fn,
+        device="cuda",
+        seed=40620,
+    )
+    policy = _exercise_auto_mla_case(
+        case,
+        expected_b200={
+            "kernel": "throughput_latency_1cta",
+            "profile": "h64_splitkv",
+            "tile_size_q": 64,
+            "total_q_rows": 24,
+            "num_q_tiles": 1,
+            "tail_q_rows": 24,
+            "split_kv": 2,
+            "producer_ctas": 128,
+            "separate_reducer_impl": "parallel",
+        },
+    )
+    assert policy["logical_num_heads_q"] == 24
 
 
 @pytest.mark.parametrize(

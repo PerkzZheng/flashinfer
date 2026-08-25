@@ -657,9 +657,9 @@ def _resolve_mla_decode_launch_spec(
         )
         use_small_flat_family_probe = (
             num_heads & (num_heads - 1) != 0
-            and 48 <= total_q_rows <= 64
+            and 1 <= total_q_rows <= 64
             and one_cta_launch_shape.enabled
-            and one_cta_launch_shape.tile_size_q == 64
+            and one_cta_launch_shape.tile_size_q in (8, 16, 32, 64)
             and one_cta_launch_shape.seq_len_q == 1
         )
         if use_established_family_probe:
