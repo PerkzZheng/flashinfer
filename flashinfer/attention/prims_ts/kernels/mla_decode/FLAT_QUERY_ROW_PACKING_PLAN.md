@@ -2146,3 +2146,75 @@ continue formal BF16/FP8 public-auto Gate-B coverage from clean, commit-stamped
 artifact roots.  The final acceptance campaign must still run the issue-#4390
 TRTLLM-GEN, monolithic CuTe-DSL, and PrimTS eager/graph comparison at B1/H12,
 Q1 and Q8, BF16 and FP8, and K131072/500000/1000000.
+
+## 35. Exact correctness, BF16 Gate B, and FP8 M64 crossover (2026-08-25)
+
+The section-34 candidate was committed as runtime checkpoint
+`f18478cf7843390cdf689be9a75cb5dbe0951aa3`; the rounded 2CTA split contract
+was then corrected without changing runtime behavior in test-only checkpoint
+`a8df85fefbde64a1de93ccecf578238e5dbe808e`.  A final process-isolated B200
+correctness campaign at `a8df85fe` passed 268/268 cases (249 main cases plus
+10 and 9 supplemental cases) with `CUDA_LAUNCH_BLOCKING=1`, a dedicated JIT
+cache, exact public eager/wrapper/graph paths, fixed and packed Q, zero-Q,
+BF16/FP8, non-power heads, both kernel families, and all reducer modes.  The
+complete artifact is `full_validation_a8df85fe_gpu_f044_process_isolated`.
+
+Formal BF16 Gate-B first coverage also completed all seven shapes and all 31
+B/K points per shape.  Five shards ran on B200 UUID
+`GPU-f0446129-f969-b901-fe8c-20db6e1d2f60`; that allocation ended after 24/31
+H12/Q4 pairs, so the partial shard was retained only for audit and never
+aggregated.  H12/Q4 and H24/Q2 restarted from zero on replacement B200 UUID
+`GPU-3da4eea0-c8f3-34f8-fcde-fbb8432c5b46`.  Every accepted shard used
+public-auto dispatch, monolithic CuTe DSL, graph/event timing, 20 warmups, 100
+iterations, seed 42, refcheck, alternating backend order, fresh processes,
+isolated backend caches, and completion markers.
+
+| BF16 shape | Shard geomean | Shard minimum |
+| --- | ---: | ---: |
+| H6/Q8 | 1.102773 | 0.977887 |
+| H12/Q4 | 1.109897 | 0.980096 |
+| H24/Q2 | 1.107678 | 0.981565 |
+| H48/Q1 | 1.095036 | 0.942209 |
+| H6/Q1 | 1.150188 | 0.944117 |
+| H12/Q1 | 1.115032 | 0.950555 |
+| H24/Q1 | 1.054201 | 0.944254 |
+
+The equal-weight 217-point BF16 geometric mean is `1.104656x`; every point is
+above the requester-approved `0.94x` floor.  Accepted GPU-f044 artifacts are
+under `gate_b_formal_a8df85fe_gpu_f044`; replacement-allocation artifacts and
+provenance are under `gate_b_formal_a8df85fe_gpu_3da4`.  Results from the two
+GPUs remain separate shards and are not mixed into per-point medians.
+
+The first formal FP8 H24/Q1 shard at `a8df85fe` had a strong `1.091869x`
+geometric mean but reproduced two pointwise failures at B64: K512 was
+`0.9328x` and K2048 was `0.877422x`.  Five fresh alternating-order repetitions
+were effectively invariant, ruling out launch order and ordinary timing
+variance.  Source-neutral controls showed that the existing direct-output
+2CTA family improved both points while preserving refcheck.  The topology is
+general: the selected M64 1CTA producer uses split2 plus a reducer, while the
+2CTA producer has equal normalized wave work, split1, and no reducer.
+
+Boundary controls rejected a head-specific rule.  FP8 H6/M8 and H12/M16 were
+faster on 1CTA, whereas forced direct 2CTA improved both K512 and K2048 for
+intermediate non-power M64 launches H18, H30, and H42 by 7.7--19.7 percent;
+H48 already selected the same direct 2CTA crossover.  Production checkpoint
+`24f0fbd717746593668e43349fa549116b83ab28` therefore removes only the old
+48-logical-row qualification: an already-selected non-power FP8 M64 producer
+may use the existing equal-wave direct 2CTA crossover.  M8/M16, split2+ 2CTA,
+long-local-K, and power-of-two-head behavior are unchanged.  No head, batch,
+or K identity appears in the rule.
+
+The 18-case host selector contract passes and now explicitly distinguishes
+M64 direct crossover from M16 retention.  The focused B200 public-path test
+passes both K2048 2CTA and K2049 1CTA sides with exact outputs.  At the formal
+failure points, the new public-auto measurements are `10.8064 us` versus
+CuTe's `11.4208 us` at K512 (`1.056855x`) and `21.4464 us` versus
+`20.4320 us` at K2048 (`0.952701x`).  Diagnostic and repeat artifacts are
+under `gate_b_formal_a8df85fe_gpu_3da4`.
+
+Next, commit this recovery section, update the formal runner's exact clean-HEAD
+guard, rerun the complete impacted correctness block, and restart the full
+31-point FP8 H24/Q1 shard at the new checkpoint.  Then complete the other six
+FP8 first-coverage shards and required repeat campaigns.  The issue-#4390
+TRTLLM-GEN/CuTeDSL/PrimTS eager-and-graph matrix remains the final performance
+comparison after correctness and Gate B close.
