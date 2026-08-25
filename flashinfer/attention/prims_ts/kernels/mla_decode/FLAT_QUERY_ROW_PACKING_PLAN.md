@@ -1949,3 +1949,50 @@ H48/SQ1 and H6/SQ1 boundary controls on GPU-f044.  Only repeat-confirmed misses
 may motivate a general schedule/profile/reducer experiment.  Then restart the
 remaining FP8 first coverage, complete the formal campaign repetitions, and
 run the required issue-#4390 three-backend eager/graph matrix.
+
+## 32. Fresh-GPU repeat-confirmed boundary diagnosis (2026-08-25)
+
+Exact runtime checkpoint `e85d52a2` completed the planned fresh-allocation
+boundary campaign on B200 UUID
+`GPU-f0446129-f969-b901-fe8c-20db6e1d2f60`.  The environment was container
+`b5d3a689c116`, driver 610.57.04, PyTorch 2.10.0+cu128, CUDA runtime 12.8,
+compute capability 10.0, and a 1000 W power limit.  The campaign selected every
+complete GPU-4883 BF16 first-campaign row below `0.955x`, producing 14 targets
+times five paired public-auto PrimTS/monolithic-CuTe runs.  Every backend and
+repeat ran in a fresh process with alternating order, graph/event timing, 20
+warmups, 100 iterations, seed 42, refcheck, fail-closed 1CTA dispatch, isolated
+JIT caches, and completion markers.
+
+| H/Q | B/K | Median CuTe/PrimTS | Five-pair range | 1CTA topology |
+| --- | --- | ---: | ---: | --- |
+| 6/1 | 4/32768 | 0.9550 | 0.9543--0.9554 | M8, split32, parallel reducer |
+| 6/1 | 16/8192 | 0.9424 | 0.9404--0.9428 | M8, split9, parallel reducer |
+| 6/1 | 64/2048 | 0.9334 | 0.9326--0.9344 | M8, split2, cluster reduction |
+| 12/1 | 4/32768 | 0.9411 | 0.9410--0.9414 | M16, split32, parallel reducer |
+| 12/1 | 16/8192 | 0.9306 | 0.9263--0.9333 | M16, split9, parallel reducer |
+| 12/1 | 64/2048 | 0.9094 | 0.9091--0.9116 | M16, split2, cluster reduction |
+| 24/1 | 4/32768 | 0.9189 | 0.9168--0.9211 | M64, split32, parallel reducer |
+| 24/1 | 16/8192 | 0.9294 | 0.9291--0.9296 | M64, split8, parallel reducer |
+| 24/1 | 32/4096 | 0.9392 | 0.9378--0.9395 | M64, split4, parallel reducer |
+| 24/1 | 64/512 | 0.9480 | 0.9432--0.9490 | M64, split2, parallel reducer |
+| 24/1 | 64/2048 | 0.8692 | 0.8692--0.8692 | M64, split2, parallel reducer |
+| 24/1 | 256/512 | 0.9246 | 0.9245--0.9270 | M64, direct split1 |
+| 48/1 | 4/32768 | 0.9384 | 0.9383--0.9385 | M64, split32, parallel reducer |
+| 48/1 | 256/512 | 0.9421 | 0.9421--0.9424 | M64, direct split1 |
+
+The 14-target median geometric mean was `0.929896x`; nine target medians were
+below the requester-approved `0.94x` floor.  The narrow ranges reproduce the
+gap independently of backend order and this allocation's newer driver.  The
+failures span M8, M16, and M64; direct, cluster, and standalone-parallel
+reduction; and split counts 1, 2, 4, 8/9, and 32.  A reducer-only exception or
+a head/batch/K-specific dispatch rule therefore cannot explain or defensibly
+fix the complete boundary set.
+
+Raw CSVs, logs, markers, analyzer, exact summary, and provenance are under
+`gate_b_boundary_repeats_e85d52a2_gpu_f044`.  These rows are a same-GPU repeat
+diagnostic and are never aggregated with the GPU-4883 first campaign.
+Production source remains unchanged.  A source-neutral forced-family harness
+is prepared under `diagnostic_general_family_e85d52a2_gpu_f044`; it will force
+the existing 2CTA implementation across all 14 targets and compare each result
+with the five-repeat public and CuTe medians.  Only a cross-shape,
+topology-derived improvement may advance to a production policy experiment.
