@@ -1201,11 +1201,11 @@ _MLA_CASES = (
     ),
     _param(
         _case(4, 16, 4097, torch.bfloat16, 32007, seq_len_q=8),
-        _policy("throughput_2cta", 128, 17, 256, cluster=False),
+        _policy("throughput_2cta", 128, 16, 256, cluster=False),
         "identity",
         False,
         exercise_all_paths=True,
-        id="M7-bf16-sq8-grouped-2cta-q128-v256-s17",
+        id="M7-bf16-sq8-grouped-2cta-q128-v256-s16",
     ),
     _param(
         _case(
