@@ -1996,3 +1996,76 @@ is prepared under `diagnostic_general_family_e85d52a2_gpu_f044`; it will force
 the existing 2CTA implementation across all 14 targets and compare each result
 with the five-repeat public and CuTe medians.  Only a cross-shape,
 topology-derived improvement may advance to a production policy experiment.
+
+## 33. General family, split, reducer, and profile diagnostics (2026-08-25)
+
+The source-neutral harness from section 32 forced the existing throughput 2CTA
+family across all 14 repeat-confirmed BF16 boundaries without editing public
+dispatch or production kernels.  Every row passed refcheck.  Against the same
+five-repeat public-auto and CuTe medians, forced 2CTA improved 10 of 12 split
+rows enough to clear `0.94x`; direct 1CTA B256/K512 correctly remained faster.
+
+| H/Q | B/K | Public 1CTA (us) | Forced 2CTA (us) | CuTe/2CTA | 2CTA split/reducer |
+| --- | --- | ---: | ---: | ---: | --- |
+| 12/1 | 16/8192 | 40.0992 | 38.8368 | 0.9608 | S4 reference |
+| 12/1 | 4/32768 | 39.8752 | 39.6736 | 0.9459 | S18 reference |
+| 12/1 | 64/2048 | 38.2240 | 36.3936 | 0.9551 | direct |
+| 24/1 | 16/8192 | 40.4928 | 39.2608 | 0.9587 | S4 reference |
+| 24/1 | 32/4096 | 40.6944 | 39.6368 | 0.9644 | S2 reference |
+| 24/1 | 4/32768 | 41.7152 | 41.1024 | 0.9307 | S18 reference |
+| 24/1 | 64/2048 | 40.6944 | 36.6912 | 0.9641 | direct |
+| 24/1 | 64/512 | 16.1376 | 15.4432 | 0.9907 | direct |
+| 48/1 | 4/32768 | 43.1520 | 42.7456 | 0.9473 | S18 reference |
+| 6/1 | 16/8192 | 39.2784 | 38.4416 | 0.9628 | S4 reference |
+| 6/1 | 4/32768 | 38.8640 | 39.2672 | 0.9452 | S18 reference |
+| 6/1 | 64/2048 | 36.9872 | 36.1888 | 0.9543 | direct |
+
+The common long-K 2CTA split18 is the same wave-fill artifact already fixed
+for 1CTA: rounding to split16 retains 64 of 74 resident clusters, above the
+five-sixths guard, while reducing reducer/workspace work.  It improved all four
+H6/H12/H24/H48 rows.  The existing small-split parallel selector then chose a
+physical M128-row G1 reducer even for short logical tails.  A compact
+logical-row reference control was faster for H24 and H48 and neutral within
+0.21 us for H6/H12:
+
+| H/Q B4/K32768 | S18 reference (us) | S16 parallel (us) | S16 logical reference (us) |
+| --- | ---: | ---: | ---: |
+| 6/1 | 39.2672 | 39.1600 | 39.3664 |
+| 12/1 | 39.6736 | 39.4688 | 39.4688 |
+| 24/1 | 41.1024 | 40.9008 | 40.2880 |
+| 48/1 | 42.7456 | 41.8208 | 41.3120 |
+
+Thus H24's final long-K ratio becomes about `0.9494x`.  This supports two
+structural changes rather than a B4/K32768 rule: apply the existing
+five-sixths power-of-two rounding to 2CTA cluster splits, and do not replace a
+compact logical-row reference reduction with a padded physical-M128 parallel
+grid.  A future logical-row parallel grid remains a valid optimization, but is
+not required to close the gate and would require its own topology/numerical
+qualification.
+
+The remaining direct H24/Q1 B256/K512 failure was isolated to profile choice.
+M32 is the smallest one-scan tile for 17--32 rows and reduced BF16 latency from
+43.3504 to 42.4448 us (`1.0213x`), clearing the CuTe floor.  Cross-shape and
+dtype controls established the general boundary:
+
+- BF16 multiwave direct H18/Q1 and H30/Q1 improved `1.0096x` and `1.0263x`;
+- grouped BF16 H12/Q2 remained correct and regressed only `0.9816x`, above the
+  unchanged Gate-A `0.97x` point floor;
+- one-wave BF16 H24/Q1 B64/K256 regressed to `0.9476x`, so it must retain M64;
+- all five FP8 M32 controls regressed, with `0.887466x` geometric mean, so FP8
+  must retain its M64 schedule.
+
+The defensible profile condition is therefore BF16, 17--32 logical flat rows,
+one M32 scan, direct split1 work, and a base M32 grid beyond one resident wave.
+It names no head, batch, or K value.  The forced-family evidence likewise
+supports a BF16 small-flat crossover when 1CTA and 2CTA have equal normalized
+producer-wave work (the 1CTA split is twice the 2CTA cluster split, allowing
+the single residual split created by integer wave fill).  Existing FP8 and
+power-of-two-head decisions remain unchanged.
+
+Diagnostic CSVs, logs, completion markers, source-neutral override, and
+summaries are under `diagnostic_general_family_e85d52a2_gpu_f044`.  Production
+runtime remains exact `e85d52a2`.  Next, implement the four topology-derived
+conditions as one reversible candidate, add host contracts across boundaries,
+then run focused BF16/FP8 fixed/packed/graph correctness and paired performance
+before accepting the source.
