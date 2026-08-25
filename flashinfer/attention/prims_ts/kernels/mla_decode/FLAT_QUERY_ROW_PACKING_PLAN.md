@@ -1903,3 +1903,49 @@ and provenance are under `gate_a_exact_e85d52a2_gpu_4883`.
 Continue with the remaining exact public-auto Gate-B shards and repeats at the
 requester-approved `0.94x` CuTeDSL/PrimTS pointwise floor.  Do not merge old-
 GPU rows into the replacement-GPU acceptance aggregate.
+
+## 31. BF16 Gate-B first coverage and second allocation boundary (2026-08-25)
+
+Exact `e85d52a2` completed the entire BF16 Gate-B first campaign on B200 UUID
+`GPU-48834f9f-5e2e-4a49-15e1-3ededce56259`: seven public-auto shapes times 31
+B/K points, or 217 complete PrimTS/CuTe DSL pairs.  Every row used graph/event
+timing, 20 warmups, 100 iterations, seed 42, refcheck, alternating backend
+order, public dispatch assertions, isolated backend caches, and completion
+markers.  The combined BF16 geometric mean was `1.110476x`, but Gate B remains
+open because seven first-campaign rows were below the `0.94x` pointwise floor.
+
+| Shape | Shard geomean | Shard minimum | First-campaign status |
+| --- | ---: | ---: | --- |
+| H6/SQ8 | 1.107281 | 0.975290 | pass |
+| H12/SQ4 | 1.112509 | 0.982226 | pass |
+| H24/SQ2 | 1.110523 | 0.982294 | pass |
+| H48/SQ1 | 1.106761 | 0.946732 | pass; repeat boundary rows |
+| H6/SQ1 | 1.160920 | 0.950290 | pass; repeat boundary rows |
+| H12/SQ1 | 1.128431 | 0.926740 | pointwise fail |
+| H24/SQ1 | 1.049892 | 0.889291 | pointwise fail |
+
+The exact first-campaign misses were H12/SQ1 B16/K8192 `0.926740x` and
+B64/K2048 `0.9303x`; and H24/SQ1 B16/K8192 `0.9347x`, B256/K512 `0.9332x`,
+B32/K4096 `0.9399x`, B4/K32768 `0.9258x`, and B64/K2048 `0.889291x`.  All
+shape geometric means remain above the gate.  These rows span M16 and M64,
+direct and parallel-reducer schedules, and split counts 1, 2, 4, 8/9, and 32.
+They therefore require same-GPU alternating-order repeats and topology-level
+diagnosis; do not fit a head/batch/K dispatch exception to the first campaign.
+
+FP8 H6/SQ8 then completed eight same-GPU pairs before the allocation ended.
+One subsequent CuTe DSL CSV is header-only and lacks an `.ok` marker.  No FP8
+shard aggregate is accepted from this partial run.
+
+At resume, the environment had changed to container `b5d3a689c116`, B200 UUID
+`GPU-f0446129-f969-b901-fe8c-20db6e1d2f60`, driver 610.57.04, PyTorch
+2.10.0+cu128, CUDA 12.8, compute capability 10.0, and a 1000 W power limit.
+`SECOND_ALLOCATION_TRANSITION.md` in the GPU-4883 artifact records the exact
+accepted-marker and incomplete-file boundary.  New repeats and remaining FP8
+coverage must rerun both backends under a new GPU-f044 root; never append them
+to `gate_b_exact_e85d52a2_gpu_4883` or aggregate medians across allocations.
+
+Next, run five alternating-order pairs for the seven BF16 misses plus the
+H48/SQ1 and H6/SQ1 boundary controls on GPU-f044.  Only repeat-confirmed misses
+may motivate a general schedule/profile/reducer experiment.  Then restart the
+remaining FP8 first coverage, complete the formal campaign repetitions, and
+run the required issue-#4390 three-backend eager/graph matrix.
