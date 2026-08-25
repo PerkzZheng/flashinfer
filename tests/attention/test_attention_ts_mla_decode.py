@@ -414,17 +414,18 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
 
 
 @pytest.mark.parametrize(
-    "num_heads,seq_len_q,one_cta_split,two_cta_split,seq_len_k,dtype,expected",
+    "num_heads,seq_len_q,one_cta_tile_size_q,one_cta_split,two_cta_split,seq_len_k,dtype,expected",
     (
         pytest.param(
-            6, 8, 2, 1, 2048, "bf16", "throughput_2cta", id="flat-short-k-bf16"
+            6, 8, 64, 2, 1, 2048, "bf16", "throughput_2cta", id="flat-short-k-bf16"
         ),
         pytest.param(
-            6, 8, 2, 1, 2048, "e4m3", "throughput_2cta", id="flat-short-k-fp8"
+            6, 8, 64, 2, 1, 2048, "e4m3", "throughput_2cta", id="flat-short-k-fp8"
         ),
         pytest.param(
             6,
             8,
+            64,
             2,
             1,
             2049,
@@ -432,10 +433,13 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
             "throughput_latency_1cta",
             id="local-k-boundary",
         ),
-        pytest.param(6, 8, 8, 4, 8192, "bf16", "throughput_2cta", id="equal-wave-bf16"),
+        pytest.param(
+            6, 8, 64, 8, 4, 8192, "bf16", "throughput_2cta", id="equal-wave-bf16"
+        ),
         pytest.param(
             6,
             8,
+            64,
             8,
             4,
             4096,
@@ -446,6 +450,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             6,
             8,
+            64,
             8,
             4,
             4097,
@@ -456,6 +461,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             6,
             8,
+            64,
             8,
             4,
             8192,
@@ -466,6 +472,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             6,
             8,
+            64,
             10,
             5,
             8192,
@@ -476,6 +483,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             6,
             8,
+            64,
             8,
             3,
             8192,
@@ -486,6 +494,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             6,
             8,
+            64,
             2,
             2,
             2048,
@@ -496,6 +505,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             6,
             8,
+            64,
             1,
             1,
             2048,
@@ -506,6 +516,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             24,
             1,
+            64,
             2,
             1,
             2048,
@@ -516,6 +527,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             24,
             1,
+            64,
             8,
             4,
             8192,
@@ -526,6 +538,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             12,
             1,
+            16,
             9,
             4,
             8192,
@@ -536,6 +549,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             24,
             1,
+            64,
             32,
             16,
             32768,
@@ -546,16 +560,29 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
         pytest.param(
             24,
             1,
+            64,
+            2,
+            1,
+            2048,
+            "e4m3",
+            "throughput_2cta",
+            id="small-fp8-m64-tail-direct",
+        ),
+        pytest.param(
+            12,
+            1,
+            16,
             2,
             1,
             2048,
             "e4m3",
             "throughput_latency_1cta",
-            id="small-fp8-tail-retains-1cta",
+            id="small-fp8-m16-tail-retains-1cta",
         ),
         pytest.param(
             64,
             1,
+            64,
             2,
             1,
             2048,
@@ -568,6 +595,7 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
 def test_attention_ts_mla_small_flat_direct_2cta_crossover(
     num_heads: int,
     seq_len_q: int,
+    one_cta_tile_size_q: int,
     one_cta_split: int,
     two_cta_split: int,
     seq_len_k: int,
@@ -584,7 +612,7 @@ def test_attention_ts_mla_small_flat_direct_2cta_crossover(
             one_cta_capacity=148,
             two_cta_cluster_work=64,
             two_cta_cluster_capacity=74,
-            one_cta_tile_size_q=64,
+            one_cta_tile_size_q=one_cta_tile_size_q,
             one_cta_split_kv=one_cta_split,
             two_cta_split_kv=two_cta_split,
             seq_len_k=seq_len_k,
@@ -3052,33 +3080,51 @@ def test_attention_ts_mla_decode_bf16_short_multiwave_direct_uses_m32():
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_fp8_small_flat_retains_m64_1cta():
-    """Keep the independently tuned FP8 family and profile decisions."""
+def test_attention_ts_mla_decode_fp8_small_flat_m64_direct_crossover():
+    """Use direct 2CTA for bounded M64 work and retain 1CTA beyond it."""
 
-    case = _make_mla_case(
-        batch_size=64,
-        num_qo_heads=24,
-        max_seq_len=2049,
-        seq_len_q=1,
-        qkv_dtype=torch.float8_e4m3fn,
-        device="cuda",
-        seed=40620,
+    cases = (
+        (
+            2048,
+            {
+                "kernel": "throughput_2cta",
+                "tile_size_q": 128,
+                "total_q_rows": 24,
+                "num_q_tiles": 1,
+                "tail_q_rows": 24,
+                "split_kv": 1,
+                "producer_ctas": 128,
+                "separate_reducer_impl": "none",
+                "reducer_rows_per_cta": None,
+            },
+        ),
+        (
+            2049,
+            {
+                "kernel": "throughput_latency_1cta",
+                "profile": "h64_splitkv",
+                "tile_size_q": 64,
+                "total_q_rows": 24,
+                "num_q_tiles": 1,
+                "tail_q_rows": 24,
+                "split_kv": 2,
+                "producer_ctas": 128,
+                "separate_reducer_impl": "parallel",
+            },
+        ),
     )
-    policy = _exercise_auto_mla_case(
-        case,
-        expected_b200={
-            "kernel": "throughput_latency_1cta",
-            "profile": "h64_splitkv",
-            "tile_size_q": 64,
-            "total_q_rows": 24,
-            "num_q_tiles": 1,
-            "tail_q_rows": 24,
-            "split_kv": 2,
-            "producer_ctas": 128,
-            "separate_reducer_impl": "parallel",
-        },
-    )
-    assert policy["logical_num_heads_q"] == 24
+    for max_seq_len, expected_b200 in cases:
+        case = _make_mla_case(
+            batch_size=64,
+            num_qo_heads=24,
+            max_seq_len=max_seq_len,
+            seq_len_q=1,
+            qkv_dtype=torch.float8_e4m3fn,
+            device="cuda",
+            seed=40620 + max_seq_len,
+        )
+        policy = _exercise_auto_mla_case(case, expected_b200=expected_b200)
+        assert policy["logical_num_heads_q"] == 24
 
 
 @pytest.mark.parametrize(

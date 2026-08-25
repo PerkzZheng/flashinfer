@@ -106,12 +106,11 @@ def _prefer_small_flat_2cta(
         return False
     if two_cta_split_kv == 1:
         # BF16 benefits across M8--M64 when an equal normalized 2CTA wave can
-        # write directly.  Retain the separately qualified FP8 crossover only
-        # for the established full M64 flat-row cohort.
+        # write directly.  FP8 retains its faster M8/M16 1CTA schedules, while
+        # a selected M64 producer benefits from removing the split reducer at
+        # the same normalized producer-wave work.
         return qkv_dtype == "bf16" or (
-            qkv_dtype == "e4m3"
-            and 48 <= total_q_rows <= 64
-            and one_cta_tile_size_q == 64
+            qkv_dtype == "e4m3" and one_cta_tile_size_q == 64
         )
     # A power-of-two 2CTA split supplies the same normalized producer-wave work
     # when the 1CTA split is twice as large. Integer capacity fill may leave one
