@@ -2218,3 +2218,51 @@ guard, rerun the complete impacted correctness block, and restart the full
 FP8 first-coverage shards and required repeat campaigns.  The issue-#4390
 TRTLLM-GEN/CuTeDSL/PrimTS eager-and-graph matrix remains the final performance
 comparison after correctness and Gate B close.
+
+## 36. Complete primary Gate-B coverage at the FP8 crossover checkpoint
+
+Clean documentation checkpoint `612391a8c882ccef4107db9d0ee36c44f050ba75`
+(runtime parent `24f0fbd717746593668e43349fa549116b83ab28`) completed all
+seven formal FP8 first-coverage shards on B200 UUID
+`GPU-3da4eea0-c8f3-34f8-fcde-fbb8432c5b46`.  Each shard contains 31 complete
+public-auto PrimTS/monolithic-CuTe pairs with the section-35 protocol and no
+reused CSV from the prior failing checkpoint.
+
+| FP8 shape | Shard geomean | Shard minimum |
+| --- | ---: | ---: |
+| H6/Q8 | 1.150360 | 0.976410 |
+| H12/Q4 | 1.133012 | 0.976502 |
+| H24/Q2 | 1.141014 | 0.976594 |
+| H48/Q1 | 1.144682 | 0.977147 |
+| H6/Q1 | 1.240764 | 1.011106 |
+| H12/Q1 | 1.184295 | 0.964646 |
+| H24/Q1 | 1.097648 | 0.952309 |
+
+The equal-weight 217-point FP8 geometric mean is `1.155221x`; every point is
+above `0.94x`.  Together with section 35's complete BF16 coverage, the full
+434-point primary Gate-B geometric mean is `1.129656x`; the global minimum is
+the BF16 H48/Q1 B256/K512 row at `0.942209x`.  First coverage therefore passes
+for both dtypes, all seven required H/Q factorizations, and every B/K point.
+
+Five fresh alternating-order pairs then qualified the three closest FP8
+boundaries.  Every individual pair passed:
+
+| FP8 H/Q B/K | Five-pair median | Range |
+| --- | ---: | ---: |
+| 24/1 1/32768 | 0.952399 | 0.952039--0.952939 |
+| 24/1 64/2048 | 0.953056 | 0.952630--0.956698 |
+| 12/1 64/2048 | 0.965421 | 0.964801--0.969758 |
+
+Finally, the complete process-isolated correctness file passed 269/269 at the
+same exact clean checkpoint: 250 main cases, 10 packed-nonpower cases, and 9
+supplemental tail cases.  All three pytest processes exited zero with
+`CUDA_LAUNCH_BLOCKING=1` and a dedicated JIT cache.  The prior expected count
+was 268; the new M16/M64 selector parameter adds one host case, so the runner's
+initial status 4 was only a stale-count mismatch and is reconciled in the
+artifact.  Evidence is under `full_validation_612391a8_gpu_3da4_process_isolated`.
+
+Formal results and repeat data are under
+`gate_b_formal_612391a8_gpu_3da4`.  Remaining acceptance work is broader
+multi-campaign repetition according to the saved protocol, followed by the
+issue-#4390 B1/H12 Q1/Q8 BF16/FP8 K131072/500000/1000000 comparison across
+TRTLLM-GEN, monolithic CuTe DSL, and PrimTS in eager and graph modes.
