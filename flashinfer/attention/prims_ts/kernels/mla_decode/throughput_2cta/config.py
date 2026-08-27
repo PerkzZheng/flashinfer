@@ -41,6 +41,14 @@ MAX_SPLITS = 128
 SPLIT_ROUNDING_WAVE_NUMERATOR = 5
 SPLIT_ROUNDING_WAVE_DENOMINATOR = 6
 
+# Automatic scheduling retains the compact reference-reducer regime until a
+# resident power-of-two cluster wave has enough local K work to amortize the
+# high-split clustered reducer.  Four K tiles per split is the first common
+# BF16/FP8 point where the fuller producer wave wins; a single tile per split
+# remains launch/reduction bound.
+AUTO_COMPACT_SPLIT_CAP = 32
+AUTO_WAVE_SPLIT_MIN_K_TILES = 4
+
 # The separate reducer follows the public MLA output contract: partial O is
 # stored as BF16 while LSE and the final accumulation remain FP32.  One
 # 512-thread CTA owns eight D512 rows, with each thread moving one 16-byte
@@ -140,15 +148,28 @@ def compute_split_kv(
     split_heur = min(max_splits, blocks_per_batch)
     k_waves = ceil_div(max_splits, split_heur)
     split_wave_aware = ceil_div(max_splits, k_waves)
-    # The 2CTA reduction workspace supports more split slots, but the automatic
-    # scheduler caps launch-time splits at 32 to avoid excessive reduction work.
-    split_kv = min(split_wave_aware, 32)
+    # A 2CTA split is one producer cluster.  Use the largest power-of-two wave
+    # that fits the host-reported resident cluster capacity only when every
+    # split retains enough K tiles to amortize the clustered reducer.  Shorter
+    # local-K work stays in the established compact S<=32 regime.
+    target_clusters = max(1, max_active_blocks // 2)
+    resident_wave_splits = min(
+        MAX_SPLITS,
+        1 << (target_clusters.bit_length() - 1),
+    )
+    compact_split_cap = min(AUTO_COMPACT_SPLIT_CAP, resident_wave_splits)
+    wave_split_is_amortized = (
+        max_splits >= resident_wave_splits * AUTO_WAVE_SPLIT_MIN_K_TILES
+    )
+    auto_split_cap = (
+        resident_wave_splits if wave_split_is_amortized else compact_split_cap
+    )
+    split_kv = min(split_wave_aware, auto_split_cap)
     if split_kv <= 1 or split_kv & (split_kv - 1) == 0:
         return split_kv
 
     rounded_split_kv = 1 << (split_kv.bit_length() - 1)
     base_clusters = batch_size * num_q_tiles
-    target_clusters = max(1, max_active_blocks // 2)
     rounded_clusters = base_clusters * rounded_split_kv
     if (
         rounded_clusters * SPLIT_ROUNDING_WAVE_DENOMINATOR

@@ -37,6 +37,7 @@ from typing import Literal, TypedDict, cast
 from typing_extensions import Unpack
 
 from .helpers.constants import SUPPORTED_MLA_PAGE_SIZES
+from .throughput_2cta.config import AUTO_COMPACT_SPLIT_CAP
 from .throughput_latency_1cta.config import (
     MlaConfig,
     enumerate_throughput_latency_mla_profiles,
@@ -100,6 +101,11 @@ def _prefer_small_flat_2cta(
     assert two_cta_split_kv is not None
     assert seq_len_k is not None
     if one_cta_split_kv <= 1:
+        return False
+    # This crossover was established for direct output and the compact 2CTA
+    # reducer domain.  A larger split uses the clustered high-split reducer;
+    # equal producer-wave work alone does not account for that topology.
+    if two_cta_split_kv > AUTO_COMPACT_SPLIT_CAP:
         return False
     tokens_per_one_cta_split = (seq_len_k + one_cta_split_kv - 1) // one_cta_split_kv
     if tokens_per_one_cta_split > _SHORT_K_DIRECT_2CTA_MAX_TOKENS_PER_1CTA_SPLIT:

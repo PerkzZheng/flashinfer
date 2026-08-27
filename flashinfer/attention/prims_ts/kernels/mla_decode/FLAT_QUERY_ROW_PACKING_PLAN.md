@@ -2266,3 +2266,88 @@ Formal results and repeat data are under
 multi-campaign repetition according to the saved protocol, followed by the
 issue-#4390 B1/H12 Q1/Q8 BF16/FP8 K131072/500000/1000000 comparison across
 TRTLLM-GEN, monolithic CuTe DSL, and PrimTS in eager and graph modes.
+
+## 37. Issue-#4390 matrix and amortized resident 2CTA waves (2026-08-27)
+
+The issue-#4390 benchmark harness first needed one general correctness fix.
+The direct MLA API requires the physical page-table width to cover a
+128-token-aligned capacity, while K500000 at page size 64 has 7,813 logical
+pages.  Benchmark checkpoint `41ba155df405f40efd458d766c58595ef968bc8a`
+pads only the physical table to 7,814 entries; logical K, FLOP/byte accounting,
+and every backend input remain exactly 500000.  Seven focused harness tests and
+a same-input BF16 K500000 refcheck across TRTLLM-GEN, CuTe DSL, and PrimTS
+passed.
+
+The resulting clean-checkpoint issue matrix completed all 72 fresh-process
+backend runs: graph/eager, BF16/FP8 E4M3, Q1/Q8, K131072/500000/1000000, and
+TRTLLM-GEN/monolithic-CuTe/public-auto-PrimTS.  It used B1, H12/Hkv1, D512+64,
+page64, CUDA-event timing, 20 warmups, 100 iterations, seed 0, and refcheck.
+Q1 selected 1CTA M16/S128 and remained faster than CuTe.  Q8 selected 2CTA
+M128/S32.  The combined CuTe/PrimTS geometric mean was `1.208934x`, but five
+FP8 Q8 rows missed the `0.94x` point floor; the minimum was `0.855620x` at
+graph K500000.  Raw data and exact provenance are under
+`issue4390_matrix_41ba155d_gpu_3d9f`.
+
+The failure is structural.  At B1/Q96, S32 launches 32 producer clusters on a
+74-cluster B200 wave and uses only 12 compact reference-reducer CTAs.  A
+source-neutral S64 control launches 64 producer clusters and selects the
+already-qualified parallel G8 reducer.  Across both dtypes and all three
+formal K lengths, S64 improved the old public path by `1.1626x`--`1.3759x`
+and cleared CuTe by `1.1626x`--`1.3759x`.  Boundary controls established that
+S64 is not a universal short-K choice: at K8192 it was `0.9875x` of S32 for
+BF16 and `0.9193x` for FP8, while at K32768 it was `1.1458x` and `1.0215x`
+respectively.
+
+The candidate therefore derives the largest resident power-of-two producer
+cluster wave from host-reported active CTA capacity and permits that wave only
+when it retains at least four 128-token K tiles per split.  Otherwise it keeps
+the established compact S<=32 cap.  The small-flat 1CTA-to-2CTA crossover is
+also kept in the compact-reducer domain: its equal-producer-work comparison
+does not model the high-split clustered reducer.  These conditions contain no
+head, batch, Q, dtype, or absolute-K identity.  Host contracts cover smaller
+and larger resident capacities as well as both sides of the four-tile
+boundary.
+
+The exact dirty-runtime files used for qualification have SHA256
+`22ed18c069369dfd46420e0c9ef3e1224bbcf860f1ff0928a35e2983e81081fe`
+for 2CTA config and
+`b3ce1b2275d7b6378b1b4f49b5dd0c14276f9df39d6f09dbf3f5f0e940deae8a`
+for kernel policy.  The 24-point public-auto candidate rerun passed every
+refcheck and both pointwise gates:
+
+- CuTe/candidate geometric mean `1.425484x`, minimum `1.162269x`, required
+  minimum `0.94x`;
+- old-PrimTS/candidate geometric mean `1.179125x`, minimum `0.996632x`,
+  required minimum `0.97x`;
+- Q1 retained exact 1CTA M16/S128 topology; every Q8 row selected 2CTA
+  M128/S64 with parallel G8 reduction.
+
+The source-pinned artifact is
+`issue4390_candidate_41ba155d_diffabbad_gpu_3d9f`.  Additional B200
+correctness passed 8/8 resident-wave H/Q-by-dtype cases, 30/30 fixed-Q
+non-power/reducer cases, and 19/19 packed, zero-Q, and runtime-K cases in
+isolated CUDA processes.  All 123 non-Blackwell-policy cases, Ruff checks,
+format checks, `py_compile`, and `git diff --check` passed.
+
+A shape-neutral control held total flat Q rows at 96 and factored them as
+H12/Q8, H24/Q4, H48/Q2, and H96/Q1.  All eight BF16/FP8 public-auto pairs used
+the same M128/S64/G8 topology and passed refcheck; CuTe/PrimTS had geometric
+mean `1.004475x` and minimum `0.940637x`.  Five alternating-order repeats of
+the narrow FP8 H12/Q8 K32768 boundary had median `0.943796x` and range
+`0.937292x`--`0.946228x`; one timing sample crossed the point floor by 0.27%,
+so the crossover remains explicitly narrow even though its repeat median and
+the formal K>=131072 matrix pass the accepted six-percent tolerance.
+
+Source-neutral split controls rejected a special boundary split: S64 measured
+`19.190 us`, while S48/S56/S60/S68/S72/S74 ranged from `20.630 us` to
+`22.474 us`.  A forced G4 reducer improved this diagnostic to `18.586 us`, but
+G selection belongs to the separately qualified Q128 standalone-reducer
+topology.  It is retained as a follow-up rather than folded into this dispatch
+change without the required split/batch/numerical reducer campaign.  Evidence
+is under `resident_wave_factorization_candidate_gpu_3d9f`,
+`resident_wave_boundary_repeats_gpu_3d9f`, and
+`resident_wave_split_sweep_gpu_3d9f`.
+
+Next, commit the runtime and tests, run the complete 284-case process-isolated
+correctness file at that exact clean checkpoint, and rerun the full 72-run
+TRTLLM-GEN/CuTeDSL/PrimTS issue matrix from zero under the clean commit.

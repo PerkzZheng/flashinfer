@@ -317,17 +317,24 @@ def test_attention_ts_mla_auto_split_power_of_two_wave_guard(
 
 
 @pytest.mark.parametrize(
-    "batch_size,seq_len_kv,expected",
+    "batch_size,seq_len_kv,max_active_blocks,expected",
     (
-        pytest.param(4, 32768, 16, id="split18-rounds-to-split16"),
-        pytest.param(8, 32768, 8, id="split9-rounds-to-split8"),
-        pytest.param(16, 8192, 4, id="power-of-two-is-retained"),
-        pytest.param(3, 32768, 24, id="rounded-grid-would-underfill"),
+        pytest.param(1, 32768, 148, 64, id="amortized-resident-wave-split64"),
+        pytest.param(1, 8192, 148, 32, id="single-tile-per-wave-split-stays-compact"),
+        pytest.param(2, 32768, 148, 32, id="two-base-clusters-fill-wave-at-split32"),
+        pytest.param(4, 32768, 148, 16, id="split18-rounds-to-split16"),
+        pytest.param(8, 32768, 148, 8, id="split9-rounds-to-split8"),
+        pytest.param(16, 8192, 148, 4, id="power-of-two-is-retained"),
+        pytest.param(3, 32768, 148, 24, id="rounded-grid-would-underfill"),
+        pytest.param(1, 32768, 76, 32, id="smaller-resident-wave-remains-split32"),
+        pytest.param(1, 32768, 300, 32, id="larger-wave-is-not-yet-amortized"),
+        pytest.param(1, 65536, 300, 128, id="larger-amortized-wave-uses-split128"),
     ),
 )
 def test_attention_ts_mla_2cta_auto_split_power_of_two_wave_guard(
     batch_size: int,
     seq_len_kv: int,
+    max_active_blocks: int,
     expected: int,
 ):
     assert (
@@ -335,7 +342,7 @@ def test_attention_ts_mla_2cta_auto_split_power_of_two_wave_guard(
             batch_size=batch_size,
             num_q_tiles=1,
             seq_len_kv=seq_len_kv,
-            max_active_blocks=148,
+            max_active_blocks=max_active_blocks,
         )
         == expected
     )
@@ -556,6 +563,17 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
             "bf16",
             "throughput_2cta",
             id="small-bf16-tail-long-equal-wave",
+        ),
+        pytest.param(
+            12,
+            1,
+            16,
+            128,
+            64,
+            131072,
+            "bf16",
+            "throughput_latency_1cta",
+            id="clustered-2cta-reducer-retains-1cta",
         ),
         pytest.param(
             24,
@@ -3302,6 +3320,68 @@ def test_attention_ts_mla_decode_non_power_of_two_heads_2cta_matched_rows(
         wrapper._workspace_layout.kernel_workspace.byte_size == expected_workspace_bytes
     )
     _exercise_public_paths(wrapper, case, policy, exercise_all_paths=False)
+
+
+@pytest.mark.parametrize(
+    "num_qo_heads,seq_len_q",
+    (
+        pytest.param(12, 8, id="h12-sq8"),
+        pytest.param(24, 4, id="h24-sq4"),
+        pytest.param(48, 2, id="h48-sq2"),
+        pytest.param(96, 1, id="h96-sq1"),
+    ),
+)
+@pytest.mark.parametrize(
+    "qkv_dtype",
+    (torch.bfloat16, torch.float8_e4m3fn),
+    ids=("bf16", "fp8"),
+)
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_amortized_resident_2cta_wave(
+    num_qo_heads: int,
+    seq_len_q: int,
+    qkv_dtype: torch.dtype,
+):
+    """Exercise the full resident producer wave across equal flat-Q shapes."""
+
+    case = _make_mla_case(
+        batch_size=1,
+        num_qo_heads=num_qo_heads,
+        max_seq_len=32769,
+        seq_len_q=seq_len_q,
+        qkv_dtype=qkv_dtype,
+        device="cuda",
+        seed=41500 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
+    )
+    if seq_len_q > 1:
+        case = _apply_mla_tail_markers(case)
+    wrapper = _plan_case(case)
+    policy = _policy_dict(wrapper)
+    _assert_auto_policy(
+        policy,
+        {
+            "kernel": "throughput_2cta",
+            "tile_size_q": 128,
+            "total_q_rows": 96,
+            "num_q_tiles": 1,
+            "tail_q_rows": 96,
+            "split_kv": 64,
+            "producer_ctas": 128,
+            "separate_reducer_impl": "parallel",
+            "reducer_cluster_size": 8,
+        },
+        device=case.query.device,
+    )
+    _exercise_public_paths(
+        wrapper,
+        case,
+        policy,
+        exercise_all_paths=(
+            (num_qo_heads == 12 and qkv_dtype == torch.bfloat16)
+            or (num_qo_heads == 96 and qkv_dtype == _FP8)
+        ),
+    )
 
 
 @pytest.mark.parametrize(
