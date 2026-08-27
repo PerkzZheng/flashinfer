@@ -93,6 +93,25 @@ def _select_reference_output(outputs, priority):
     return None, None
 
 
+def _aligned_mla_num_pages_per_seq(seq_len, page_size):
+    """Return an MLA block-table width aligned to a 128-token boundary.
+
+    The direct TRTLLM-GEN/CuTeDSL MLA API requires the rectangular block-table
+    width to cover an integer number of 128-token groups.  Keep ``seq_len``
+    unchanged and add only unused physical pages so non-aligned benchmark
+    lengths exercise the requested logical workload across every backend.
+    """
+    if seq_len < 0:
+        raise ValueError(f"seq_len must be non-negative, got {seq_len}")
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive, got {page_size}")
+    logical_pages = (seq_len + page_size - 1) // page_size
+    pages_per_group = max(1, 128 // page_size)
+    return (
+        (logical_pages + pages_per_group - 1) // pages_per_group * pages_per_group
+    )
+
+
 def _context_reference_sample_points(qo_indptr_host, num_qo_heads, limit=8):
     """Choose deterministic context samples across requests, rows, and heads."""
     batch_size = len(qo_indptr_host) - 1
@@ -3254,7 +3273,8 @@ def testBatchMLAPagedAttentionWrapper(args):
         print(f"[VVERBOSE] {q.shape = }")
 
     # Create KV cache
-    num_pages_per_seq = (s_kv + page_size - 1) // page_size
+    logical_num_pages_per_seq = (s_kv + page_size - 1) // page_size
+    num_pages_per_seq = _aligned_mla_num_pages_per_seq(s_kv, page_size)
     total_num_pages = num_pages_per_seq * batch_size
 
     # Now initialize the page tables
@@ -3268,6 +3288,7 @@ def testBatchMLAPagedAttentionWrapper(args):
     )
 
     if args.verbose >= 2:
+        print(f"[VVERBOSE] {logical_num_pages_per_seq = }")
         print(f"[VVERBOSE] {num_pages_per_seq = }")
         print(f"[VVERBOSE] {total_num_pages = }")
         print(f"[VVERBOSE] {block_tables.shape = }")

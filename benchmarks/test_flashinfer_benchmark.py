@@ -22,6 +22,10 @@ class _RecordingPrimsTSWrapper:
         self.constructor_call = None
         self.plan_calls = []
         self.run_calls = []
+        self._policy = {}
+        self._workspace_layout = SimpleNamespace(
+            kernel_workspace=SimpleNamespace(byte_size=0)
+        )
 
     def plan(self, *args, **kwargs):
         self.plan_calls.append((args, kwargs))
@@ -573,7 +577,9 @@ def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
     assert wrapper.constructor_call == ((), {})
     assert len(wrapper.plan_calls) == len(wrapper.run_calls) == 1
     plan_args, plan_kwargs = wrapper.plan_calls[0]
-    assert plan_args[0].shape == (2, 1)
+    # MLA block tables are padded with unused physical pages to the direct
+    # backend's 128-token alignment contract, while seq_lens remain exact.
+    assert plan_args[0].shape == (2, 8)
     assert plan_args[1].tolist() == [16, 16]
     assert plan_args[2:] == (2, 512, 64, 16)
     assert plan_kwargs == {
@@ -588,13 +594,33 @@ def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
     run_args, run_kwargs = wrapper.run_calls[0]
     runtime_q, runtime_kv_cache = run_args
     assert runtime_q.shape == (2, 3, 2, 576)
-    assert runtime_kv_cache.shape == (2, 16, 576)
+    assert runtime_kv_cache.shape == (16, 16, 576)
     assert runtime_kv_cache.is_contiguous()
     assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(192))
     assert run_kwargs["bmm2_scale"] == 1.0
     assert run_kwargs["out"].shape == (2, 3, 2, 512)
     assert run_kwargs["out"].dtype == torch.bfloat16
     assert benchmark_outputs[0].shape == (6, 2, 512)
+
+
+@pytest.mark.parametrize(
+    "seq_len,page_size,expected_pages",
+    [
+        (131072, 64, 2048),
+        (500000, 64, 7814),
+        (1000000, 64, 15626),
+        (500000, 32, 15628),
+        (16, 16, 8),
+        (500000, 128, 3907),
+    ],
+)
+def test_mla_block_table_width_uses_128_token_alignment(
+    seq_len, page_size, expected_pages
+):
+    assert (
+        attention_routine._aligned_mla_num_pages_per_seq(seq_len, page_size)
+        == expected_pages
+    )
 
 
 @pytest.mark.parametrize("batch_size", [16, 32])
