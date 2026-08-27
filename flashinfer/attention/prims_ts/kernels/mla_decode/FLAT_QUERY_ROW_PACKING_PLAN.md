@@ -2351,3 +2351,58 @@ is under `resident_wave_factorization_candidate_gpu_3d9f`,
 Next, commit the runtime and tests, run the complete 284-case process-isolated
 correctness file at that exact clean checkpoint, and rerun the full 72-run
 TRTLLM-GEN/CuTeDSL/PrimTS issue matrix from zero under the clean commit.
+
+## 38. Clean-checkpoint correctness and final three-backend comparison
+
+Runtime/test/documentation checkpoint
+`f7e2b77067ca392abd44a6eb462bbe1f5990c9a4` contains the resident-wave policy
+from section 37.  The worktree was clean and the runtime file hashes exactly
+matched the dirty-candidate campaign before final validation.
+
+The complete process-isolated correctness file passed 284/284 on B200 UUID
+`GPU-3d9f88bc-09e1-a0f3-30ed-ab4dd0fbc5ab`: 265 main cases, 10 packed
+non-power cases, and 9 zero-Q/runtime-K tail cases.  Every pytest process
+exited zero with `CUDA_LAUNCH_BLOCKING=1` and a dedicated JIT cache.  The first
+runner summary accidentally included its own tee'd log and doubled the parsed
+count to 568; the retained reconciler restricts counting to the three named
+disjoint logs, verifies each saved exit code and 265/10/9 count, and reports
+status zero with 284 selected passes.  Evidence is under
+`full_validation_f7e2b770_gpu_3d9f_process_isolated`.
+
+The final issue-#4390 matrix then reran all 72 backends from zero at the same
+clean checkpoint.  This table follows the requested eager/CUDA-graph layout
+and adds public-auto PrimTS; values are median microseconds per call and lower
+is faster.
+
+| KV dtype | Q length | Context length | TRTLLM-Gen Eager | TRTLLM-Gen CUDA Graph | CuTe DSL Eager | CuTe DSL CUDA Graph | PrimTS Eager | PrimTS CUDA Graph |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| BF16 | 1 | 131,072 | 66.5 | 50.3 | 76.8 | 54.2 | 54.2 | 40.9 |
+| BF16 | 1 | 500,000 | 154.5 | 142.2 | 191.4 | 178.0 | 132.2 | 121.9 |
+| BF16 | 1 | 1,000,000 | 268.3 | 267.0 | 351.2 | 351.1 | 238.4 | 228.3 |
+| BF16 | 8 | 131,072 | 213.1 | 198.3 | 74.8 | 61.2 | 58.4 | 44.8 |
+| BF16 | 8 | 500,000 | 745.4 | 729.4 | 208.0 | 199.5 | 140.4 | 146.8 |
+| BF16 | 8 | 1,000,000 | 1,460.3 | 1,444.9 | 386.0 | 389.4 | 251.0 | 283.4 |
+| FP8 | 1 | 131,072 | 45.0 | 32.1 | 75.8 | 31.7 | 33.7 | 22.3 |
+| FP8 | 1 | 500,000 | 88.1 | 71.4 | 99.3 | 92.8 | 74.8 | 57.5 |
+| FP8 | 1 | 1,000,000 | 138.3 | 123.5 | 175.1 | 181.5 | 119.7 | 101.5 |
+| FP8 | 8 | 131,072 | 106.4 | 96.8 | 69.6 | 35.0 | 39.9 | 30.1 |
+| FP8 | 8 | 500,000 | 353.2 | 352.2 | 103.5 | 92.8 | 81.0 | 75.4 |
+| FP8 | 8 | 1,000,000 | 686.1 | 725.3 | 179.2 | 191.5 | 134.1 | 155.5 |
+
+Every run used B1, Hq12/Hkv1, D512+64, page64, exact logical K, refcheck,
+20 warmups, 100 CUDA-event iterations, seed 0, and a fresh backend process.
+PrimTS was fastest in all 24 eager/graph cells.  Q1 retained 1CTA M16/S128;
+Q8 selected 2CTA M128/S64 with the parallel G8 reducer.  Final gates passed
+with zero failures:
+
+- CuTe/new-PrimTS geometric mean `1.439822x`, minimum `1.163224x` against the
+  `0.94x` point floor;
+- old-PrimTS/new-PrimTS geometric mean `1.178201x`, minimum `0.998102x`
+  against the `0.97x` no-regression floor.
+
+The complete CSVs, logs, completion markers, exact analyzer output, issue-style
+table, and provenance are under `issue4390_matrix_f7e2b770_gpu_3d9f`.  The
+requested migration and primary acceptance plan are complete.  The diagnostic
+S64/G4 reducer result from section 37 remains an explicitly separate follow-up
+requiring its own reducer-wide qualification; no narrow production exception
+was introduced here.
