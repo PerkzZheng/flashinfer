@@ -1319,7 +1319,13 @@ class FmhaDecodeConfig:
             raise ValueError("block-sparse does not support split-KV reduction")
 
     def compile_signature(self) -> tuple[tuple[str, object], ...]:
-        """Freeze every static config field for a cached compiled callable."""
+        """Key and reconstruct the batch-dynamic callable in the decode cache.
+
+        The public planner can reuse one compiled topology across batch sizes.
+        Keeping the complete static config in the cache key prevents a callable
+        compiled for one scheduler, reduction, or tile layout from being reused
+        by another.
+        """
 
         return tuple(
             (config_field.name, getattr(self, config_field.name))

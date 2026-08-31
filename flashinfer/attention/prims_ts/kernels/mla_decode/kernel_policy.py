@@ -52,152 +52,6 @@ MlaKernelName = MlaKernelPolicy
 
 
 @dataclass(frozen=True)
-class MlaAutomaticWork:
-    """Candidate topology facts consumed by automatic family selection."""
-
-    one_cta_work: int | None = None
-    one_cta_capacity: int | None = None
-    two_cta_cluster_work: int | None = None
-    two_cta_cluster_capacity: int | None = None
-    allow_equal_wave_crossover: bool = False
-    one_cta_tile_size_q: int | None = None
-    one_cta_split_kv: int | None = None
-    two_cta_split_kv: int | None = None
-    seq_len_k: int | None = None
-    qkv_dtype: str | None = None
-    one_cta_kernel_variant: str | None = None
-
-
-_SMALL_FLAT_2CTA_WAVE_FILL_NUMERATOR = 5
-_SMALL_FLAT_2CTA_WAVE_FILL_DENOMINATOR = 6
-_SMALL_FLAT_2CTA_MAX_REFERENCE_SPLIT = 4
-# Bound each 2CTA producer's K128 mainloop independently of the 1CTA
-# split-rounding policy; the two decisions model different task graphs.
-_SMALL_FLAT_DIRECT_BF16_MAX_LOCAL_K_TILES = 16
-_SMALL_FLAT_DIRECT_FP8_MAX_LOCAL_K_TILES = 18
-_SMALL_FLAT_COMPACT_BF16_MIN_LOCAL_K_TILES = 5
-_SMALL_FLAT_COMPACT_BF16_MAX_LOCAL_K_TILES = 10
-_SMALL_FLAT_COMPACT_FP8_MIN_LOCAL_K_TILES = 9
-_SMALL_FLAT_COMPACT_FP8_MAX_LOCAL_K_TILES = 13
-
-
-def _retains_normalized_producer_work(
-    *,
-    candidate_work: int,
-    candidate_capacity: int,
-    reference_work: int,
-    reference_capacity: int,
-) -> bool:
-    """Return whether candidate occupancy retains five sixths of reference."""
-
-    return (
-        candidate_work * reference_capacity * _SMALL_FLAT_2CTA_WAVE_FILL_DENOMINATOR
-        >= reference_work * candidate_capacity * _SMALL_FLAT_2CTA_WAVE_FILL_NUMERATOR
-    )
-
-
-def _prefer_small_flat_2cta(
-    num_heads: int,
-    seq_len_q: int,
-    work: MlaAutomaticWork,
-) -> bool:
-    """Return whether a compact 2CTA topology qualifies for automatic use."""
-
-    total_q_rows = num_heads * seq_len_q
-    if (
-        not 1 <= total_q_rows <= 64
-        or work.one_cta_tile_size_q not in SUPPORTED_TILE_SIZE_Q
-        or total_q_rows > work.one_cta_tile_size_q
-    ):
-        return False
-    inputs = (
-        work.one_cta_split_kv,
-        work.two_cta_split_kv,
-        work.seq_len_k,
-        work.one_cta_work,
-        work.one_cta_capacity,
-        work.two_cta_cluster_work,
-        work.two_cta_cluster_capacity,
-    )
-    if any(value is None for value in inputs):
-        return False
-    if any(int(value) <= 0 for value in inputs):
-        raise ValueError("automatic MLA topology inputs must be positive")
-
-    one_cta_split_kv = work.one_cta_split_kv
-    two_cta_split_kv = work.two_cta_split_kv
-    seq_len_k = work.seq_len_k
-    one_cta_work = work.one_cta_work
-    one_cta_capacity = work.one_cta_capacity
-    two_cta_cluster_work = work.two_cta_cluster_work
-    two_cta_cluster_capacity = work.two_cta_cluster_capacity
-    assert one_cta_split_kv is not None
-    assert two_cta_split_kv is not None
-    assert seq_len_k is not None
-    assert one_cta_work is not None
-    assert one_cta_capacity is not None
-    assert two_cta_cluster_work is not None
-    assert two_cta_cluster_capacity is not None
-    if one_cta_split_kv <= 1:
-        return False
-    # Limit this crossover to direct output and the bounded reference-reducer
-    # loop. Equal producer-wave work does not model the increasing reduction
-    # cost of deeper split domains.
-    if (
-        two_cta_split_kv >= one_cta_split_kv
-        or two_cta_split_kv > _SMALL_FLAT_2CTA_MAX_REFERENCE_SPLIT
-    ):
-        return False
-    if (
-        two_cta_cluster_work * _SMALL_FLAT_2CTA_WAVE_FILL_DENOMINATOR
-        < two_cta_cluster_capacity * _SMALL_FLAT_2CTA_WAVE_FILL_NUMERATOR
-        or not _retains_normalized_producer_work(
-            candidate_work=two_cta_cluster_work,
-            candidate_capacity=two_cta_cluster_capacity,
-            reference_work=one_cta_work,
-            reference_capacity=one_cta_capacity,
-        )
-    ):
-        return False
-
-    total_k_tiles = (seq_len_k + MlaConfig.tile_size_kv - 1) // MlaConfig.tile_size_kv
-    # A 2CTA cluster divides each split rank across two producer CTAs. Measure
-    # the candidate's actual per-CTA mainloop instead of inferring it from the
-    # independently selected 1CTA split count.
-    candidate_ranks = 2 * two_cta_split_kv
-    local_k_tiles = (total_k_tiles + candidate_ranks - 1) // candidate_ranks
-    if two_cta_split_kv == 1:
-        # Direct output has no reducer.  Its crossover is mainloop depth within
-        # the physical task graph: BF16 remains favorable through 16 local K128
-        # tiles, while the FP8 Keeps producer crosses earlier.  FP8 Swaps does
-        # not have enough per-CTA row work to offset 2CTA coordination.
-        if work.qkv_dtype == "bf16":
-            return local_k_tiles <= _SMALL_FLAT_DIRECT_BF16_MAX_LOCAL_K_TILES
-        return (
-            work.qkv_dtype == "e4m3"
-            and work.one_cta_kernel_variant == "keeps_mma_ab"
-            and local_k_tiles <= _SMALL_FLAT_DIRECT_FP8_MAX_LOCAL_K_TILES
-        )
-
-    # The compact reducer is eligible only while each 2CTA producer owns a
-    # bounded local mainloop. BF16 reaches that window sooner; FP8 participates
-    # only for the Keeps task graph, where its parallel reducer has more work.
-    two_cta_is_power_of_two = two_cta_split_kv & (two_cta_split_kv - 1) == 0
-    if work.qkv_dtype == "bf16":
-        min_local_k_tiles = _SMALL_FLAT_COMPACT_BF16_MIN_LOCAL_K_TILES
-        max_local_k_tiles = _SMALL_FLAT_COMPACT_BF16_MAX_LOCAL_K_TILES
-    elif work.qkv_dtype == "e4m3" and work.one_cta_kernel_variant == "keeps_mma_ab":
-        min_local_k_tiles = _SMALL_FLAT_COMPACT_FP8_MIN_LOCAL_K_TILES
-        max_local_k_tiles = _SMALL_FLAT_COMPACT_FP8_MAX_LOCAL_K_TILES
-    else:
-        return False
-    return (
-        min_local_k_tiles <= local_k_tiles <= max_local_k_tiles
-        and two_cta_is_power_of_two
-    )
-
-
-@dataclass(frozen=True)
 class MlaKernelDecision:
     """Python-side result of explicit MLA TS kernel selection.
 
@@ -235,67 +89,28 @@ def normalize_mla_kernel_policy(policy: str) -> MlaKernelPolicy:
 def select_default_mla_kernel_policy(
     num_heads: int,
     seq_len_q: int,
-    automatic_work: MlaAutomaticWork | None = None,
+    *,
+    one_cta_split_kv: int | None = None,
+    two_cta_split_kv: int | None = None,
 ) -> MlaKernelPolicy:
-    """Choose the default TS MLA family from work and resident capacity.
+    """Choose a native family, preferring direct output over split reduction.
 
-    Logical Q rows up to 64 normally retain the throughput-latency family. A
-    one-tile flat launch uses 2CTA when its direct-output or smaller reference
-    reduction retains the 1CTA candidate's normalized producer-wave work.
-    Larger shapes normally retain 2CTA, but an automatic caller may provide
-    projected work for both candidates. The underfilled-grid probe requires
-    the complete 2CTA launch to occupy at most one quarter of its resident cluster
-    wave and the 1CTA candidate to improve normalized occupancy. A candidate
-    with a separately proven one-wave local-work bound may use the whole 2CTA
-    wave and accept equal normalized occupancy. No device-name whitelist
-    participates in any decision.
+    The M64 1CTA schedule owns one native tile of logical query rows. Within
+    that tile, 2CTA is selected only when it can write the final output directly
+    while 1CTA would require a split-K reduction. This compares task-graph
+    structure; it does not contain shape, dtype, or measured crossover tables.
     """
 
-    work = automatic_work or MlaAutomaticWork()
+    if (one_cta_split_kv is None) != (two_cta_split_kv is None):
+        raise ValueError("automatic MLA split topology must be provided as a pair")
+    if one_cta_split_kv is not None:
+        if one_cta_split_kv <= 0 or two_cta_split_kv is None or two_cta_split_kv <= 0:
+            raise ValueError("automatic MLA split counts must be positive")
 
-    # When one physical 1CTA tile needs a short-K standalone reducer, a compact
-    # 2CTA wave can remove or shrink that reducer without losing wave fill.
-    if num_heads * seq_len_q <= 64:
-        if _prefer_small_flat_2cta(
-            num_heads,
-            seq_len_q,
-            work,
-        ):
-            return "throughput_2cta"
-        return "throughput_latency_1cta"
-
-    occupancy_inputs = (
-        work.one_cta_work,
-        work.one_cta_capacity,
-        work.two_cta_cluster_work,
-        work.two_cta_cluster_capacity,
-    )
-    if any(value is None for value in occupancy_inputs):
-        return "throughput_2cta"
-    if any(int(value) <= 0 for value in occupancy_inputs):
-        raise ValueError("automatic MLA family work and capacities must be positive")
-
-    one_cta_work = work.one_cta_work
-    one_cta_capacity = work.one_cta_capacity
-    two_cta_cluster_work = work.two_cta_cluster_work
-    two_cta_cluster_capacity = work.two_cta_cluster_capacity
-    assert one_cta_work is not None
-    assert one_cta_capacity is not None
-    assert two_cta_cluster_work is not None
-    assert two_cta_cluster_capacity is not None
-    if work.allow_equal_wave_crossover:
-        two_cta_underfilled = two_cta_cluster_work <= two_cta_cluster_capacity
-        one_cta_has_more_occupancy = (
-            one_cta_work * two_cta_cluster_capacity
-            >= two_cta_cluster_work * one_cta_capacity
-        )
-    else:
-        two_cta_underfilled = two_cta_cluster_work * 4 <= two_cta_cluster_capacity
-        one_cta_has_more_occupancy = (
-            one_cta_work * two_cta_cluster_capacity
-            > two_cta_cluster_work * one_cta_capacity
-        )
-    if two_cta_underfilled and one_cta_has_more_occupancy:
+    if num_heads * seq_len_q <= max(SUPPORTED_TILE_SIZE_Q):
+        if one_cta_split_kv is not None:
+            if one_cta_split_kv > 1 and two_cta_split_kv == 1:
+                return "throughput_2cta"
         return "throughput_latency_1cta"
     return "throughput_2cta"
 
@@ -304,7 +119,9 @@ def resolve_mla_kernel_policy(
     policy: str | None,
     num_heads: int,
     seq_len_q: int,
-    automatic_work: MlaAutomaticWork | None = None,
+    *,
+    one_cta_split_kv: int | None = None,
+    two_cta_split_kv: int | None = None,
 ) -> tuple[MlaKernelPolicy, str]:
     """Resolve an explicit or automatic TS MLA kernel policy."""
 
@@ -313,7 +130,8 @@ def resolve_mla_kernel_policy(
             select_default_mla_kernel_policy(
                 num_heads,
                 seq_len_q,
-                automatic_work,
+                one_cta_split_kv=one_cta_split_kv,
+                two_cta_split_kv=two_cta_split_kv,
             ),
             "auto",
         )

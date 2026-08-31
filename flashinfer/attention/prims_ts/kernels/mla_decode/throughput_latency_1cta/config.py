@@ -31,7 +31,7 @@ from math import ceil
 from typing import Any
 
 from ....split_kv_mode_policy import select_split_kv_modes
-from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.query import FlatQueryTileLayout
 
@@ -40,36 +40,6 @@ from ..helpers.query import FlatQueryTileLayout
 # the swaps-MMA-AB schedule; tile sizes 32/64 are supported for explicit or
 # keeps-MMA-AB profiles.
 SUPPORTED_TILE_SIZE_Q = (8, 16, 32, 64)
-
-# Automatic profile search starts with the low-row Swaps-MMA-AB variants. Flat
-# query-row selection may supply an M32 or M64 target before profile resolution.
-AUTO_SWAPS_TILE_SIZE_Q = (8, 16)
-
-# The Swaps task graph consumes two K128 instructions per steady-state step.
-# Keep it while each projected CTA owns at most three such steps; longer local
-# mainloops use the Keeps task graph.
-SWAPS_MMA_AB_KV_STEP_TOKENS = 256
-SWAPS_MMA_AB_MAX_LOCAL_K_STEPS = 3
-
-# A promoted full-row tile trades the small-M latency schedule for one KV scan.
-# Require its complete producer decomposition to fill at least five sixths of
-# a resident wave while retaining M8/M16 for short underfilled work.
-FULL_ROW_PROMOTION_WAVE_NUMERATOR = 5
-FULL_ROW_PROMOTION_WAVE_DENOMINATOR = 6
-
-# Small Swaps Q tiles expose less useful row work per producer CTA than the
-# M32/M64 schedules.  Keep their single-digit split counts occupancy-first;
-# once at least 16 K partitions feed the standalone reducer, power-of-two
-# rounding is permitted across M8/M16 and BF16/FP8. The common five-sixths wave
-# guard below still decides whether the rounded producer grid is sufficiently
-# full.
-SMALL_Q_TILE_SPLIT_ROUNDING_MIN_SPLITS = 16
-
-# Reducing a split count trades producer-rank depth for a smaller standalone
-# reducer. Bound that trade by each task graph's local-mainloop window; beyond
-# it, retain the more balanced unrounded producer decomposition.
-AUTO_SPLIT_ROUND_BF16_MAX_LOCAL_K_TILES = 10
-AUTO_SPLIT_ROUND_FP8_MAX_LOCAL_K_TILES = 13
 
 # SM100A exposes 227 KiB of dynamic SMEM.  Keep a small TS metadata reservation
 # when deciding whether the automatic cluster-reduction scratch can fit.
@@ -537,383 +507,51 @@ def validate_max_active_clusters(max_active_clusters: int) -> int:
 def tile_size_q_for_heads(num_heads_q: int) -> int:
     """Choose the automatic 1CTA Q tile from the physical row extent."""
 
-    # H8 gets a q8 tile, H16/H32 use the q16 swaps-MMA-AB schedule, and wider
-    # effective head tiles use the q64 keeps-MMA-AB schedule.
-    if num_heads_q <= 8:
-        return 8
-    if num_heads_q <= 32:
-        return 16
-    return 64
-
-
-def use_swaps_mma_ab_mla_gen_kernel(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    multi_processor_count: int,
-) -> bool:
-    """Return whether MLA generation should use swaps-MMA-AB.
-
-    Estimate the number of KV CTAs using the task graph's two-K128 step, then
-    use Swaps while each CTA owns at most three steps and the q16 row grid fits
-    within one resident wave.
-    """
-
-    num_ctas = batch_size * ceil(num_heads_q * seq_len_q / 16)
-    if num_ctas <= 0:
-        return False
-
-    max_num_ctas_per_seq_kv = ceil(seq_len_kv / SWAPS_MMA_AB_KV_STEP_TOKENS)
-    num_ctas_per_seq_kv = min(
-        max_num_ctas_per_seq_kv,
-        max(1, multi_processor_count // num_ctas),
-    )
-    seq_len_per_cta_kv = ceil(seq_len_kv / num_ctas_per_seq_kv)
-    local_k_steps = ceil(seq_len_per_cta_kv / SWAPS_MMA_AB_KV_STEP_TOKENS)
-    return (
-        local_k_steps <= SWAPS_MMA_AB_MAX_LOCAL_K_STEPS
-        and num_ctas <= multi_processor_count
+    return auto_tile_size_q_for_mla_gen(
+        num_heads_q=num_heads_q,
+        seq_len_q=1,
     )
 
 
 def auto_tile_size_q_for_mla_gen(
     *,
-    batch_size: int,
     num_heads_q: int,
     seq_len_q: int,
-    seq_len_kv: int,
-    multi_processor_count: int,
 ) -> int:
-    """Select the default 1CTA MLA generation Q tile.
+    """Choose the smallest native M tile covering the flat query rows.
 
-    When the normal family choice is q16, prefer a full q32 tile if it is the
-    smallest tile that collapses the q16 work from multiple CTA waves to one
-    without leaving capacity for a split-KV replica.  This occupancy transition
-    refines swaps-MMA-AB only; it must not replace a q64 keeps-MMA-AB choice.
+    Shapes wider than the largest 1CTA tile use repeated M64 tiles. The choice
+    depends only on query geometry, so one compiled topology is reusable across
+    runtime batch extents and K/V lengths.
     """
 
     total_q_rows = num_heads_q * seq_len_q
-    if total_q_rows <= 32:
-        base_tile_size_q = 8 if total_q_rows <= 8 else 16
-    elif use_swaps_mma_ab_mla_gen_kernel(
-        batch_size=batch_size,
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        multi_processor_count=multi_processor_count,
-    ):
-        base_tile_size_q = 16
-    else:
-        base_tile_size_q = 64
-
-    q16_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 16)
-    q32_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 32)
-    full_q32 = num_heads_q * seq_len_q >= 32
-    if (
-        base_tile_size_q == 16
-        and full_q32
-        and q16_work > multi_processor_count
-        and q32_work <= multi_processor_count
-        and multi_processor_count // q32_work == 1
-    ):
-        return 32
-    return base_tile_size_q
-
-
-def projected_auto_profile_split_kv(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    qkv_dtype: str,
-    tile_size_q: int,
-    max_active_clusters: int,
-) -> int:
-    """Project the automatic split count for one explicit Q tile."""
-
-    base_work = q_tile_work_count(
-        batch_size,
-        num_heads_q,
-        seq_len_q,
-        tile_size_q,
-    )
-    return select_auto_split_kv(
-        seq_len_kv=seq_len_kv,
-        qkv_dtype=qkv_dtype,
-        tile_size_q=tile_size_q,
-        base_work=base_work,
-        target_work=max_active_clusters,
-    )
-
-
-def projected_auto_profile_producer_work(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    qkv_dtype: str,
-    tile_size_q: int,
-    max_active_clusters: int,
-) -> int:
-    """Project producer CTAs after automatic split-KV and V slicing."""
-
-    base_work = q_tile_work_count(
-        batch_size,
-        num_heads_q,
-        seq_len_q,
-        tile_size_q,
-    )
-    split_kv = projected_auto_profile_split_kv(
-        batch_size=batch_size,
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        qkv_dtype=qkv_dtype,
-        tile_size_q=tile_size_q,
-        max_active_clusters=max_active_clusters,
-    )
-    work_after_kv = base_work * split_kv
-    head_dim_split = head_dim_split_for_work(
-        work_after_kv=work_after_kv,
-        target_work=max_active_clusters,
-        latent_dim=MlaConfig.latent_dim,
-    )
-    return work_after_kv * head_dim_split
-
-
-def should_use_short_bf16_m32_flat_query_tile(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    qkv_dtype: str,
-    max_active_clusters: int,
-) -> bool:
-    """Keep the smallest one-scan tile for short BF16 multiwave direct work.
-
-    The M32 Swaps schedule is useful only when 17--32 logical rows already
-    expose more than one resident wave without split-KV.  Underfilled grids,
-    longer local mainloops, and FP8 retain the M64 Keeps schedule.
-    """
-
-    total_q_rows = num_heads_q * seq_len_q
-    steady_step_tokens = MlaConfig.tile_size_kv * MlaConfig.num_insts_kv
-    steady_steps = ceil(seq_len_kv / steady_step_tokens)
-    if (
-        qkv_dtype != "bf16"
-        or not 16 < total_q_rows <= 32
-        or steady_steps > SWAPS_MMA_AB_MAX_LOCAL_K_STEPS
-    ):
-        return False
-
-    m32_base_work = q_tile_work_count(
-        batch_size,
-        num_heads_q,
-        seq_len_q,
-        32,
-    )
-    if m32_base_work <= max_active_clusters:
-        return False
-    return (
-        projected_auto_profile_split_kv(
-            batch_size=batch_size,
-            num_heads_q=num_heads_q,
-            seq_len_q=seq_len_q,
-            seq_len_kv=seq_len_kv,
-            qkv_dtype=qkv_dtype,
-            tile_size_q=32,
-            max_active_clusters=max_active_clusters,
-        )
-        == 1
-    )
-
-
-def throughput_full_flat_query_tile_size_q(total_q_rows: int) -> int:
-    """Return the one-scan tile for a promoted flat-row launch.
-
-    M64 Keeps is the full-row schedule for 17--64 rows. Smaller row products
-    retain their M8/M16 latency tiles; the bounded short-work M32 choice is
-    handled separately.
-    """
-
-    if 16 < total_q_rows <= 64:
-        return 64
-    return tile_size_q_for_flat_rows(total_q_rows)
-
-
-def should_promote_full_flat_query_tile(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    qkv_dtype: str,
-    current_tile_size_q: int,
-    max_active_clusters: int,
-) -> bool:
-    """Return whether one full flat-row tile has enough throughput work."""
-
-    total_q_rows = num_heads_q * seq_len_q
-    if total_q_rows > 64:
-        return False
-    full_row_tile_size_q = throughput_full_flat_query_tile_size_q(total_q_rows)
-    if full_row_tile_size_q <= current_tile_size_q:
-        return False
-    producer_work = projected_auto_profile_producer_work(
-        batch_size=batch_size,
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        qkv_dtype=qkv_dtype,
-        tile_size_q=full_row_tile_size_q,
-        max_active_clusters=max_active_clusters,
-    )
-    return (
-        producer_work * FULL_ROW_PROMOTION_WAVE_DENOMINATOR
-        >= max_active_clusters * FULL_ROW_PROMOTION_WAVE_NUMERATOR
-    )
-
-
-def prefer_smaller_swaps_tile_for_resident_work(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    qkv_dtype: str,
-    current_tile_size_q: int,
-    max_active_clusters: int,
-) -> int:
-    """Use a smaller Swaps tile only when it adds resident producer work.
-
-    Once the current producer already fills a wave, more Q tiles only repeat
-    the KV scan.  For an underfilled launch, compare complete split-KV and V
-    decompositions and choose a smaller supported Swaps tile only on a strict
-    work increase.  Ties retain the larger tile.
-    """
-
-    if current_tile_size_q not in AUTO_SWAPS_TILE_SIZE_Q:
-        return current_tile_size_q
-    current_work = projected_auto_profile_producer_work(
-        batch_size=batch_size,
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        qkv_dtype=qkv_dtype,
-        tile_size_q=current_tile_size_q,
-        max_active_clusters=max_active_clusters,
-    )
-    if current_work >= max_active_clusters:
-        return current_tile_size_q
-
-    selected_tile_size_q = current_tile_size_q
-    selected_work = current_work
-    for candidate_tile_size_q in reversed(AUTO_SWAPS_TILE_SIZE_Q):
-        if candidate_tile_size_q >= current_tile_size_q:
-            continue
-        candidate_work = projected_auto_profile_producer_work(
-            batch_size=batch_size,
-            num_heads_q=num_heads_q,
-            seq_len_q=seq_len_q,
-            seq_len_kv=seq_len_kv,
-            qkv_dtype=qkv_dtype,
-            tile_size_q=candidate_tile_size_q,
-            max_active_clusters=max_active_clusters,
-        )
-        if candidate_work > selected_work:
-            selected_tile_size_q = candidate_tile_size_q
-            selected_work = candidate_work
-    return selected_tile_size_q
+    for tile_size_q in SUPPORTED_TILE_SIZE_Q:
+        if total_q_rows <= tile_size_q:
+            return tile_size_q
+    return SUPPORTED_TILE_SIZE_Q[-1]
 
 
 def resolve_auto_flat_query_launch_shape(
     *,
-    batch_size: int,
     num_heads_q: int,
     seq_len_q: int,
-    seq_len_kv: int,
-    qkv_dtype: str,
-    max_active_clusters: int,
 ) -> FlatQueryLaunchShape:
     """Resolve the public 1CTA profile tile and flat-row launch extent.
 
-    Tile selection depends on the flat logical row count and projected physical
-    work.  Equivalent H/Q factorizations therefore resolve to the same physical
-    profile when their runtime work is otherwise identical.
+    Equivalent H/Q factorizations resolve to the same physical profile when
+    their runtime work is otherwise identical.
     """
 
     tile_size_q = auto_tile_size_q_for_mla_gen(
-        batch_size=batch_size,
         num_heads_q=num_heads_q,
         seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        multi_processor_count=max_active_clusters,
     )
-    tile_size_q = prefer_smaller_swaps_tile_for_resident_work(
-        batch_size=batch_size,
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        qkv_dtype=qkv_dtype,
-        current_tile_size_q=tile_size_q,
-        max_active_clusters=max_active_clusters,
-    )
-    if should_use_short_bf16_m32_flat_query_tile(
-        batch_size=batch_size,
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        qkv_dtype=qkv_dtype,
-        max_active_clusters=max_active_clusters,
-    ):
-        tile_size_q = 32
-    elif should_promote_full_flat_query_tile(
-        batch_size=batch_size,
-        num_heads_q=num_heads_q,
-        seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        qkv_dtype=qkv_dtype,
-        current_tile_size_q=tile_size_q,
-        max_active_clusters=max_active_clusters,
-    ):
-        tile_size_q = throughput_full_flat_query_tile_size_q(num_heads_q * seq_len_q)
-
     return FlatQueryLaunchShape.for_tile(
         num_heads_q,
         seq_len_q,
         tile_size_q,
     )
-
-
-def min_heuristic_tile_size_q(num_heads_q: int) -> int:
-    """Return the smallest Q tile considered after split-KV is exhausted."""
-
-    if num_heads_q <= 8:
-        return 8
-    return 16
-
-
-def smaller_tile_size_q_candidates(
-    num_heads_q: int, tile_size_q: int
-) -> tuple[int, ...]:
-    """Return smaller Q tiles considered after split-KV in heuristic order."""
-
-    min_tile_size_q = min_heuristic_tile_size_q(num_heads_q)
-    candidates = []
-    # Generic split-exhaustion search uses the low-row Swaps variants. M32 is
-    # selected only by the full-row multiwave policy above.
-    for candidate in reversed(AUTO_SWAPS_TILE_SIZE_Q):
-        if candidate >= tile_size_q or candidate < min_tile_size_q:
-            continue
-        if num_heads_q > candidate and num_heads_q % candidate != 0:
-            continue
-        candidates.append(candidate)
-    return tuple(candidates)
 
 
 def profile_name(
@@ -935,103 +573,31 @@ def q_tile_work_count(
     return batch_size * ceil(num_heads_q * seq_len_q / tile_size_q)
 
 
-def automatic_split_kv_step_tokens(
-    *, qkv_dtype: str, tile_size_q: int, base_work: int
-) -> int:
-    """Return the target KV-token cadence limiting automatic split count.
+def automatic_split_kv_step_tokens(tile_size_q: int) -> int:
+    """Return one steady-state K step for the selected task graph."""
 
-    The base steady-state step consumes two 128-token KV tiles.  FP8 q8 keeps
-    two such steps per split, while FP8 q16 uses four once the Q grid already
-    exposes more than four CTAs. For non-divisible K, the final balanced split
-    can own less than the target. BF16 q8 uses the common one-step cadence;
-    a two-CTA q16 grid uses two steps per split.
-    """
-
-    steady_step_tokens = MlaConfig.tile_size_kv * MlaConfig.num_insts_kv
-    if qkv_dtype == "e4m3":
-        if tile_size_q <= 8 or (tile_size_q == 16 and base_work <= 4):
-            return steady_step_tokens * 2
-        if tile_size_q == 16:
-            return steady_step_tokens * 4
-        return steady_step_tokens
-
-    if tile_size_q == 16 and base_work == 2:
-        return steady_step_tokens * 2
-    return steady_step_tokens
+    num_kv_insts = 1 if tile_size_q >= 64 else MlaConfig.num_insts_kv
+    return MlaConfig.tile_size_kv * num_kv_insts
 
 
 def select_auto_split_kv(
     *,
     seq_len_kv: int,
-    qkv_dtype: str,
     tile_size_q: int,
     base_work: int,
     target_work: int,
 ) -> int:
-    """Choose the automatic split count from K work and resident capacity."""
+    """Choose the smallest split count preserving the target K-step depth."""
 
-    split_kv_step_tokens = automatic_split_kv_step_tokens(
-        qkv_dtype=qkv_dtype,
-        tile_size_q=tile_size_q,
-        base_work=base_work,
-    )
+    split_kv_step_tokens = automatic_split_kv_step_tokens(tile_size_q)
     max_split_kv = max(1, ceil(seq_len_kv / split_kv_step_tokens))
-    split_kv = min(max_split_kv, max(1, target_work // base_work))
-    rounded_split_kv = round_auto_split_kv_for_wave(
-        split_kv=split_kv,
-        base_work=base_work,
-        target_work=target_work,
-        tile_size_q=tile_size_q,
+    split_kv = min(
+        max_split_kv,
+        max(1, target_work // base_work),
+        MAX_MLA_SPLITS_KV,
     )
-    if (
-        rounded_split_kv < split_kv
-        and split_kv < SMALL_Q_TILE_SPLIT_ROUNDING_MIN_SPLITS
-    ):
-        total_k_tiles = ceil(seq_len_kv / MlaConfig.tile_size_kv)
-        original_local_k_tiles = ceil(total_k_tiles / split_kv)
-        rounded_local_k_tiles = ceil(total_k_tiles / rounded_split_kv)
-        max_rounded_local_k_tiles = (
-            AUTO_SPLIT_ROUND_FP8_MAX_LOCAL_K_TILES
-            if qkv_dtype == "e4m3"
-            else AUTO_SPLIT_ROUND_BF16_MAX_LOCAL_K_TILES
-        )
-        # Power-of-two reducers tolerate the normal one-tile balance slack.
-        # Do not buy a smaller reducer outside the task graph's bounded local
-        # mainloop window or by adding two or more tiles to the busiest rank.
-        if (
-            rounded_local_k_tiles > max_rounded_local_k_tiles
-            or rounded_local_k_tiles > original_local_k_tiles + 1
-        ):
-            return split_kv
-    return rounded_split_kv
-
-
-def round_auto_split_kv_for_wave(
-    *,
-    split_kv: int,
-    base_work: int,
-    target_work: int,
-    tile_size_q: int,
-) -> int:
-    """Prefer a power-of-two split when it still nearly fills a wave.
-
-    M32/M64 schedules benefit even at small split counts.  M8/M16 schedules
-    retain single-digit splits, where producer occupancy matters more than the
-    smaller standalone-reduction domain.
-    """
-
-    if split_kv <= 1 or is_power_of_two(split_kv):
-        return split_kv
-    if tile_size_q < 32 and split_kv < SMALL_Q_TILE_SPLIT_ROUNDING_MIN_SPLITS:
-        return split_kv
-    rounded_split_kv = 1 << (split_kv.bit_length() - 1)
-    rounded_work = base_work * rounded_split_kv
-    if (
-        rounded_work * FULL_ROW_PROMOTION_WAVE_DENOMINATOR
-        >= target_work * FULL_ROW_PROMOTION_WAVE_NUMERATOR
-    ):
-        return rounded_split_kv
-    return split_kv
+    local_k_steps = ceil(max_split_kv / split_kv)
+    return ceil(max_split_kv / local_k_steps)
 
 
 def is_power_of_two(value: int) -> bool:
@@ -1618,10 +1184,8 @@ def auto_split_profile(
     latent_dim: int,
     max_active_clusters: int,
     tile_size_q: int | None = None,
-    allow_tile_size_q_adjustment: bool = False,
-    qkv_dtype: str = "bf16",
 ) -> MlaProfile | None:
-    """Choose split-KV, then smaller Q tiles, then V head-dim splitting."""
+    """Choose split-KV followed by V head-dimension decomposition."""
 
     max_active_clusters = validate_max_active_clusters(max_active_clusters)
     original_tile_size_q = tile_size_q or tile_size_q_for_heads(num_heads_q)
@@ -1632,39 +1196,18 @@ def auto_split_profile(
 
     split_kv = select_auto_split_kv(
         seq_len_kv=seq_len_kv,
-        qkv_dtype=qkv_dtype,
         tile_size_q=original_tile_size_q,
         base_work=base_work,
         target_work=target_work,
     )
     work_after_kv = base_work * split_kv
-    selected_tile_size_q = original_tile_size_q
-
-    if allow_tile_size_q_adjustment and work_after_kv < target_work:
-        for candidate_tile_size_q in smaller_tile_size_q_candidates(
-            num_heads_q, selected_tile_size_q
-        ):
-            candidate_work = (
-                q_tile_work_count(
-                    batch_size, num_heads_q, seq_len_q, candidate_tile_size_q
-                )
-                * split_kv
-            )
-            selected_tile_size_q = candidate_tile_size_q
-            work_after_kv = candidate_work
-            if work_after_kv >= target_work:
-                break
 
     head_dim_split = head_dim_split_for_work(
         work_after_kv=work_after_kv,
         target_work=target_work,
         latent_dim=latent_dim,
     )
-    if (
-        split_kv == 1
-        and head_dim_split == 1
-        and selected_tile_size_q == original_tile_size_q
-    ):
+    if split_kv == 1 and head_dim_split == 1:
         return None
 
     suffix = "baseline"
@@ -1675,7 +1218,7 @@ def auto_split_profile(
     if split_kv > 1 and head_dim_split > 1:
         suffix = f"{suffix}_hdim{latent_dim // head_dim_split}"
     return MlaProfile(
-        name=profile_name(suffix, num_heads_q, selected_tile_size_q),
+        name=profile_name(suffix, num_heads_q, original_tile_size_q),
         num_ctas_per_seq_kv=split_kv,
         num_ctas_per_head_dim=head_dim_split,
         use_persistent_scheduler=0,
@@ -1683,111 +1226,10 @@ def auto_split_profile(
         use_multi_ctas_kv=int_flag(split_kv > 1),
         use_cluster_reduction=int_flag(split_kv > 1),
         kernel_variant=(
-            "keeps_mma_ab" if selected_tile_size_q >= 64 else "swaps_mma_ab"
+            "keeps_mma_ab" if original_tile_size_q >= 64 else "swaps_mma_ab"
         ),
-        tile_size_q=selected_tile_size_q,
+        tile_size_q=original_tile_size_q,
     )
-
-
-def wave_fill_split_kv(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    latent_dim: int,
-    max_active_clusters: int,
-    tile_size_q: int,
-) -> int:
-    """Choose a joint split-KV/V decomposition for a family-switch probe.
-
-    The probe may use every legal one-step KV split, then derives V sharding
-    with ``head_dim_split_for_work``.  It maximizes resident CTA work without
-    exceeding one 1CTA wave; equal-work candidates prefer fewer KV splits to
-    reduce reduction overhead.  This path is internal to automatic family
-    selection and does not alter explicit split requests.
-    """
-
-    max_active_clusters = validate_max_active_clusters(max_active_clusters)
-    base_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, tile_size_q)
-    if base_work <= 0:
-        raise ValueError("base work must be positive")
-
-    steady_step_tokens = MlaConfig.tile_size_kv * MlaConfig.num_insts_kv
-    max_split_kv = min(
-        max(1, ceil(seq_len_kv / steady_step_tokens)),
-        max(1, max_active_clusters // base_work),
-    )
-    best_split = 1
-    best_score = (-1, 0)
-    for split_kv in range(1, max_split_kv + 1):
-        work_after_kv = base_work * split_kv
-        head_dim_split = head_dim_split_for_work(
-            work_after_kv=work_after_kv,
-            target_work=max_active_clusters,
-            latent_dim=latent_dim,
-        )
-        total_work = work_after_kv * head_dim_split
-        if total_work > max_active_clusters:
-            continue
-        score = (total_work, -split_kv)
-        if score > best_score:
-            best_split = split_kv
-            best_score = score
-    return best_split
-
-
-def bounded_swaps_family_probe_split_kv(
-    *,
-    batch_size: int,
-    num_heads_q: int,
-    seq_len_q: int,
-    seq_len_kv: int,
-    tile_size_q: int,
-    max_active_clusters: int,
-    max_local_k_steps: int = 2,
-) -> int | None:
-    """Return a one-wave split count with bounded local Swaps mainloop work.
-
-    Give the candidate enough splits to keep its local K span within
-    ``max_local_k_steps`` while keeping the complete Q/K grid in one 1CTA wave.
-    If hardware capacity cannot satisfy both constraints, return ``None``.
-
-    V-head-dimension sharding is deliberately not part of this decision.  The
-    shared ``head_dim_split_for_work`` policy derives it after split-KV has
-    been fixed, preserving the launch-policy order of Q tile, K split, then V
-    decomposition.
-    """
-
-    max_active_clusters = validate_max_active_clusters(max_active_clusters)
-    if seq_len_kv <= 0:
-        raise ValueError("seq_len_kv must be positive")
-    validate_tile_size_q(tile_size_q)
-    if max_local_k_steps <= 0:
-        raise ValueError("max_local_k_steps must be positive")
-
-    base_work = q_tile_work_count(
-        batch_size,
-        num_heads_q,
-        seq_len_q,
-        tile_size_q,
-    )
-    if base_work <= 0:
-        raise ValueError("base work must be positive")
-    max_wave_splits = max_active_clusters // base_work
-    if max_wave_splits <= 0:
-        return None
-
-    steady_step_tokens = MlaConfig.tile_size_kv * MlaConfig.num_insts_kv
-    target_split_kv = max(
-        1,
-        ceil(seq_len_kv / (max_local_k_steps * steady_step_tokens)),
-    )
-    split_kv = min(target_split_kv, max_wave_splits)
-    local_steps = ceil(seq_len_kv / (split_kv * steady_step_tokens))
-    if local_steps > max_local_k_steps:
-        return None
-    return split_kv
 
 
 def is_throughput_latency_mla_supported_shape(
@@ -1845,13 +1287,9 @@ def enumerate_throughput_latency_mla_profiles(
     ):
         return ()
 
-    target_work = max_active_clusters
     selected_tile_size_q = tile_size_q or auto_tile_size_q_for_mla_gen(
-        batch_size=batch_size,
         num_heads_q=num_heads_q,
         seq_len_q=seq_len_q,
-        seq_len_kv=seq_len_kv,
-        multi_processor_count=target_work,
     )
     if explicit_split_kv is not None and explicit_split_kv > 0:
         if explicit_split_kv > 1 and explicit_persistent is True:
@@ -1919,8 +1357,6 @@ def enumerate_throughput_latency_mla_profiles(
         latent_dim=latent_dim,
         max_active_clusters=max_active_clusters,
         tile_size_q=selected_tile_size_q,
-        allow_tile_size_q_adjustment=False,
-        qkv_dtype=qkv_dtype,
     )
     if split_profile is not None:
         profiles.append(split_profile)

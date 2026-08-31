@@ -21,32 +21,12 @@ the same explicit configuration structure and output-reduction contract.
 from dataclasses import dataclass
 from typing import Tuple
 
-from ..helpers.constants import SUPPORTED_MLA_PAGE_SIZES
+from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
 # Softmax converts natural-scale scores to exp2 with log2(e).
 LOG2_E = 1.4426950408889634074
-
-# Split-KV reduction allocates one LSE slot per possible split.  Match the
-# standalone reducer's qualified workspace and launch capacity.
-MAX_SPLITS = 128
-
-# Automatic 2CTA split selection fills clusters rather than individual CTAs.
-# A power-of-two split removes reduction/workspace work and enables cheaper
-# compile-time divmods, but only when the rounded cluster grid retains at least
-# five sixths of a resident wave.  This is the same occupancy contract used by
-# the throughput-latency 1CTA split policy.
-SPLIT_ROUNDING_WAVE_NUMERATOR = 5
-SPLIT_ROUNDING_WAVE_DENOMINATOR = 6
-
-# Automatic scheduling retains the compact reference-reducer regime until a
-# resident power-of-two cluster wave has enough local K work to amortize the
-# high-split clustered reducer.  Four K tiles per split is the first common
-# BF16/FP8 point where the fuller producer wave wins; a single tile per split
-# remains launch/reduction bound.
-AUTO_COMPACT_SPLIT_CAP = 32
-AUTO_WAVE_SPLIT_MIN_K_TILES = 4
 
 # The separate reducer follows the public MLA output contract: partial O is
 # stored as BF16 while LSE and the final accumulation remain FP32.  One
@@ -60,7 +40,6 @@ REDUCTION_VECTOR_BYTES = 16
 REDUCTION_VALUES_PER_THREAD = REDUCTION_VECTOR_BYTES * 8 // PARTIAL_O_BITS
 REDUCTION_THREADS_PER_ROW = 512 // REDUCTION_VALUES_PER_THREAD
 REDUCTION_ROWS_PER_CTA = REDUCTION_THREADS_PER_CTA // REDUCTION_THREADS_PER_ROW
-MIN_REDUCTION_ROWS_PER_CTA = REDUCTION_ROWS_PER_CTA // 2
 
 # PV consumes V from SMEM in 32-token K blocks.  Physical KV pages may be
 # smaller or larger, but TMA must assemble this fixed block geometry before
@@ -77,41 +56,6 @@ def ceil_div(a: int, b: int) -> int:
     if b <= 0:
         raise ValueError(f"divisor must be positive, got {b}")
     return (a + b - 1) // b
-
-
-def select_reference_reduction_rows_per_cta(
-    *,
-    batch_size: int,
-    logical_query_rows: int,
-    producer_ctas: int,
-    physical_sm_count: int,
-) -> int:
-    """Choose four rows for a bounded reducer grid with enough producers.
-
-    Splitting an eight-row CTA in half exposes more independent reducer work
-    without changing total row work.  Require at least half a producer wave and
-    retain the same four-wave pressure bound as the Q128 parallel-reducer
-    selector. Larger grids keep the eight-row/512-thread CTA.
-    """
-
-    for value, name in (
-        (batch_size, "batch_size"),
-        (logical_query_rows, "logical_query_rows"),
-        (producer_ctas, "producer_ctas"),
-        (physical_sm_count, "physical_sm_count"),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise TypeError(f"{name} must be an integer")
-        if value <= 0:
-            raise ValueError(f"{name} must be positive")
-
-    narrow_ctas = batch_size * ceil_div(logical_query_rows, MIN_REDUCTION_ROWS_PER_CTA)
-    if (
-        producer_ctas >= ceil_div(physical_sm_count, 2)
-        and narrow_ctas <= physical_sm_count * 4
-    ):
-        return MIN_REDUCTION_ROWS_PER_CTA
-    return REDUCTION_ROWS_PER_CTA
 
 
 def compute_split_kv(
@@ -147,35 +91,7 @@ def compute_split_kv(
     split_heur = min(max_splits, blocks_per_batch)
     k_waves = ceil_div(max_splits, split_heur)
     split_wave_aware = ceil_div(max_splits, k_waves)
-    # A 2CTA split is one producer cluster.  Use the largest power-of-two wave
-    # that fits the host-reported resident cluster capacity only when every
-    # split retains enough K tiles to amortize the clustered reducer.  Shorter
-    # local-K work stays in the compact S<=32 regime.
-    target_clusters = max(1, max_active_blocks // 2)
-    resident_wave_splits = min(
-        MAX_SPLITS,
-        1 << (target_clusters.bit_length() - 1),
-    )
-    compact_split_cap = min(AUTO_COMPACT_SPLIT_CAP, resident_wave_splits)
-    wave_split_is_amortized = (
-        max_splits >= resident_wave_splits * AUTO_WAVE_SPLIT_MIN_K_TILES
-    )
-    auto_split_cap = (
-        resident_wave_splits if wave_split_is_amortized else compact_split_cap
-    )
-    split_kv = min(split_wave_aware, auto_split_cap)
-    if split_kv <= 1 or split_kv & (split_kv - 1) == 0:
-        return split_kv
-
-    rounded_split_kv = 1 << (split_kv.bit_length() - 1)
-    base_clusters = batch_size * num_q_tiles
-    rounded_clusters = base_clusters * rounded_split_kv
-    if (
-        rounded_clusters * SPLIT_ROUNDING_WAVE_DENOMINATOR
-        >= target_clusters * SPLIT_ROUNDING_WAVE_NUMERATOR
-    ):
-        return rounded_split_kv
-    return split_kv
+    return min(split_wave_aware, MAX_MLA_SPLITS_KV)
 
 
 def compute_workspace_size(

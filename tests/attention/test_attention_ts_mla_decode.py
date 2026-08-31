@@ -45,11 +45,9 @@ from flashinfer.attention.prims_ts import (
     batch_decode_mla_with_paged_kv_cache,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.config import (
-    MAX_SPLITS,
     make_mla_decode_config,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.kernel import (
-    MlaDecodeTs,
     build_mla_decode_task_manager,
 )
 from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_2cta.resources import (
@@ -513,32 +511,6 @@ def _case(
     }
 
 
-def _policy(
-    kernel: str,
-    tile_size_q: int,
-    split_kv: int,
-    head_dim_per_cta_v: int,
-    *,
-    cluster: bool,
-    persistent: bool = False,
-    clc: bool = False,
-    schedulers: bool = True,
-) -> dict[str, object]:
-    expected = {
-        "kernel": kernel,
-        "tile_size_q": tile_size_q,
-        "split_kv": split_kv,
-        "head_dim_per_cta_v": head_dim_per_cta_v,
-        "use_cluster_reduction": cluster,
-    }
-    if schedulers:
-        expected.update(
-            use_persistent_scheduler=persistent,
-            use_clc_dynamic_persistent_scheduler=clc,
-        )
-    return expected
-
-
 def _param(
     case_kwargs: dict[str, object],
     expected_policy: dict[str, object],
@@ -561,39 +533,48 @@ def _param(
 _MLA_CASES = (
     _param(
         _case(2, 8, 2048, torch.bfloat16, 32001),
-        _policy("throughput_latency_1cta", 8, 8, 128, cluster=True),
+        {
+            "kernel": "throughput_latency_1cta",
+            "use_cluster_reduction": True,
+        },
         "identity",
         False,
         exercise_all_paths=True,
-        id="M1-bf16-q8-v128-s8-cluster",
+        id="bf16-1cta-cluster-reduction",
     ),
     _param(
         _case(4, 16, 4097, torch.float8_e4m3fn, 32002),
-        _policy("throughput_latency_1cta", 16, 9, 128, cluster=False),
+        {
+            "kernel": "throughput_latency_1cta",
+            "separate_reducer_impl": "parallel",
+        },
         "mixed",
         True,
-        id="M2-fp8-q16-v128-s9-separate",
+        id="fp8-1cta-parallel-reduction",
     ),
     _param(
         _case(128, 32, 2048, torch.bfloat16, 32003),
-        _policy("throughput_latency_1cta", 64, 1, 512, cluster=False),
+        {"kernel": "throughput_latency_1cta", "split_kv": 1},
         None,
         False,
-        id="M3-bf16-q32-v512-direct-one-wave",
+        id="bf16-1cta-direct",
     ),
     _param(
         _case(128, 64, 2048, torch.float8_e4m3fn, 32004),
-        _policy("throughput_latency_1cta", 64, 1, 512, cluster=False),
+        {"kernel": "throughput_latency_1cta", "split_kv": 1},
         "identity",
         False,
-        id="M4-fp8-q64-keeps-direct-static",
+        id="fp8-1cta-direct",
     ),
     _param(
         _case(8, 128, 2048, torch.float8_e4m3fn, 32005),
-        _policy("throughput_2cta", 128, 8, 256, cluster=False),
+        {
+            "kernel": "throughput_2cta",
+            "separate_reducer_impl": "reference",
+        },
         "mixed",
         False,
-        id="M5-fp8-2cta-q128-v256-s8-separate",
+        id="fp8-2cta-reference-reduction",
     ),
     _param(
         _case(
@@ -604,18 +585,24 @@ _MLA_CASES = (
             32006,
             seq_len_q=4,
         ),
-        _policy("throughput_latency_1cta", 64, 17, 256, cluster=False),
+        {
+            "kernel": "throughput_latency_1cta",
+            "separate_reducer_impl": "parallel",
+        },
         "mixed",
         False,
-        id="M6-fp8-sq4-flat-q64-v256-s17",
+        id="fp8-multi-q-1cta-parallel-reduction",
     ),
     _param(
         _case(4, 16, 4097, torch.bfloat16, 32007, seq_len_q=8),
-        _policy("throughput_2cta", 128, 16, 256, cluster=False),
+        {
+            "kernel": "throughput_2cta",
+            "separate_reducer_impl": "reference",
+        },
         "identity",
         False,
         exercise_all_paths=True,
-        id="M7-bf16-sq8-flat-2cta-q128-v256-s16",
+        id="bf16-multi-q-2cta-reference-reduction",
     ),
     _param(
         _case(
@@ -627,40 +614,45 @@ _MLA_CASES = (
             seq_len_q=4,
             mask_type="dense",
         ),
-        _policy("throughput_latency_1cta", 16, 9, 256, cluster=False, schedulers=False),
+        {
+            "kernel": "throughput_latency_1cta",
+            "separate_reducer_impl": "parallel",
+        },
         "tail",
         False,
-        id="M8-spec-dense-tail-visible",
+        id="speculative-dense-tail",
     ),
     _param(
         _case(2, 16, 2049, torch.bfloat16, 32008, seq_len_q=4),
-        _policy("throughput_latency_1cta", 16, 9, 256, cluster=False, schedulers=False),
+        {
+            "kernel": "throughput_latency_1cta",
+            "separate_reducer_impl": "parallel",
+        },
         "tail",
         False,
-        id="M9-spec-causal-tail-progressive",
+        id="speculative-causal-tail",
     ),
     _param(
         _case(128, 128, 2048, torch.bfloat16, 32009),
-        _policy(
-            "throughput_2cta",
-            128,
-            1,
-            256,
-            cluster=False,
-            persistent=True,
-            clc=True,
-        ),
+        {
+            "kernel": "throughput_2cta",
+            "split_kv": 1,
+            "use_persistent_scheduler": True,
+            "use_clc_dynamic_persistent_scheduler": True,
+        },
         None,
         False,
-        id="M10-bf16-2cta-q128-direct-clc",
+        id="bf16-2cta-persistent-direct",
     ),
     _param(
         _case(5, 65, 256, torch.bfloat16, 32010, seq_len_q=2),
-        _policy("throughput_2cta", 128, 2, 256, cluster=False)
-        | {"separate_reducer_impl": "reference"},
+        {
+            "kernel": "throughput_2cta",
+            "separate_reducer_impl": "reference",
+        },
         None,
         False,
-        id="M11-bf16-2cta-q128-s2-reducer-tail",
+        id="bf16-2cta-reference-reducer-tail",
     ),
     _param(
         _case(
@@ -671,18 +663,15 @@ _MLA_CASES = (
             32011,
             page_size=128,
         ),
-        _policy(
-            "throughput_2cta",
-            128,
-            1,
-            256,
-            cluster=False,
-            persistent=True,
-            clc=True,
-        ),
+        {
+            "kernel": "throughput_2cta",
+            "split_kv": 1,
+            "use_persistent_scheduler": True,
+            "use_clc_dynamic_persistent_scheduler": True,
+        },
         None,
         False,
-        id="M12-bf16-b128-h128-k4097-page128-direct-clc",
+        id="bf16-page128-2cta-persistent-direct",
     ),
 )
 
@@ -814,14 +803,15 @@ def _assert_auto_policy(
     *,
     device: torch.device,
 ) -> None:
-    """Contract exact B200 coverage and portable Blackwell legality."""
+    """Contract requested feature coverage and portable Blackwell legality."""
 
     assert policy["source"] == "auto"
     assert policy["kernel"] in ("throughput_latency_1cta", "throughput_2cta")
     assert policy["tile_size_q"] in (8, 16, 32, 64, 128)
     assert policy["tile_size_kv"] == 128
     assert int(policy["num_insts_kv"]) in (1, 2)
-    assert int(policy["split_kv"]) >= 1
+    split_kv = int(policy["split_kv"])
+    assert split_kv >= 1
     head_dim_per_cta_v = int(policy["head_dim_per_cta_v"])
     num_ctas_per_head_dim = int(policy["num_ctas_per_head_dim"])
     assert head_dim_per_cta_v in (128, 256, 512)
@@ -830,9 +820,16 @@ def _assert_auto_policy(
     use_cluster = bool(policy["use_cluster_reduction"])
     persistent = bool(policy["use_persistent_scheduler"])
     use_clc = bool(policy["use_clc_dynamic_persistent_scheduler"])
+    separate_reducer = policy["separate_reducer_impl"]
+    assert separate_reducer in ("none", "reference", "parallel")
     if use_cluster:
-        assert int(policy["split_kv"]) > 1
+        assert split_kv > 1
         assert policy["kernel"] == "throughput_latency_1cta"
+        assert separate_reducer == "none"
+    if separate_reducer != "none":
+        assert split_kv > 1
+    if split_kv == 1:
+        assert separate_reducer == "none"
     if use_clc:
         assert persistent
     if policy["kernel"] == "throughput_2cta":
@@ -1363,18 +1360,6 @@ def test_attention_ts_mla_packed_q_offsets_reject_decrease():
         mla_decode_module._derive_max_seq_len_q(qo_indptr, batch_size=2)
 
 
-def test_attention_ts_mla_2cta_reduction_capacity_bound():
-    """The producer and standalone reducer expose the same split capacity."""
-
-    assert MAX_SPLITS == 128
-    assert MlaDecodeTs().reduction_split_capacity == MAX_SPLITS
-    assert (
-        MlaDecodeTs(static_split_kv=MAX_SPLITS).reduction_split_capacity == MAX_SPLITS
-    )
-    with pytest.raises(ValueError, match=r"static_split_kv must be in \[1, 128\]"):
-        MlaDecodeTs(static_split_kv=MAX_SPLITS + 1)
-
-
 def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
     """Workspace policy resolution rejects unsafe bounds before CUDA work."""
 
@@ -1575,7 +1560,10 @@ def test_attention_ts_mla_fp8_reference_uses_p448():
                 "qkv_dtype": torch.float8_e4m3fn,
                 "seed": 20260808,
             },
-            _policy("throughput_latency_1cta", 8, 3, 128, cluster=True),
+            {
+                "kernel": "throughput_latency_1cta",
+                "use_cluster_reduction": True,
+            },
             0,
             id="smem-p-cluster",
         ),

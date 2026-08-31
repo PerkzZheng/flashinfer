@@ -18,8 +18,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .helpers.constants import MAX_MLA_SPLITS_KV
 
-_MAX_SPLITS_KV = 128
 _TARGET_SPLITS_PER_RANK = 8
 _PARALLEL_REDUCER_MIN_SPLITS_PER_RANK = 32
 _PARALLEL_REDUCER_MAX_CLUSTER_WAVES = 4
@@ -75,8 +75,8 @@ def _next_power_of_two(value: int) -> int:
 def _validate_splits_kv(splits_kv: int) -> None:
     if isinstance(splits_kv, bool) or not isinstance(splits_kv, int):
         raise TypeError("splits_kv must be an integer")
-    if not 1 <= splits_kv <= _MAX_SPLITS_KV:
-        raise ValueError(f"splits_kv must be in [1, {_MAX_SPLITS_KV}]")
+    if not 1 <= splits_kv <= MAX_MLA_SPLITS_KV:
+        raise ValueError(f"splits_kv must be in [1, {MAX_MLA_SPLITS_KV}]")
 
 
 def _validate_positive_int(value: int, name: str) -> None:

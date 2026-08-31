@@ -74,17 +74,6 @@ class _MLADecodeLaunchSpec:
 
 
 @dataclass(frozen=True)
-class _MLAOneCtaCandidate:
-    """One fully resolved 1CTA family candidate used by automatic policy."""
-
-    launch_shape: Any
-    decision: Any
-    split_kv: int | None
-    work: int
-    allow_equal_wave_crossover: bool = False
-
-
-@dataclass(frozen=True)
 class _MLADecodeCompileSpec:
     """Batch-independent identity and implementation for one MLA compile."""
 
@@ -599,7 +588,6 @@ def _resolve_mla_decode_launch_spec(
     from cuda.bindings import driver as cuda_drv
 
     from .kernels.mla_decode.kernel_policy import (
-        MlaAutomaticWork,
         resolve_mla_kernel_policy,
         select_mla_ts_kernel,
     )
@@ -610,13 +598,11 @@ def _resolve_mla_decode_launch_spec(
     )
     from .kernels.mla_decode.throughput_2cta.kernel import MlaDecodeTs
     from .kernels.mla_decode.throughput_latency_1cta.config import (
-        FlatQueryLaunchShape,
-        auto_tile_size_q_for_mla_gen,
         compute_workspace_size as compute_1cta_workspace_size,
-        bounded_swaps_family_probe_split_kv,
+        q_tile_work_count,
         resolve_auto_flat_query_launch_shape,
         resolve_runtime_cluster_reduction_mode,
-        wave_fill_split_kv,
+        select_auto_split_kv,
     )
     from .kernels.mla_decode.throughput_latency_1cta.kernel import (
         ThroughputLatencyMlaDecodeTs,
@@ -645,33 +631,45 @@ def _resolve_mla_decode_launch_spec(
         max_active_two_cta_clusters = hardware_info.get_max_active_clusters(
             2, plan_stream
         )
-
-        two_cta_layout = FlatQueryTileLayout.for_tile(num_heads, seq_len_q, 128)
+        one_cta_launch_shape = resolve_auto_flat_query_launch_shape(
+            num_heads_q=num_heads,
+            seq_len_q=seq_len_q,
+        )
+        one_cta_base_work = q_tile_work_count(
+            batch_size,
+            one_cta_launch_shape.num_heads_q,
+            one_cta_launch_shape.seq_len_q,
+            one_cta_launch_shape.tile_size_q,
+        )
+        one_cta_split_kv = select_auto_split_kv(
+            seq_len_kv=max_kv_len,
+            tile_size_q=one_cta_launch_shape.tile_size_q,
+            base_work=one_cta_base_work,
+            target_work=max_active_one_cta_clusters,
+        )
+        two_cta_launch_shape = FlatQueryTileLayout.for_tile(num_heads, seq_len_q, 128)
         two_cta_split_kv = compute_split_kv(
             batch_size=batch_size,
-            num_q_tiles=two_cta_layout.num_tiles,
+            num_q_tiles=two_cta_launch_shape.num_tiles,
             seq_len_kv=max_kv_len,
             mma_qk_tiler_mn=(128, 128),
             max_active_blocks=max_active_two_cta_clusters * 2,
         )
-        two_cta_cluster_work = (
-            batch_size * two_cta_layout.num_tiles * max(two_cta_split_kv, 1)
+        requested_policy, policy_source = resolve_mla_kernel_policy(
+            None,
+            num_heads,
+            seq_len_q,
+            one_cta_split_kv=one_cta_split_kv,
+            two_cta_split_kv=two_cta_split_kv,
         )
+        use_throughput_latency = requested_policy == "throughput_latency_1cta"
 
-        one_cta_launch_shape = resolve_auto_flat_query_launch_shape(
-            batch_size=batch_size,
-            num_heads_q=num_heads,
-            seq_len_q=seq_len_q,
-            seq_len_kv=max_kv_len,
-            qkv_dtype=qkv_dtype_name,
-            max_active_clusters=max_active_one_cta_clusters,
-        )
-
-        def select_one_cta(launch_shape, split_kv=None):
-            """Resolve one physical 1CTA launch shape with shared inputs."""
-
-            return select_mla_ts_kernel(
-                requested_policy="throughput_latency_1cta",
+        kernel: Any
+        if use_throughput_latency:
+            max_active_clusters = max_active_one_cta_clusters
+            launch_shape = one_cta_launch_shape
+            decision = select_mla_ts_kernel(
+                requested_policy=requested_policy,
                 batch_size=batch_size,
                 num_heads=launch_shape.num_heads_q,
                 seq_len_q=launch_shape.seq_len_q,
@@ -683,185 +681,9 @@ def _resolve_mla_decode_launch_spec(
                 out_dtype=output_dtype_name,
                 throughput_latency_profile=None,
                 throughput_latency_tile_size_q=launch_shape.tile_size_q,
-                max_active_clusters=max_active_one_cta_clusters,
-                throughput_latency_split_kv=split_kv,
+                max_active_clusters=max_active_clusters,
+                throughput_latency_split_kv=None,
                 throughput_latency_persistent=None,
-            )
-
-        def make_one_cta_candidate(
-            launch_shape,
-            decision,
-            split_kv=None,
-            *,
-            allow_equal_wave_crossover=False,
-        ):
-            """Return a complete candidate, or ``None`` for an unavailable profile."""
-
-            cfg = decision.config
-            if not decision.implementation_ready or cfg is None:
-                return None
-            work = (
-                cfg.batch_size
-                * cfg.num_ctas_per_seq_q
-                * cfg.num_ctas_for_all_heads
-                * cfg.num_ctas_per_seq_kv
-                * cfg.num_ctas_per_head_dim
-            )
-            return _MLAOneCtaCandidate(
-                launch_shape=launch_shape,
-                decision=decision,
-                split_kv=split_kv,
-                work=int(work),
-                allow_equal_wave_crossover=allow_equal_wave_crossover,
-            )
-
-        one_cta_candidate = None
-        total_q_rows = num_heads * seq_len_q
-        use_underfilled_two_cta_probe = (
-            total_q_rows > 64
-            and two_cta_cluster_work * 4 <= max_active_two_cta_clusters
-        )
-        use_single_tile_one_cta_probe = (
-            1 <= total_q_rows <= 64
-            and one_cta_launch_shape.tile_size_q in (8, 16, 32, 64)
-            and one_cta_launch_shape.seq_len_q == 1
-        )
-        if use_underfilled_two_cta_probe:
-            initial_probe = select_one_cta(one_cta_launch_shape)
-            if initial_probe.implementation_ready and initial_probe.config is not None:
-                probe_split_kv = wave_fill_split_kv(
-                    batch_size=batch_size,
-                    num_heads_q=one_cta_launch_shape.num_heads_q,
-                    seq_len_q=one_cta_launch_shape.seq_len_q,
-                    seq_len_kv=max_kv_len,
-                    latent_dim=kv_lora_rank,
-                    max_active_clusters=max_active_one_cta_clusters,
-                    tile_size_q=int(initial_probe.config.tile_size_q),
-                )
-                one_cta_candidate = make_one_cta_candidate(
-                    one_cta_launch_shape,
-                    select_one_cta(one_cta_launch_shape, probe_split_kv),
-                    probe_split_kv,
-                )
-        elif (
-            total_q_rows > 64
-            and qkv_dtype_name == "e4m3"
-            and two_cta_cluster_work <= max_active_two_cta_clusters
-        ):
-            # When both families fit one wave, consider a Swaps candidate only
-            # if its local K span stays within a bounded mainloop. Saturated or
-            # long-local-K shapes retain the M128 2CTA schedule.
-            probe_tile_size_q = auto_tile_size_q_for_mla_gen(
-                batch_size=batch_size,
-                num_heads_q=num_heads,
-                seq_len_q=seq_len_q,
-                seq_len_kv=max_kv_len,
-                multi_processor_count=max_active_one_cta_clusters,
-            )
-            if probe_tile_size_q == 16:
-                one_wave_launch_shape = FlatQueryLaunchShape.for_tile(
-                    num_heads,
-                    seq_len_q,
-                    probe_tile_size_q,
-                )
-                one_wave_split_kv = bounded_swaps_family_probe_split_kv(
-                    batch_size=batch_size,
-                    num_heads_q=one_wave_launch_shape.num_heads_q,
-                    seq_len_q=one_wave_launch_shape.seq_len_q,
-                    seq_len_kv=max_kv_len,
-                    tile_size_q=probe_tile_size_q,
-                    max_active_clusters=max_active_one_cta_clusters,
-                )
-                if one_wave_split_kv is not None:
-                    one_wave_decision = select_one_cta(
-                        one_wave_launch_shape,
-                        one_wave_split_kv,
-                    )
-                    one_wave_cfg = one_wave_decision.config
-                    if (
-                        one_wave_decision.implementation_ready
-                        and one_wave_cfg is not None
-                        and one_wave_cfg.kernel_variant == "swaps_mma_ab"
-                        and one_wave_cfg.tile_size_q == probe_tile_size_q
-                    ):
-                        one_cta_candidate = make_one_cta_candidate(
-                            one_wave_launch_shape,
-                            one_wave_decision,
-                            one_wave_split_kv,
-                            allow_equal_wave_crossover=True,
-                        )
-        elif use_single_tile_one_cta_probe:
-            one_cta_candidate = make_one_cta_candidate(
-                one_cta_launch_shape,
-                select_one_cta(one_cta_launch_shape),
-            )
-
-        family_probe_cfg = (
-            one_cta_candidate.decision.config if one_cta_candidate is not None else None
-        )
-        automatic_work = MlaAutomaticWork(
-            one_cta_work=(
-                one_cta_candidate.work if one_cta_candidate is not None else None
-            ),
-            one_cta_capacity=(
-                max_active_one_cta_clusters if one_cta_candidate is not None else None
-            ),
-            two_cta_cluster_work=(
-                two_cta_cluster_work if one_cta_candidate is not None else None
-            ),
-            two_cta_cluster_capacity=(
-                max_active_two_cta_clusters if one_cta_candidate is not None else None
-            ),
-            allow_equal_wave_crossover=(
-                one_cta_candidate.allow_equal_wave_crossover
-                if one_cta_candidate is not None
-                else False
-            ),
-            one_cta_tile_size_q=(
-                int(family_probe_cfg.tile_size_q)
-                if family_probe_cfg is not None
-                else None
-            ),
-            one_cta_split_kv=(
-                int(family_probe_cfg.num_ctas_per_seq_kv)
-                if family_probe_cfg is not None
-                else None
-            ),
-            two_cta_split_kv=(
-                int(two_cta_split_kv) if family_probe_cfg is not None else None
-            ),
-            seq_len_k=max_kv_len if family_probe_cfg is not None else None,
-            qkv_dtype=qkv_dtype_name,
-            one_cta_kernel_variant=(
-                str(family_probe_cfg.kernel_variant)
-                if family_probe_cfg is not None
-                else None
-            ),
-        )
-
-        requested_policy, policy_source = resolve_mla_kernel_policy(
-            None,
-            num_heads,
-            seq_len_q,
-            automatic_work,
-        )
-        use_throughput_latency = requested_policy == "throughput_latency_1cta"
-
-        kernel: Any
-        if use_throughput_latency:
-            max_active_clusters = max_active_one_cta_clusters
-            launch_shape = (
-                one_cta_candidate.launch_shape
-                if one_cta_candidate is not None
-                else one_cta_launch_shape
-            )
-            decision = (
-                one_cta_candidate.decision
-                if one_cta_candidate is not None
-                else select_one_cta(launch_shape)
-            )
-            selected_one_cta_split_kv = (
-                one_cta_candidate.split_kv if one_cta_candidate is not None else None
             )
             if not decision.implementation_ready or decision.config is None:
                 raise NotImplementedError(decision.reason)
@@ -889,7 +711,7 @@ def _resolve_mla_decode_launch_spec(
                 logical_num_heads=num_heads,
                 logical_seq_len_q=seq_len_q,
                 tile_size_q=launch_shape.tile_size_q,
-                explicit_split_kv=selected_one_cta_split_kv,
+                explicit_split_kv=None,
                 explicit_persistent=None,
                 mask_type=mask_type,
             )
@@ -929,7 +751,7 @@ def _resolve_mla_decode_launch_spec(
             )
         else:
             max_active_clusters = max_active_two_cta_clusters
-            launch_shape = two_cta_layout
+            launch_shape = two_cta_launch_shape
             decision = select_mla_ts_kernel(
                 requested_policy=requested_policy,
                 batch_size=batch_size,
@@ -943,7 +765,7 @@ def _resolve_mla_decode_launch_spec(
                 out_dtype=output_dtype_name,
                 throughput_latency_profile=None,
                 throughput_latency_tile_size_q=None,
-                max_active_clusters=max_active_one_cta_clusters,
+                max_active_clusters=max_active_clusters,
                 throughput_latency_split_kv=None,
                 throughput_latency_persistent=None,
             )

@@ -51,15 +51,13 @@ from ...tensor_map import (
 
 from .config import (
     LOG2_E,
-    MAX_SPLITS,
     REDUCTION_ROWS_PER_CTA,
     REDUCTION_THREADS_PER_ROW,
     V_TMA_LATENT_ELEMENTS,
     MlaDecodeConfig,
     make_mla_decode_config,
-    select_reference_reduction_rows_per_cta,
 )
-from ..helpers.constants import TMEM_DEALLOC_MBAR_THREADS
+from ..helpers.constants import MAX_MLA_SPLITS_KV, TMEM_DEALLOC_MBAR_THREADS
 from ..helpers.mask import MaskType, mask_visible_k_length, normalize_mask_type
 from ..helpers.query import (
     FlatQueryTileLayout,
@@ -790,10 +788,10 @@ class MlaDecodeTs:
         self.is_var_split_kv = is_var_split_kv
         self.static_split_kv = static_split_kv
         self.reduction_split_capacity = (
-            static_split_kv if static_split_kv is not None else MAX_SPLITS
+            static_split_kv if static_split_kv is not None else MAX_MLA_SPLITS_KV
         )
-        if not 1 <= self.reduction_split_capacity <= MAX_SPLITS:
-            raise ValueError(f"static_split_kv must be in [1, {MAX_SPLITS}]")
+        if not 1 <= self.reduction_split_capacity <= MAX_MLA_SPLITS_KV:
+            raise ValueError(f"static_split_kv must be in [1, {MAX_MLA_SPLITS_KV}]")
         self.static_seq_len_k = static_seq_len_k
         self.qkv_dtype = qkv_dtype
         self.out_dtype = out_dtype
@@ -811,16 +809,6 @@ class MlaDecodeTs:
         )
         self.num_q_tiles = self.query_tile_layout.num_tiles
         self.tail_q_rows = self.query_tile_layout.tail_rows
-        self.reference_reduction_rows_per_cta = REDUCTION_ROWS_PER_CTA
-        if static_split_kv is not None and static_split_kv > 1:
-            self.reference_reduction_rows_per_cta = (
-                select_reference_reduction_rows_per_cta(
-                    batch_size=batch_size,
-                    logical_query_rows=self.query_tile_layout.total_rows,
-                    producer_ctas=(batch_size * self.num_q_tiles * static_split_kv * 2),
-                    physical_sm_count=max_active_clusters * 2,
-                )
-            )
         self.parallel_reduction_topology: ParallelReductionTopology | None = None
         self.use_parallel_reduction = False
         self._parallel_reduction_shape_is_eligible = (
@@ -864,7 +852,6 @@ class MlaDecodeTs:
             self.query_tile_layout,
             self.num_q_tiles,
             self.tail_q_rows,
-            self.reference_reduction_rows_per_cta,
             self._parallel_reduction_shape_is_eligible,
             self.use_parallel_reduction,
             self.parallel_reduction_topology,
@@ -915,7 +902,7 @@ class MlaDecodeTs:
                 producer_ctas=(
                     self.batch_size * num_query_tiles * self.static_split_kv * 2
                 ),
-                reference_rows_per_cta=self.reference_reduction_rows_per_cta,
+                reference_rows_per_cta=REDUCTION_ROWS_PER_CTA,
                 physical_sm_count=self.max_active_clusters * 2,
             )
         )
@@ -1248,10 +1235,6 @@ class MlaDecodeTs:
                 )
             else:
                 logical_query_rows = self.num_heads * self.seq_len_q
-                reduction_rows_per_cta = self.reference_reduction_rows_per_cta
-                reduction_threads_per_cta = (
-                    reduction_rows_per_cta * REDUCTION_THREADS_PER_ROW
-                )
                 self.reduction_kernel(
                     o,
                     lse,
@@ -1263,23 +1246,19 @@ class MlaDecodeTs:
                     block_split_kvs,
                 ).launch(
                     grid=(
-                        ceil_div(logical_query_rows, reduction_rows_per_cta),
+                        ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
                         1,
                         batch_size,
                     ),
-                    block=[reduction_threads_per_cta, 1, 1],
+                    block=[REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW, 1, 1],
                     smem=(
-                        reduction_rows_per_cta
+                        REDUCTION_ROWS_PER_CTA
                         * self.reduction_split_capacity
                         * self.lse_dtype.width
                         // 8
                     ),
                     stream=stream,
-                    # Preserve the 1,024 resident-thread launch
-                    # bound as row coarsening changes the CTA thread count.
-                    min_blocks_per_mp=(
-                        2 * REDUCTION_ROWS_PER_CTA // reduction_rows_per_cta
-                    ),
+                    min_blocks_per_mp=2,
                     use_pdl=use_one_wave_reducer_pdl,
                 )
 
@@ -1846,7 +1825,7 @@ class MlaDecodeTs:
             block_split_kvs,
             cfg,
             self.reduction_split_capacity,
-            self.reference_reduction_rows_per_cta,
+            REDUCTION_ROWS_PER_CTA,
         )
 
     @cute.kernel
