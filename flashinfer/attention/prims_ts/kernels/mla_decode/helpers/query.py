@@ -70,37 +70,6 @@ class FlatQueryTileLayout:
             tail_rows=tail_rows,
         )
 
-    def valid_rows(self, query_tile_idx: int) -> int:
-        """Return the logical row prefix owned by one rectangular tile."""
-
-        if query_tile_idx < 0:
-            raise ValueError("query_tile_idx must be non-negative")
-        return max(
-            0,
-            min(
-                self.tile_size_q,
-                self.total_rows - query_tile_idx * self.tile_size_q,
-            ),
-        )
-
-    def row_coordinates(
-        self,
-        query_tile_idx: int,
-        row_in_tile: int,
-    ) -> tuple[int, int, int, bool]:
-        """Map a physical tile row to ``(flat, query, head, is_valid)``."""
-
-        if query_tile_idx < 0:
-            raise ValueError("query_tile_idx must be non-negative")
-        if not 0 <= row_in_tile < self.tile_size_q:
-            raise ValueError(
-                "row_in_tile must be in the selected physical tile: "
-                f"row_in_tile={row_in_tile}, tile_size_q={self.tile_size_q}"
-            )
-        flat_row = query_tile_idx * self.tile_size_q + row_in_tile
-        query_idx, head_idx = divmod(flat_row, self.logical_num_heads_q)
-        return flat_row, query_idx, head_idx, flat_row < self.total_rows
-
 
 @cute.jit
 def query_batch_bounds(
@@ -243,8 +212,8 @@ def split_o_element_offset(
     complete workspace extent cannot prove that every offset fits in Int32.
     The within-batch layout is still compile-time constant, however. Keep that
     common bounded part in 32-bit arithmetic and widen only the batch-stride
-    product. Retain a fully widened fallback for any future profile whose
-    per-batch layout alone exceeds Int32.
+    product. Use fully widened arithmetic when a profile's per-batch layout
+    alone exceeds Int32.
     """
 
     elements_per_batch = (

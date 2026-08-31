@@ -452,7 +452,7 @@ class MlaWorkQueue(WorkQueue):
             safe_b_idx,
             self.logical_seq_len_q,
         )
-        q_group_has_rows = runtime_flat_query_tile_has_rows(
+        query_tile_has_rows = runtime_flat_query_tile_has_rows(
             s_idx,
             cfg.mma_qk_tiler[0],
             self.logical_num_heads_q,
@@ -477,7 +477,7 @@ class MlaWorkQueue(WorkQueue):
                 safe_b_idx,
             )
             K = mask_visible_k_length(cfg.mask_type, K, logical_q_idx, q_len)
-        K = K if q_group_has_rows else Int32(0)
+        K = K if query_tile_has_rows else Int32(0)
         k_tile_total = (K + Int32(cfg.mma_qk_tiler[1] - 1)) // Int32(
             cfg.mma_qk_tiler[1]
         )
@@ -2045,12 +2045,12 @@ class TmemSResource(HighThroughputMlaResource):
                 # Clamp padded physical tail rows to the request's last real
                 # row. Their Q/output accesses remain independently
                 # predicated, while this keeps the masking arithmetic safe.
-                effective_head_idx = self.cta_rank * Int32(
+                row_in_tile = self.cta_rank * Int32(
                     cfg.mma_qk_tiler[0] // cfg.num_mma_ctas
                 ) + (local_tidx & Int32(EPILOGUE_ROW_MASK))
                 flat_query_row = (
                     Int32(work_tile.tile_idx[1]) * Int32(cfg.mma_qk_tiler[0])
-                    + effective_head_idx
+                    + row_in_tile
                 )
                 last_flat_query_row = cute.math.max(
                     logical_seq_len_q * Int32(self.logical_num_heads_q) - Int32(1),
@@ -3052,11 +3052,11 @@ class GmemOResource(HighThroughputMlaResource):
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
 
     @cute.jit
-    def _query_row_state(self, effective_head_idx, effective_seq_group_idx, batch_idx):
+    def _query_row_state(self, row_in_tile, query_tile_idx, batch_idx):
         """Map one physical flat-tile row to public storage."""
         return flat_query_row_state(
-            effective_head_idx,
-            effective_seq_group_idx,
+            row_in_tile,
+            query_tile_idx,
             self.cfg.mma_qk_tiler[0],
             self.logical_num_heads_q,
             self.logical_seq_len_q,
@@ -3131,20 +3131,20 @@ class GmemOResource(HighThroughputMlaResource):
         # Public O/LSE remain in logical coordinates. Split-KV partials retain
         # physical flat-tile coordinates until final reduction.
         logical_num_heads_q = Int32(self.logical_num_heads_q)
-        effective_num_heads_q = Int32(cfg.mma_qk_tiler[0])
+        physical_tile_rows = Int32(cfg.mma_qk_tiler[0])
         D = cfg.latent_dim
         head_tile_idx = blk_coord[0]
         seq_q_idx = blk_coord[1]
         batch_idx = blk_coord[2]
         split_kv_idx = blk_coord[3]
-        effective_head_idx = head_tile_idx * tile_h + g_i
+        row_in_tile = head_tile_idx * tile_h + g_i
         (
             storage_flat_query_row,
             logical_head_idx,
             logical_q_idx,
             _,
             query_is_valid,
-        ) = self._query_row_state(effective_head_idx, seq_q_idx, batch_idx)
+        ) = self._query_row_state(row_in_tile, seq_q_idx, batch_idx)
 
         # Fully masked split rows can occur when physical tail rows or earlier
         # causal query rows have no visible K values in this split. Store zero
@@ -3177,7 +3177,7 @@ class GmemOResource(HighThroughputMlaResource):
                 qk_acc_regs[i + 1] = scaled[1]
 
             # Store O to GMEM
-            if effective_head_idx < effective_num_heads_q and query_is_valid:
+            if row_in_tile < physical_tile_rows and query_is_valid:
                 if cutlass.const_expr(self.partial_output is not None):
                     # Split-KV partial O uses BF16 workspace storage.  LSE and
                     # the eventual cross-split accumulation remain FP32.
@@ -3188,14 +3188,14 @@ class GmemOResource(HighThroughputMlaResource):
                     )
                     o_base_ptr = (
                         self.partial_output.iterator.raw_ptr()
-                        + Int64(effective_head_idx) * Int64(self.split_kv) * Int64(D)
+                        + Int64(row_in_tile) * Int64(self.split_kv) * Int64(D)
                         + Int64(split_kv_idx) * Int64(D)
                         + Int64(seq_q_idx)
                         * Int64(self.split_kv)
-                        * Int64(effective_num_heads_q)
+                        * Int64(physical_tile_rows)
                         * Int64(D)
                         + Int64(batch_idx)
-                        * Int64(effective_num_heads_q)
+                        * Int64(physical_tile_rows)
                         * Int64(self.split_kv)
                         * Int64(S_q)
                         * Int64(D)
@@ -3307,15 +3307,15 @@ class GmemOResource(HighThroughputMlaResource):
         # indexing, not global tidx (which is 128..255 for correction warps).
         lse_tidx = local_tidx
         if lse_tidx < tile_h:
-            effective_lse_head_idx = head_tile_idx * tile_h + lse_tidx
+            lse_row_in_tile = head_tile_idx * tile_h + lse_tidx
             (
                 storage_flat_lse_row,
                 logical_lse_head_idx,
                 logical_lse_q_idx,
                 _,
                 lse_query_is_valid,
-            ) = self._query_row_state(effective_lse_head_idx, seq_q_idx, batch_idx)
-            if effective_lse_head_idx < effective_num_heads_q and lse_query_is_valid:
+            ) = self._query_row_state(lse_row_in_tile, seq_q_idx, batch_idx)
+            if lse_row_in_tile < physical_tile_rows and lse_query_is_valid:
                 if cutlass.const_expr(self.partial_lse is not None):
                     S_q = (
                         cutlass.Int32(self.partial_lse.shape[2])
@@ -3324,13 +3324,13 @@ class GmemOResource(HighThroughputMlaResource):
                     )
                     lse_base_ptr = (
                         self.partial_lse.iterator.raw_ptr()
-                        + Int64(effective_lse_head_idx) * Int64(self.split_kv)
+                        + Int64(lse_row_in_tile) * Int64(self.split_kv)
                         + Int64(split_kv_idx)
                         + Int64(seq_q_idx)
-                        * Int64(effective_num_heads_q)
+                        * Int64(physical_tile_rows)
                         * Int64(self.split_kv)
                         + Int64(batch_idx)
-                        * Int64(effective_num_heads_q)
+                        * Int64(physical_tile_rows)
                         * Int64(self.split_kv)
                         * Int64(S_q)
                     )
@@ -3412,22 +3412,22 @@ class GmemOResource(HighThroughputMlaResource):
         g_j = (tidx_g >> EPILOGUE_COLUMN_GROUP_SHIFT) * EPILOGUE_THREAD_TILE_THREADS
 
         logical_num_heads_q = Int32(self.logical_num_heads_q)
-        effective_num_heads_q = Int32(cfg.mma_qk_tiler[0])
+        physical_tile_rows = Int32(cfg.mma_qk_tiler[0])
         D = cfg.latent_dim
         head_tile_idx = blk_coord[0]
         seq_q_idx = blk_coord[1]
         batch_idx = blk_coord[2]
         split_kv_idx = blk_coord[3]
-        effective_head_idx = head_tile_idx * tile_h + g_i
+        row_in_tile = head_tile_idx * tile_h + g_i
         (
             storage_flat_query_row,
             logical_head_idx,
             logical_q_idx,
             _,
             query_is_valid,
-        ) = self._query_row_state(effective_head_idx, seq_q_idx, batch_idx)
+        ) = self._query_row_state(row_in_tile, seq_q_idx, batch_idx)
 
-        if effective_head_idx < effective_num_heads_q and query_is_valid:
+        if row_in_tile < physical_tile_rows and query_is_valid:
             if cutlass.const_expr(self.partial_output is not None):
                 S_q = (
                     cutlass.Int32(self.partial_output.shape[3])
@@ -3436,14 +3436,14 @@ class GmemOResource(HighThroughputMlaResource):
                 )
                 o_base_ptr = (
                     self.partial_output.iterator.raw_ptr()
-                    + Int64(effective_head_idx) * Int64(self.split_kv) * Int64(D)
+                    + Int64(row_in_tile) * Int64(self.split_kv) * Int64(D)
                     + Int64(split_kv_idx) * Int64(D)
                     + Int64(seq_q_idx)
                     * Int64(self.split_kv)
-                    * Int64(effective_num_heads_q)
+                    * Int64(physical_tile_rows)
                     * Int64(D)
                     + Int64(batch_idx)
-                    * Int64(effective_num_heads_q)
+                    * Int64(physical_tile_rows)
                     * Int64(self.split_kv)
                     * Int64(S_q)
                     * Int64(D)
@@ -3545,18 +3545,15 @@ class GmemOResource(HighThroughputMlaResource):
             )
             lse_tidx = local_tidx
             if lse_tidx < tile_h:
-                effective_lse_head_idx = head_tile_idx * tile_h + lse_tidx
+                lse_row_in_tile = head_tile_idx * tile_h + lse_tidx
                 (
                     storage_flat_lse_row,
                     logical_lse_head_idx,
                     logical_lse_q_idx,
                     _,
                     lse_query_is_valid,
-                ) = self._query_row_state(effective_lse_head_idx, seq_q_idx, batch_idx)
-                if (
-                    effective_lse_head_idx < effective_num_heads_q
-                    and lse_query_is_valid
-                ):
+                ) = self._query_row_state(lse_row_in_tile, seq_q_idx, batch_idx)
+                if lse_row_in_tile < physical_tile_rows and lse_query_is_valid:
                     if cutlass.const_expr(self.partial_lse is not None):
                         S_q = (
                             cutlass.Int32(self.partial_lse.shape[2])
@@ -3565,13 +3562,13 @@ class GmemOResource(HighThroughputMlaResource):
                         )
                         lse_base_ptr = (
                             self.partial_lse.iterator.raw_ptr()
-                            + Int64(effective_lse_head_idx) * Int64(self.split_kv)
+                            + Int64(lse_row_in_tile) * Int64(self.split_kv)
                             + Int64(split_kv_idx)
                             + Int64(seq_q_idx)
-                            * Int64(effective_num_heads_q)
+                            * Int64(physical_tile_rows)
                             * Int64(self.split_kv)
                             + Int64(batch_idx)
-                            * Int64(effective_num_heads_q)
+                            * Int64(physical_tile_rows)
                             * Int64(self.split_kv)
                             * Int64(S_q)
                         )

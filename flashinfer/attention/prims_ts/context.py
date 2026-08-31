@@ -1232,7 +1232,7 @@ def _resolve_paged_context_scheduler(
     return "static_persistent"
 
 
-def _semantic_key(geometry: _ContextGeometry) -> _ContextCompileSpec:
+def _context_compile_spec(geometry: _ContextGeometry) -> _ContextCompileSpec:
     return _ContextCompileSpec(
         device_index=geometry.device_index,
         max_seq_len_q=geometry.max_seq_len_q,
@@ -1254,7 +1254,7 @@ def _semantic_key(geometry: _ContextGeometry) -> _ContextCompileSpec:
     )
 
 
-def _paged_semantic_key(
+def _paged_context_compile_spec(
     geometry: _PagedContextGeometry,
 ) -> _PagedContextCompileSpec:
     return _PagedContextCompileSpec(
@@ -1886,7 +1886,7 @@ class BatchPrefillTSWrapper:
         # making plan publication atomic, this lets compute-sanitizer patch the
         # generated attention kernel without interleaving later PyTorch setup
         # launches with the DSL compiler/runtime callbacks.
-        compiled, policy = _get_compiled_context(_semantic_key(geometry))
+        compiled, policy = _get_compiled_context(_context_compile_spec(geometry))
 
         # Publish only after validation, compilation, and allocation succeed.
         self._geometry = geometry
@@ -2094,7 +2094,9 @@ class BatchPrefillPagedTSWrapper:
 
         # Keep all runtime tensor allocation ahead of CUTLASS JIT, matching
         # BatchPrefillTSWrapper.plan and its compute-sanitizer ordering.
-        compiled, policy = _get_compiled_paged_context(_paged_semantic_key(geometry))
+        compiled, policy = _get_compiled_paged_context(
+            _paged_context_compile_spec(geometry)
+        )
 
         # Publish only after validation, compilation, and allocation succeed.
         self._geometry = geometry

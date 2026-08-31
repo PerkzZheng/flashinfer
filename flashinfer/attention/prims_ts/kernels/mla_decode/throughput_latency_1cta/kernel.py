@@ -1479,11 +1479,9 @@ class ThroughputLatencyMlaDecodeTs:
         self.mask_type = normalize_mask_type(mask_type)
 
         cfg = self._make_config()
-        # The parallel standalone reducer is a production-derived choice, not
-        # a user knob.  It requires a fixed split profile and a static producer
-        # schedule so the reducer topology and workspace contract are compile-
-        # time invariant.  Every other supported profile keeps the established
-        # FlashInfer reducer as an automatic fallback.
+        # Parallel standalone reduction requires a fixed split profile and a
+        # static producer schedule so its topology and workspace contract are
+        # compile-time invariant. Other profiles use the general reducer.
         self.use_parallel_reduction = (
             supports_parallel_gmem_reduction(cfg)
             and lse_dtype == _cutlass.Float32
@@ -1497,9 +1495,8 @@ class ThroughputLatencyMlaDecodeTs:
             else PARALLEL_GMEM_REDUCTION_ELEMENTS_PER_SLICE
         )
         if cfg.use_multi_ctas_kv == 1 and cfg.use_cluster_reduction != 1:
-            # Both the retained reducer and the parallel implementation use
-            # the same normalized partial-O workspace. Qualify the configured
-            # separate-GMEM launch regardless of which reducer is selected.
+            # Both reducer implementations use the same normalized partial-O
+            # workspace. Validate every separate-GMEM launch against it.
             validate_parallel_reduction_workspace(
                 batch_size=cfg.batch_size,
                 num_heads_q=cfg.num_heads_q,
@@ -1527,13 +1524,6 @@ class ThroughputLatencyMlaDecodeTs:
                     cluster_size=cluster_size,
                 )
             )
-        if num_heads > cfg.tile_size_q and num_heads % cfg.tile_size_q != 0:
-            raise NotImplementedError(
-                "Throughput-latency 1CTA TS MLA runtime requires multi-tile num_heads to be "
-                f"divisible by tile_size_q: num_heads={num_heads}, "
-                f"tile_size_q={cfg.tile_size_q}."
-            )
-
         self.acc_dtype = acc_dtype
         self.lse_dtype = lse_dtype
 

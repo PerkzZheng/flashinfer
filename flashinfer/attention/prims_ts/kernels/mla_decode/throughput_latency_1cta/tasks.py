@@ -122,7 +122,7 @@ class MlaDecodeTask(Task):
 
         # Task-domain ownership must match K/V, softmax, and reduction: dense
         # uses the full runtime K length, while causal uses the largest
-        # logical-Q-visible length in this groups_tokens_heads_q CTA. Using the
+        # logical-Q-visible length in this physical flat-query tile. Using the
         # raw batch length for causal can move an all-masked tile into tail and
         # replace a real loop accumulator at a tile boundary.
         cta_idx_q = tile_coord[0]

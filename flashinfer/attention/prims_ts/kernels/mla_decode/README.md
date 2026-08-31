@@ -7,7 +7,7 @@ layout: every query/cache row contains a 512-element latent component followed
 by a 64-element RoPE component, while output contains the 512 latent values.
 
 FlashInfer selects the 1-CTA throughput/latency family or the 2-CTA throughput
-family automatically. Query grouping, persistent scheduling, split-KV, and
+family automatically. Flat-row tiling, persistent scheduling, split-KV, and
 local versus separate reduction are implementation decisions. Unsupported
 shape, dtype, or mask combinations raise an error rather than falling back to
 another backend.
@@ -140,14 +140,10 @@ and reduction topology automatically. CLC-persistent scheduling is used when
 the logical work benefits from reusing resident CTAs; callers do not select a
 scheduler or kernel family through the public wrappers.
 
-For a static split-KV 2-CTA launch, the standalone reducer also follows launch
-geometry. Small split counts normally retain the coarsened reference reducer.
-The exact-capacity, one-row G1 reducer is selected only when that reference grid
-is smaller than one physical-SM wave, the producer supplies at least half a
-wave of split work, and expanding to one CTA per physical row stays within the
-shared four-wave pressure bound. S17 through S32 remain on the reference path;
-larger split counts may use the clustered reducer. These are topology rules,
-not per-head or per-sequence-length tuning exceptions.
+For a static split-KV 2-CTA launch, every reducer follows the same physical
+flat-row geometry. Padded M128 tails retain the compact logical-row reducer;
+fully populated layouts may use row-parallel or clustered reduction when their
+work and capacity bounds are satisfied.
 
 The BF16 2-CTA path enables CLC only when logical work exceeds one resident
 wave. Inactive physical Q tiles, pruned split slots, and zero-visible-K tiles skip
@@ -274,10 +270,9 @@ compact, 16-byte-aligned `out` tensor to avoid allocation.
 
 The public accuracy suite covers fixed and packed Q, `torch.bfloat16` and
 `torch.float8_e4m3fn` input, dense and causal masks, all four page sizes, both
-automatic kernel families, H12/H24/H48/H96 flat-row cases, forced 1-CTA
-M8/M16/M32/M64 profiles, 2-CTA M128 tails, runtime K pruning, split-KV
-reduction (including the underfilled one-row G1 and reference fallbacks),
-output/workspace contracts, and CUDA graphs:
+automatic kernel families, H6/H12/H24/H48/H96 flat-row cases, M128 tails,
+runtime K pruning, split-KV reduction, output/workspace contracts, and CUDA
+graphs:
 
 ```bash
 pytest -q tests/attention/test_attention_ts_mla_decode.py

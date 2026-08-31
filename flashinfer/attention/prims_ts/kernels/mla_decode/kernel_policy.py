@@ -59,7 +59,7 @@ class MlaAutomaticWork:
     one_cta_capacity: int | None = None
     two_cta_cluster_work: int | None = None
     two_cta_cluster_capacity: int | None = None
-    one_cta_is_extended_fp8_swaps: bool = False
+    allow_equal_wave_crossover: bool = False
     one_cta_tile_size_q: int | None = None
     one_cta_split_kv: int | None = None
     two_cta_split_kv: int | None = None
@@ -72,7 +72,7 @@ _SMALL_FLAT_2CTA_WAVE_FILL_NUMERATOR = 5
 _SMALL_FLAT_2CTA_WAVE_FILL_DENOMINATOR = 6
 _SMALL_FLAT_2CTA_MAX_REFERENCE_SPLIT = 4
 # Bound each 2CTA producer's K128 mainloop independently of the 1CTA
-# split-rounding policy; the two decisions may be tuned separately.
+# split-rounding policy; the two decisions model different task graphs.
 _SMALL_FLAT_DIRECT_BF16_MAX_LOCAL_K_TILES = 16
 _SMALL_FLAT_DIRECT_FP8_MAX_LOCAL_K_TILES = 18
 _SMALL_FLAT_COMPACT_BF16_MIN_LOCAL_K_TILES = 5
@@ -99,41 +99,38 @@ def _retains_normalized_producer_work(
 def _prefer_small_flat_2cta(
     num_heads: int,
     seq_len_q: int,
-    *,
-    one_cta_tile_size_q: int | None,
-    one_cta_split_kv: int | None,
-    two_cta_split_kv: int | None,
-    seq_len_k: int | None,
-    qkv_dtype: str | None,
-    one_cta_kernel_variant: str | None,
-    one_cta_work: int | None,
-    one_cta_capacity: int | None,
-    two_cta_cluster_work: int | None,
-    two_cta_cluster_capacity: int | None,
+    work: MlaAutomaticWork,
 ) -> bool:
     """Return whether a compact 2CTA topology qualifies for automatic use."""
 
     total_q_rows = num_heads * seq_len_q
     if (
         not 1 <= total_q_rows <= 64
-        or one_cta_tile_size_q not in SUPPORTED_TILE_SIZE_Q
-        or total_q_rows > one_cta_tile_size_q
+        or work.one_cta_tile_size_q not in SUPPORTED_TILE_SIZE_Q
+        or total_q_rows > work.one_cta_tile_size_q
     ):
         return False
     inputs = (
-        one_cta_split_kv,
-        two_cta_split_kv,
-        seq_len_k,
-        one_cta_work,
-        one_cta_capacity,
-        two_cta_cluster_work,
-        two_cta_cluster_capacity,
+        work.one_cta_split_kv,
+        work.two_cta_split_kv,
+        work.seq_len_k,
+        work.one_cta_work,
+        work.one_cta_capacity,
+        work.two_cta_cluster_work,
+        work.two_cta_cluster_capacity,
     )
     if any(value is None for value in inputs):
         return False
     if any(int(value) <= 0 for value in inputs):
         raise ValueError("automatic MLA topology inputs must be positive")
 
+    one_cta_split_kv = work.one_cta_split_kv
+    two_cta_split_kv = work.two_cta_split_kv
+    seq_len_k = work.seq_len_k
+    one_cta_work = work.one_cta_work
+    one_cta_capacity = work.one_cta_capacity
+    two_cta_cluster_work = work.two_cta_cluster_work
+    two_cta_cluster_capacity = work.two_cta_cluster_capacity
     assert one_cta_split_kv is not None
     assert two_cta_split_kv is not None
     assert seq_len_k is not None
@@ -174,11 +171,11 @@ def _prefer_small_flat_2cta(
         # the physical task graph: BF16 remains favorable through 16 local K128
         # tiles, while the FP8 Keeps producer crosses earlier.  FP8 Swaps does
         # not have enough per-CTA row work to offset 2CTA coordination.
-        if qkv_dtype == "bf16":
+        if work.qkv_dtype == "bf16":
             return local_k_tiles <= _SMALL_FLAT_DIRECT_BF16_MAX_LOCAL_K_TILES
         return (
-            qkv_dtype == "e4m3"
-            and one_cta_kernel_variant == "keeps_mma_ab"
+            work.qkv_dtype == "e4m3"
+            and work.one_cta_kernel_variant == "keeps_mma_ab"
             and local_k_tiles <= _SMALL_FLAT_DIRECT_FP8_MAX_LOCAL_K_TILES
         )
 
@@ -186,10 +183,10 @@ def _prefer_small_flat_2cta(
     # bounded local mainloop. BF16 reaches that window sooner; FP8 participates
     # only for the Keeps task graph, where its parallel reducer has more work.
     two_cta_is_power_of_two = two_cta_split_kv & (two_cta_split_kv - 1) == 0
-    if qkv_dtype == "bf16":
+    if work.qkv_dtype == "bf16":
         min_local_k_tiles = _SMALL_FLAT_COMPACT_BF16_MIN_LOCAL_K_TILES
         max_local_k_tiles = _SMALL_FLAT_COMPACT_BF16_MAX_LOCAL_K_TILES
-    elif qkv_dtype == "e4m3" and one_cta_kernel_variant == "keeps_mma_ab":
+    elif work.qkv_dtype == "e4m3" and work.one_cta_kernel_variant == "keeps_mma_ab":
         min_local_k_tiles = _SMALL_FLAT_COMPACT_FP8_MIN_LOCAL_K_TILES
         max_local_k_tiles = _SMALL_FLAT_COMPACT_FP8_MAX_LOCAL_K_TILES
     else:
@@ -238,18 +235,7 @@ def normalize_mla_kernel_policy(policy: str) -> MlaKernelPolicy:
 def select_default_mla_kernel_policy(
     num_heads: int,
     seq_len_q: int,
-    *,
-    one_cta_work: int | None = None,
-    one_cta_capacity: int | None = None,
-    two_cta_cluster_work: int | None = None,
-    two_cta_cluster_capacity: int | None = None,
-    one_cta_is_extended_fp8_swaps: bool = False,
-    one_cta_tile_size_q: int | None = None,
-    one_cta_split_kv: int | None = None,
-    two_cta_split_kv: int | None = None,
-    seq_len_k: int | None = None,
-    qkv_dtype: str | None = None,
-    one_cta_kernel_variant: str | None = None,
+    automatic_work: MlaAutomaticWork | None = None,
 ) -> MlaKernelPolicy:
     """Choose the default TS MLA family from work and resident capacity.
 
@@ -257,14 +243,15 @@ def select_default_mla_kernel_policy(
     one-tile flat launch uses 2CTA when its direct-output or smaller reference
     reduction retains the 1CTA candidate's normalized producer-wave work.
     Larger shapes normally retain 2CTA, but an automatic caller may provide
-    projected work for both candidates. The established probe requires the
-    complete 2CTA launch to occupy at most one quarter of its resident cluster
-    wave and the 1CTA candidate to improve normalized occupancy. A separately
-    bounded FP8 Q16 Swaps probe may use the whole 2CTA wave and accept equal
-    normalized occupancy: its caller has already proved a two-step local K
-    bound, and the 1CTA schedule avoids 2CTA coordination at equal service-unit
-    fill. No device-name whitelist participates in any decision.
+    projected work for both candidates. The underfilled-grid probe requires
+    the complete 2CTA launch to occupy at most one quarter of its resident cluster
+    wave and the 1CTA candidate to improve normalized occupancy. A candidate
+    with a separately proven one-wave local-work bound may use the whole 2CTA
+    wave and accept equal normalized occupancy. No device-name whitelist
+    participates in any decision.
     """
+
+    work = automatic_work or MlaAutomaticWork()
 
     # When one physical 1CTA tile needs a short-K standalone reducer, a compact
     # 2CTA wave can remove or shrink that reducer without losing wave fill.
@@ -272,36 +259,31 @@ def select_default_mla_kernel_policy(
         if _prefer_small_flat_2cta(
             num_heads,
             seq_len_q,
-            one_cta_tile_size_q=one_cta_tile_size_q,
-            one_cta_split_kv=one_cta_split_kv,
-            two_cta_split_kv=two_cta_split_kv,
-            seq_len_k=seq_len_k,
-            qkv_dtype=qkv_dtype,
-            one_cta_kernel_variant=one_cta_kernel_variant,
-            one_cta_work=one_cta_work,
-            one_cta_capacity=one_cta_capacity,
-            two_cta_cluster_work=two_cta_cluster_work,
-            two_cta_cluster_capacity=two_cta_cluster_capacity,
+            work,
         ):
             return "throughput_2cta"
         return "throughput_latency_1cta"
 
     occupancy_inputs = (
-        one_cta_work,
-        one_cta_capacity,
-        two_cta_cluster_work,
-        two_cta_cluster_capacity,
+        work.one_cta_work,
+        work.one_cta_capacity,
+        work.two_cta_cluster_work,
+        work.two_cta_cluster_capacity,
     )
     if any(value is None for value in occupancy_inputs):
         return "throughput_2cta"
     if any(int(value) <= 0 for value in occupancy_inputs):
         raise ValueError("automatic MLA family work and capacities must be positive")
 
+    one_cta_work = work.one_cta_work
+    one_cta_capacity = work.one_cta_capacity
+    two_cta_cluster_work = work.two_cta_cluster_work
+    two_cta_cluster_capacity = work.two_cta_cluster_capacity
     assert one_cta_work is not None
     assert one_cta_capacity is not None
     assert two_cta_cluster_work is not None
     assert two_cta_cluster_capacity is not None
-    if one_cta_is_extended_fp8_swaps:
+    if work.allow_equal_wave_crossover:
         two_cta_underfilled = two_cta_cluster_work <= two_cta_cluster_capacity
         one_cta_has_more_occupancy = (
             one_cta_work * two_cta_cluster_capacity
@@ -327,22 +309,11 @@ def resolve_mla_kernel_policy(
     """Resolve an explicit or automatic TS MLA kernel policy."""
 
     if policy in (None, "", "auto"):
-        work = automatic_work or MlaAutomaticWork()
         return (
             select_default_mla_kernel_policy(
                 num_heads,
                 seq_len_q,
-                one_cta_work=work.one_cta_work,
-                one_cta_capacity=work.one_cta_capacity,
-                two_cta_cluster_work=work.two_cta_cluster_work,
-                two_cta_cluster_capacity=work.two_cta_cluster_capacity,
-                one_cta_is_extended_fp8_swaps=(work.one_cta_is_extended_fp8_swaps),
-                one_cta_tile_size_q=work.one_cta_tile_size_q,
-                one_cta_split_kv=work.one_cta_split_kv,
-                two_cta_split_kv=work.two_cta_split_kv,
-                seq_len_k=work.seq_len_k,
-                qkv_dtype=work.qkv_dtype,
-                one_cta_kernel_variant=work.one_cta_kernel_variant,
+                automatic_work,
             ),
             "auto",
         )

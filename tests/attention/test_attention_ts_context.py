@@ -1448,7 +1448,7 @@ def test_attention_ts_context_plan_rejects_causal_q_longer_than_kv(paged: bool):
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_paged_uniform_geometry_has_distinct_semantic_key():
+def test_attention_ts_context_paged_uniform_geometry_has_distinct_compile_spec():
     """Only max-filled Q and uniform snapshotted K select uniform offsets."""
 
     uniform_case = _make_paged_context_case(
@@ -1501,10 +1501,12 @@ def test_attention_ts_context_paged_uniform_geometry_has_distinct_semantic_key()
     assert redistributable_metadata.seq_lens == uniform_metadata.seq_lens
     assert redistributable_geometry.uniform_packed_lengths is False
 
-    uniform_key = context_module._paged_semantic_key(uniform_geometry)
-    redistributable_key = context_module._paged_semantic_key(redistributable_geometry)
-    assert uniform_key != redistributable_key
-    assert uniform_key == context_module._paged_semantic_key(
+    uniform_spec = context_module._paged_context_compile_spec(uniform_geometry)
+    redistributable_spec = context_module._paged_context_compile_spec(
+        redistributable_geometry
+    )
+    assert uniform_spec != redistributable_spec
+    assert uniform_spec == context_module._paged_context_compile_spec(
         replace(redistributable_geometry, uniform_packed_lengths=True)
     )
 

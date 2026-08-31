@@ -742,7 +742,7 @@ def run_gmem_reduction_kernel(
             )
         return
 
-    # Scalar fallback: one reducer coordinate owns one grouped row and one
+    # Scalar fallback: one reducer coordinate owns one flat query row and one
     # head-dimension band, then publishes only after logical-row validation.
     reduction_dim_tiles = ceil_div(cfg.head_dim_v, GMEM_REDUCTION_SCALAR_DIM_TILE)
     head_idx = head_dim_tile_idx // Int32(reduction_dim_tiles)

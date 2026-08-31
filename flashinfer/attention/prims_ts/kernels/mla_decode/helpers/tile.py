@@ -301,17 +301,17 @@ def runtime_work_tile_is_active(
 
 
 @cute.jit
-def runtime_seq_len_kv_for_effective_head(
+def runtime_seq_len_kv_for_query_row(
     cfg: MlaConfig,
     cache_seqs,
     batch_idx,
     cta_idx_q,
-    effective_head_idx,
+    row_in_tile,
     cu_seqlens_q=None,
 ):
     """Return the KV length visible to one physical flat-query row."""
     _, _, logical_q_idx, _, _ = flat_query_row_state(
-        effective_head_idx,
+        row_in_tile,
         cta_idx_q,
         cfg.tile_size_q,
         cfg.logical_num_heads_q,

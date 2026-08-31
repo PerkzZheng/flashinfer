@@ -51,15 +51,15 @@ def _parallel_reduction_row_state(
     cu_seqlens_q,
     block_split_kvs,
     split_kv,
-    effective_head_idx,
-    seq_q_idx,
+    row_in_tile,
+    query_tile_idx,
     batch_idx,
     cfg,
 ):
     """Return logical row coordinates and its runtime active split count.
 
     Keep this arithmetic identical to the serial reducer below.  A causal row
-    can see fewer K tiles than the last row in its grouped producer tile, and a
+    can see fewer K tiles than the last row in its producer tile, and a
     variable-length batch can expose fewer real partitions than the compiled
     static split capacity.  The parallel reducer must ignore both kinds of
     empty workspace rows.
@@ -72,8 +72,8 @@ def _parallel_reduction_row_state(
         storage_q_idx,
         query_is_valid,
     ) = flat_query_row_state(
-        effective_head_idx,
-        seq_q_idx,
+        row_in_tile,
+        query_tile_idx,
         tile_size_q,
         num_heads,
         seq_len_q,
@@ -88,27 +88,27 @@ def _parallel_reduction_row_state(
         block_split_kvs,
         batch_idx,
     )
-    group_k = cache_seqs[batch_idx]
-    row_k = group_k
+    tile_k = cache_seqs[batch_idx]
+    row_k = tile_k
     if cutlass.const_expr(cfg.mask_type == MaskType.CAUSAL.value and seq_len_q > 1):
         _, logical_seq_len_q = query_batch_bounds(
             cu_seqlens_q,
             batch_idx,
             seq_len_q,
         )
-        _, _, group_last_logical_q_idx, _, _ = flat_query_row_state(
+        _, _, tile_last_logical_q_idx, _, _ = flat_query_row_state(
             Int32(tile_size_q - 1),
-            seq_q_idx,
+            query_tile_idx,
             tile_size_q,
             num_heads,
             seq_len_q,
             cu_seqlens_q,
             batch_idx,
         )
-        group_k = mask_visible_k_length(
+        tile_k = mask_visible_k_length(
             cfg.mask_type,
-            group_k,
-            group_last_logical_q_idx,
+            tile_k,
+            tile_last_logical_q_idx,
             logical_seq_len_q,
         )
         row_k = mask_visible_k_length(
@@ -117,11 +117,11 @@ def _parallel_reduction_row_state(
             logical_q_idx,
             logical_seq_len_q,
         )
-    group_k_tile_total = (group_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
+    tile_k_tile_total = (tile_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     row_k_tile_total = (row_k + cfg.mma_qk_tiler[1] - 1) // cfg.mma_qk_tiler[1]
     active_split_kv = runtime_row_prefix_active_split_count(
         row_k_tile_total,
-        group_k_tile_total,
+        tile_k_tile_total,
         split_kv_cap,
     )
     return (
@@ -206,12 +206,12 @@ def run_parallel_reduction_kernel(
     signal before entering this body.
     """
 
-    block_idx_x, seq_q_idx, batch_idx = cute.arch.block_idx()
+    block_idx_x, query_tile_idx, batch_idx = cute.arch.block_idx()
     tidx, _, _ = cute.arch.thread_idx()
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     lane_idx = tidx % Int32(cfg.threads_per_warp)
     cluster_rank = cute.arch.block_idx_in_cluster()
-    effective_head_idx = block_idx_x // Int32(cluster_size)
+    row_in_tile = block_idx_x // Int32(cluster_size)
     (
         logical_head_idx,
         logical_q_idx,
@@ -227,8 +227,8 @@ def run_parallel_reduction_kernel(
         cu_seqlens_q,
         block_split_kvs,
         split_kv,
-        effective_head_idx,
-        seq_q_idx,
+        row_in_tile,
+        query_tile_idx,
         batch_idx,
         cfg,
     )
@@ -273,7 +273,7 @@ def run_parallel_reduction_kernel(
             # ranks must not form a load from the unpadded producer allocation.
             if active_slot:
                 lane_lse[lane_slot_i] = Float32(
-                    acc_lse[effective_head_idx, split_idx, seq_q_idx, batch_idx]
+                    acc_lse[row_in_tile, split_idx, query_tile_idx, batch_idx]
                 )
             local_lse_max = fmax_f32(
                 local_lse_max,
@@ -332,10 +332,10 @@ def run_parallel_reduction_kernel(
         if active_slot:
             split_scale = Float32(smem_local_scale[slot_i])
             partial_offset = Int64(
-                effective_head_idx * acc_output.stride[0]
+                row_in_tile * acc_output.stride[0]
                 + split_idx * acc_output.stride[1]
                 + element_idx * acc_output.stride[2]
-                + seq_q_idx * acc_output.stride[3]
+                + query_tile_idx * acc_output.stride[3]
                 + batch_idx * acc_output.stride[4]
             )
             partial_output = (

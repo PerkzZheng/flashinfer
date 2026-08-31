@@ -875,16 +875,15 @@ class MlaDecodeTs:
 
         self.parallel_reduction_topology = None
         self.use_parallel_reduction = False
-        effective_num_heads, effective_seq_len_q = self._effective_reduction_shape()
+        physical_tile_rows, num_query_tiles = self._effective_reduction_shape()
 
-        # The established reducer shares this normalized partial workspace.
-        # Validate its full configured capacity too, not only the clustered
-        # implementation selected for high split counts.
+        # Every reducer shares this normalized partial workspace. Validate its
+        # full configured capacity, not only high-split clustered launches.
         if self.reduction_split_capacity > 1:
             validate_parallel_reduction_workspace(
                 batch_size=self.batch_size,
-                num_heads_q=effective_num_heads,
-                seq_len_q=effective_seq_len_q,
+                num_heads_q=physical_tile_rows,
+                seq_len_q=num_query_tiles,
                 splits_kv=self.reduction_split_capacity,
                 head_dim=PARALLEL_REDUCTION_HEAD_DIM,
             )
@@ -899,15 +898,12 @@ class MlaDecodeTs:
             max_cluster_size=8,
         )
         parallel_g1_grid_has_no_padded_rows = (
-            self.query_tile_layout.total_rows
-            == effective_num_heads * effective_seq_len_q
+            self.query_tile_layout.total_rows == physical_tile_rows * num_query_tiles
         )
-        # Small split counts keep the reference reducer unless its row
-        # coarsening leaves a sub-wave grid and the producer generated enough
-        # work to amortize one CTA per physical row. Do not replace the compact
-        # logical-row reference grid with a G1 launch padded to physical M128
-        # rows. S17..S32 continue to use the reference path; high-split
-        # clustered reduction retains its established selection above it.
+        # Small split counts use G1 only when row coarsening leaves a sub-wave
+        # grid and the producer generated enough work to amortize one CTA per
+        # physical row. Padded M128 tails and intermediate split counts retain
+        # the compact reference grid; high split counts may use clusters.
         use_small_split_g1 = (
             self.static_split_kv <= 16
             and topology is not None
@@ -915,9 +911,9 @@ class MlaDecodeTs:
             and parallel_g1_grid_has_no_padded_rows
             and should_use_q128_g1_parallel_reducer(
                 batch_size=self.batch_size,
-                physical_rows_per_batch=(effective_num_heads * effective_seq_len_q),
+                physical_rows_per_batch=(physical_tile_rows * num_query_tiles),
                 producer_ctas=(
-                    self.batch_size * effective_seq_len_q * self.static_split_kv * 2
+                    self.batch_size * num_query_tiles * self.static_split_kv * 2
                 ),
                 reference_rows_per_cta=self.reference_reduction_rows_per_cta,
                 physical_sm_count=self.max_active_clusters * 2,
@@ -965,8 +961,8 @@ class MlaDecodeTs:
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
         )
-        effective_num_heads_q = self.mma_qk_tiler_mn[0]
-        effective_seq_len_q = self.num_q_tiles
+        physical_tile_rows = self.mma_qk_tiler_mn[0]
+        num_query_tiles = self.num_q_tiles
         # Fixed public tensors retain [H,D,SQ,B]/[H,SQ,B]; variable-Q tensors
         # compact batches into [H,D,totalQ]/[H,totalQ]. The scheduler/workspace
         # use physical flat-query tile coordinates, while resources map
@@ -1156,20 +1152,20 @@ class MlaDecodeTs:
         tile_sched_params = create_mla_static_tile_scheduler_params(
             self.is_persistent,
             batch_size,
-            Int32(effective_seq_len_q),
+            Int32(num_query_tiles),
             cfg.cluster_shape_mnk,
             kernel_split_kv,
         )
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
         clc_tile_sched_params = None
         if cutlass.const_expr(use_clc_dynamic):
-            # Keep the logical query-group dimension in grid X and flatten
+            # Keep the physical query-tile dimension in grid X and flatten
             # only split/batch into grid Z.  Besides avoiding a hot-path
             # S/B decode for every stolen tile, this preserves the natural
             # 2CTA query-cluster raster used by the nonpersistent launch.
             clc_tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
                 (
-                    cfg.cluster_shape_mnk[0] * Int32(effective_seq_len_q),
+                    cfg.cluster_shape_mnk[0] * Int32(num_query_tiles),
                     1,
                     batch_size * kernel_split_kv,
                 ),
@@ -1183,9 +1179,9 @@ class MlaDecodeTs:
 
         # Initialize workspace for split_kv > 1
         acc_o, acc_lse = self.initialize_workspace(
-            Int32(effective_num_heads_q),  # grouped H
+            Int32(physical_tile_rows),
             cfg.latent_dim,  # D
-            Int32(effective_seq_len_q),  # grouped SQ groups
+            Int32(num_query_tiles),
             batch_size,
             kernel_split_kv,
             workspace,
@@ -1240,8 +1236,8 @@ class MlaDecodeTs:
                     block_split_kvs,
                 ).launch(
                     grid=(
-                        effective_num_heads_q * topology.cluster_size,
-                        effective_seq_len_q,
+                        physical_tile_rows * topology.cluster_size,
+                        num_query_tiles,
                         batch_size,
                     ),
                     block=[PARALLEL_REDUCTION_THREADS, 1, 1],
@@ -1279,7 +1275,7 @@ class MlaDecodeTs:
                         // 8
                     ),
                     stream=stream,
-                    # Preserve the established 1,024 resident-thread launch
+                    # Preserve the 1,024 resident-thread launch
                     # bound as row coarsening changes the CTA thread count.
                     min_blocks_per_mp=(
                         2 * REDUCTION_ROWS_PER_CTA // reduction_rows_per_cta
@@ -1325,7 +1321,7 @@ class MlaDecodeTs:
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
         )
-        effective_seq_len_q = self.num_q_tiles
+        num_query_tiles = self.num_q_tiles
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
         tiled_mma_qk = None
         if cutlass.const_expr(cfg.is_fp8_qkv()):
@@ -1456,7 +1452,7 @@ class MlaDecodeTs:
             cluster_idx = current_work_linear_idx % Int32(cfg.cluster_shape_mnk[0])
             current_work_after_seq_q, seq_q_idx = divmod_constexpr_power_of_two_or_fdd(
                 current_work_cluster_batch,
-                effective_seq_len_q,
+                num_query_tiles,
                 tile_sched_params.problem_shape_s_fdd,
             )
             current_work_after_batch, batch_idx = divmod_constexpr_power_of_two_or_fdd(
@@ -1514,7 +1510,7 @@ class MlaDecodeTs:
                 tile_batch_idx,
                 self.seq_len_q,
             )
-            q_group_has_rows = runtime_flat_query_tile_has_rows(
+            query_tile_has_rows = runtime_flat_query_tile_has_rows(
                 tile_seq_q_idx,
                 self.mma_qk_tiler_mn[0],
                 self.num_heads,
@@ -1535,7 +1531,7 @@ class MlaDecodeTs:
                     tile_batch_idx,
                 )
                 K = mask_visible_k_length(cfg.mask_type, K, logical_q_idx, q_len)
-            K = K if q_group_has_rows else Int32(0)
+            K = K if query_tile_has_rows else Int32(0)
             # split_kv is the static launch/workspace capacity. Runtime K
             # contracts the optional per-batch cap to an active prefix.
             max_split_kv = (
@@ -1647,7 +1643,7 @@ class MlaDecodeTs:
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=self.seq_len_q,
                 static_problem_shape_b=None,
-                static_problem_shape_s=effective_seq_len_q,
+                static_problem_shape_s=num_query_tiles,
                 use_clc_dynamic=use_clc_dynamic,
                 tile_scheduler_config=work_queue_tile_scheduler_config,
                 pipeline_config=work_queue_pipeline_config,

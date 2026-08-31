@@ -14,9 +14,8 @@
 
 """Configuration for the throughput 2CTA MLA decode TS kernel.
 
-The throughput 2CTA policy uses a 2CTA M128 schedule. BF16 is the public
-throughput path; dtype traits are explicit so FP8 bring-up can share the same
-configuration structure once its 2CTA V/PV layout is complete.
+The throughput 2CTA policy uses a 2CTA M128 schedule. BF16 and FP8 inputs share
+the same explicit configuration structure and output-reduction contract.
 """
 
 from dataclasses import dataclass
@@ -92,7 +91,7 @@ def select_reference_reduction_rows_per_cta(
     Splitting an eight-row CTA in half exposes more independent reducer work
     without changing total row work.  Require at least half a producer wave and
     retain the same four-wave pressure bound as the Q128 parallel-reducer
-    selector.  Larger grids keep the established eight-row/512-thread CTA.
+    selector. Larger grids keep the eight-row/512-thread CTA.
     """
 
     for value, name in (
@@ -151,7 +150,7 @@ def compute_split_kv(
     # A 2CTA split is one producer cluster.  Use the largest power-of-two wave
     # that fits the host-reported resident cluster capacity only when every
     # split retains enough K tiles to amortize the clustered reducer.  Shorter
-    # local-K work stays in the established compact S<=32 regime.
+    # local-K work stays in the compact S<=32 regime.
     target_clusters = max(1, max_active_blocks // 2)
     resident_wave_splits = min(
         MAX_SPLITS,

@@ -89,7 +89,7 @@ from ...helpers.tile import (
     cta_idx_q_for_stage,
     global_kv_tile_idx,
     head_idx_for_stage,
-    runtime_seq_len_kv_for_effective_head,
+    runtime_seq_len_kv_for_query_row,
     runtime_seq_len_kv_from_task_cache,
     softmax_kv_tile_idx,
 )
@@ -393,7 +393,7 @@ class TmemSResource(MlaResource):
         s_arr,
         section: cutlass.Constexpr[MlaStage],
     ):
-        """Read S from TMEM and update the grouped-head softmax state."""
+        """Read S from TMEM and update the flat-query softmax state."""
         # Consumer work for TmemSResource: softmax waits for the QK MMA score
         # stage, loads S from TMEM, applies masks, and returns updated local
         # softmax state to the captured schedule.
@@ -501,7 +501,7 @@ class TmemSResource(MlaResource):
             cfg.mask_type == MaskType.CAUSAL.value and cfg.logical_seq_len_q > 1
         )
         if cutlass.const_expr(needs_row_causal_mask):
-            min_seq_len_kv = runtime_seq_len_kv_for_effective_head(
+            min_seq_len_kv = runtime_seq_len_kv_for_query_row(
                 cfg,
                 self.cache_seqs,
                 batch_idx,
@@ -520,17 +520,17 @@ class TmemSResource(MlaResource):
             if cutlass.const_expr(cfg.kernel_variant == "keeps_mma_ab"):
                 local_col_base = (lane_idx >> Int32(4)) * Int32(cfg.tile_size_kv // 2)
                 local_row_idx = warp_idx * Int32(16) + (lane_idx & Int32(0xF))
-                effective_head_idx = (
+                row_in_tile = (
                     head_idx_for_stage(self.head_idx, cfg, stage_info) + local_row_idx
                 )
                 row_seq_len_kv = seq_len_kv
                 if cutlass.const_expr(needs_row_causal_mask):
-                    row_seq_len_kv = runtime_seq_len_kv_for_effective_head(
+                    row_seq_len_kv = runtime_seq_len_kv_for_query_row(
                         cfg,
                         self.cache_seqs,
                         batch_idx,
                         cta_idx_q,
-                        effective_head_idx,
+                        row_in_tile,
                         self.cu_seqlens_q,
                     )
                 for reg_idx in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
@@ -550,29 +550,29 @@ class TmemSResource(MlaResource):
                     SCORE_ROWS_PER_Q_PAIR
                 )
                 for repeat_idx in cutlass.range_constexpr(q_repeats):
-                    effective_head_idx_0 = (
+                    row_in_tile_0 = (
                         head_idx
                         + Int32(repeat_idx * SCORE_TOKENS_PER_QK_GROUP)
                         + local_q_pair
                     )
-                    effective_head_idx_1 = effective_head_idx_0 + Int32(1)
+                    row_in_tile_1 = row_in_tile_0 + Int32(1)
                     seq_len_kv_0 = seq_len_kv
                     seq_len_kv_1 = seq_len_kv
                     if cutlass.const_expr(needs_row_causal_mask):
-                        seq_len_kv_0 = runtime_seq_len_kv_for_effective_head(
+                        seq_len_kv_0 = runtime_seq_len_kv_for_query_row(
                             cfg,
                             self.cache_seqs,
                             batch_idx,
                             cta_idx_q,
-                            effective_head_idx_0,
+                            row_in_tile_0,
                             self.cu_seqlens_q,
                         )
-                        seq_len_kv_1 = runtime_seq_len_kv_for_effective_head(
+                        seq_len_kv_1 = runtime_seq_len_kv_for_query_row(
                             cfg,
                             self.cache_seqs,
                             batch_idx,
                             cta_idx_q,
-                            effective_head_idx_1,
+                            row_in_tile_1,
                             self.cu_seqlens_q,
                         )
                     s_base = repeat_idx * 4

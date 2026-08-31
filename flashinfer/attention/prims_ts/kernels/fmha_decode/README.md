@@ -232,11 +232,12 @@ window, and Q-layout arguments as the launch. Allocate at least that many
 bytes as a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8`
 tensor. Zero it before first use and re-zero it whenever any workspace-layout
 input, including batch size, changes because the internal workspace section
-offsets can move even when the compiled callable is reused. Do not share it between concurrent
-launches or captured graphs. It must not overlap Q, K/V cache, metadata, or
-output storage. The standalone hot path trusts CSR, `seq_lens`, and packed-Q
-values: keep lengths positive and within their static bounds, keep enough page
-entries in every CSR row for its live length, and keep all page IDs valid. CSR
+offsets can move even when the compiled callable is reused. Do not share it
+between concurrent launches or captured graphs. It must not overlap Q, K/V
+cache, metadata, or output storage. The standalone hot path trusts CSR,
+`seq_lens`, and packed-Q values: keep lengths positive and within their static
+bounds, keep enough page entries in every CSR row for its live length, and keep
+all page IDs valid. CSR
 offsets, sequence lengths, page IDs, and packed-Q offsets may change between
 completed launches or graph replays while preserving those contracts and
 stable captured storage. Do not mutate them concurrently with an execution

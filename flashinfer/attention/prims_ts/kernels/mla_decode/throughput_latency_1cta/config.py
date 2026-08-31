@@ -41,9 +41,8 @@ from ..helpers.query import FlatQueryTileLayout
 # keeps-MMA-AB profiles.
 SUPPORTED_TILE_SIZE_Q = (8, 16, 32, 64)
 
-# Automatic profile search without a groups_tokens_heads_q tile target considers only
-# the low-Q swaps-MMA-AB variants. groups_tokens_heads_q selection may supply a
-# q32 or q64 target before profile resolution.
+# Automatic profile search starts with the low-row Swaps-MMA-AB variants. Flat
+# query-row selection may supply an M32 or M64 target before profile resolution.
 AUTO_SWAPS_TILE_SIZE_Q = (8, 16)
 
 # The Swaps task graph consumes two K128 instructions per steady-state step.
@@ -60,15 +59,15 @@ FULL_ROW_PROMOTION_WAVE_DENOMINATOR = 6
 
 # Small Swaps Q tiles expose less useful row work per producer CTA than the
 # M32/M64 schedules.  Keep their single-digit split counts occupancy-first;
-# once at least 16 K partitions feed the standalone reducer, the measured
-# reduction/workspace saving from a power-of-two split wins across M8/M16 and
-# BF16/FP8.  The common five-sixths wave guard below still decides
-# whether the rounded producer grid is sufficiently full.
+# once at least 16 K partitions feed the standalone reducer, power-of-two
+# rounding is permitted across M8/M16 and BF16/FP8. The common five-sixths wave
+# guard below still decides whether the rounded producer grid is sufficiently
+# full.
 SMALL_Q_TILE_SPLIT_ROUNDING_MIN_SPLITS = 16
 
 # Reducing a split count trades producer-rank depth for a smaller standalone
-# reducer. Bound that trade by the measured mainloop window of each task graph;
-# beyond it, retain the more balanced unrounded producer decomposition.
+# reducer. Bound that trade by each task graph's local-mainloop window; beyond
+# it, retain the more balanced unrounded producer decomposition.
 AUTO_SPLIT_ROUND_BF16_MAX_LOCAL_K_TILES = 10
 AUTO_SPLIT_ROUND_FP8_MAX_LOCAL_K_TILES = 13
 
@@ -143,7 +142,7 @@ class MlaConfig:
     use_bf16_output: int = 1
     use_fp8_output: int = 0
 
-    # Mainloop tile shape for groups_tokens_heads_q decode.  Each loop step consumes two
+    # Mainloop tile shape for flat query-row decode. Each loop step consumes two
     # 128-token KV tiles: K for the current score update and V for the delayed
     # PV update.
     tile_size_q: int = 16
@@ -475,10 +474,6 @@ class FlatQueryLaunchShape:
     ) -> "FlatQueryLaunchShape":
         """Build consecutive physical M-row tiles for one logical query."""
 
-        if logical_num_heads_q <= 0:
-            raise ValueError("logical_num_heads_q must be positive")
-        if logical_seq_len_q <= 0:
-            raise ValueError("logical_seq_len_q must be positive")
         layout = FlatQueryTileLayout.for_tile(
             logical_num_heads_q,
             logical_seq_len_q,
@@ -515,16 +510,16 @@ def tile_size_q_from_profile_name(profile: str | None) -> int | None:
     return None
 
 
-def tile_size_q_for_tokens_heads(num_tokens_heads_q: int) -> int:
-    """Return the groups_tokens_heads_q tile target from tokens times heads."""
+def tile_size_q_for_flat_rows(total_q_rows: int) -> int:
+    """Return the smallest supported tile for a flat query-row count."""
 
-    if num_tokens_heads_q <= 0:
-        raise ValueError("num_tokens_heads_q must be positive")
-    if num_tokens_heads_q <= 8:
+    if total_q_rows <= 0:
+        raise ValueError("total_q_rows must be positive")
+    if total_q_rows <= 8:
         return 8
-    if num_tokens_heads_q <= 16:
+    if total_q_rows <= 16:
         return 16
-    if num_tokens_heads_q <= 32:
+    if total_q_rows <= 32:
         return 32
     return 64
 
@@ -540,7 +535,7 @@ def validate_max_active_clusters(max_active_clusters: int) -> int:
 
 
 def tile_size_q_for_heads(num_heads_q: int) -> int:
-    """Choose the automatic 1CTA Q tile from the effective grouped head count."""
+    """Choose the automatic 1CTA Q tile from the physical row extent."""
 
     # H8 gets a q8 tile, H16/H32 use the q16 swaps-MMA-AB schedule, and wider
     # effective head tiles use the q64 keeps-MMA-AB schedule.
@@ -739,7 +734,7 @@ def should_use_short_bf16_m32_flat_query_tile(
 
 
 def throughput_full_flat_query_tile_size_q(total_q_rows: int) -> int:
-    """Return the measured one-scan tile for a promoted flat-row launch.
+    """Return the one-scan tile for a promoted flat-row launch.
 
     M64 Keeps is the full-row schedule for 17--64 rows. Smaller row products
     retain their M8/M16 latency tiles; the bounded short-work M32 choice is
@@ -748,7 +743,7 @@ def throughput_full_flat_query_tile_size_q(total_q_rows: int) -> int:
 
     if 16 < total_q_rows <= 64:
         return 64
-    return tile_size_q_for_tokens_heads(total_q_rows)
+    return tile_size_q_for_flat_rows(total_q_rows)
 
 
 def should_promote_full_flat_query_tile(
@@ -836,7 +831,7 @@ def prefer_smaller_swaps_tile_for_resident_work(
     return selected_tile_size_q
 
 
-def resolve_auto_mla_gen_groups_tokens_heads_q_shape(
+def resolve_auto_flat_query_launch_shape(
     *,
     batch_size: int,
     num_heads_q: int,
@@ -910,8 +905,8 @@ def smaller_tile_size_q_candidates(
 
     min_tile_size_q = min_heuristic_tile_size_q(num_heads_q)
     candidates = []
-    # Keep tile_size_q=32 available for explicit benchmarking, but do not
-    # select it automatically until the swaps-MMA-AB q32 profile is tuned.
+    # Generic split-exhaustion search uses the low-row Swaps variants. M32 is
+    # selected only by the full-row multiwave policy above.
     for candidate in reversed(AUTO_SWAPS_TILE_SIZE_Q):
         if candidate >= tile_size_q or candidate < min_tile_size_q:
             continue
@@ -947,10 +942,9 @@ def automatic_split_kv_step_tokens(
 
     The base steady-state step consumes two 128-token KV tiles.  FP8 q8 keeps
     two such steps per split, while FP8 q16 uses four once the Q grid already
-    exposes more than four CTAs. Those FP8 factors come from local measurements
-    rather than imported constants. For non-divisible K, the final balanced split
+    exposes more than four CTAs. For non-divisible K, the final balanced split
     can own less than the target. BF16 q8 uses the common one-step cadence;
-    the tiny q16 grid keeps its existing two-step cadence.
+    a two-CTA q16 grid uses two steps per split.
     """
 
     steady_step_tokens = MlaConfig.tile_size_kv * MlaConfig.num_insts_kv
@@ -1483,11 +1477,9 @@ def keeps_mma_ab_profiles(
     )
     base_work = q_tile_work_count(batch_size, num_heads_q, seq_len_q, 64)
     if base_work > max_active_clusters:
-        # The Keeps-MMA-AB task graph does not yet retire a second persistent
-        # work tile reliably. A persistent launch therefore cancels the grid
-        # suffix once work exceeds the resident wave. Do not enumerate that
-        # candidate for a multi-wave shape; the direct grid is the complete
-        # automatic path until multi-tile persistence is qualified here.
+        # The Keeps-MMA-AB task graph supports one persistent work tile. A
+        # persistent launch would therefore omit the grid suffix once work
+        # exceeds the resident wave, so multi-wave shapes use the direct grid.
         return nonpersistent, split
     return nonpersistent, clc, split
 
@@ -1745,27 +1737,24 @@ def wave_fill_split_kv(
     return best_split
 
 
-def fp8_q16_extended_family_probe_split_kv(
+def bounded_swaps_family_probe_split_kv(
     *,
     batch_size: int,
     num_heads_q: int,
     seq_len_q: int,
     seq_len_kv: int,
+    tile_size_q: int,
     max_active_clusters: int,
+    max_local_k_steps: int = 2,
 ) -> int | None:
-    """Return the bounded split count for an extended FP8 Q16 family probe.
+    """Return a one-wave split count with bounded local Swaps mainloop work.
 
-    The ordinary family probe is intentionally conservative and remains
-    unchanged.  This extended probe is considered only by the public planner
-    after a 2CTA launch fits in one resident cluster wave.  A Q16 Swaps CTA
-    consumes two KV128 instructions per steady-state step.  Give the candidate
-    enough splits to keep its local K span at no more than two such steps while
-    keeping the complete Q/K grid in one 1CTA wave.  If hardware capacity
-    cannot satisfy both constraints, return ``None`` instead of selecting a
-    K-rereading Q16 family with a long local mainloop.
+    Give the candidate enough splits to keep its local K span within
+    ``max_local_k_steps`` while keeping the complete Q/K grid in one 1CTA wave.
+    If hardware capacity cannot satisfy both constraints, return ``None``.
 
     V-head-dimension sharding is deliberately not part of this decision.  The
-    existing ``head_dim_split_for_work`` policy derives it after split-KV has
+    shared ``head_dim_split_for_work`` policy derives it after split-KV has
     been fixed, preserving the launch-policy order of Q tile, K split, then V
     decomposition.
     """
@@ -1773,8 +1762,10 @@ def fp8_q16_extended_family_probe_split_kv(
     max_active_clusters = validate_max_active_clusters(max_active_clusters)
     if seq_len_kv <= 0:
         raise ValueError("seq_len_kv must be positive")
+    validate_tile_size_q(tile_size_q)
+    if max_local_k_steps <= 0:
+        raise ValueError("max_local_k_steps must be positive")
 
-    tile_size_q = 16
     base_work = q_tile_work_count(
         batch_size,
         num_heads_q,
@@ -1788,14 +1779,13 @@ def fp8_q16_extended_family_probe_split_kv(
         return None
 
     steady_step_tokens = MlaConfig.tile_size_kv * MlaConfig.num_insts_kv
-    max_local_steps = 2
     target_split_kv = max(
         1,
-        ceil(seq_len_kv / (max_local_steps * steady_step_tokens)),
+        ceil(seq_len_kv / (max_local_k_steps * steady_step_tokens)),
     )
     split_kv = min(target_split_kv, max_wave_splits)
     local_steps = ceil(seq_len_kv / (split_kv * steady_step_tokens))
-    if local_steps > max_local_steps:
+    if local_steps > max_local_k_steps:
         return None
     return split_kv
 

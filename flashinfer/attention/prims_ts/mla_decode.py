@@ -81,7 +81,7 @@ class _MLAOneCtaCandidate:
     decision: Any
     split_kv: int | None
     work: int
-    is_extended_fp8_swaps: bool = False
+    allow_equal_wave_crossover: bool = False
 
 
 @dataclass(frozen=True)
@@ -613,8 +613,8 @@ def _resolve_mla_decode_launch_spec(
         FlatQueryLaunchShape,
         auto_tile_size_q_for_mla_gen,
         compute_workspace_size as compute_1cta_workspace_size,
-        fp8_q16_extended_family_probe_split_kv,
-        resolve_auto_mla_gen_groups_tokens_heads_q_shape,
+        bounded_swaps_family_probe_split_kv,
+        resolve_auto_flat_query_launch_shape,
         resolve_runtime_cluster_reduction_mode,
         wave_fill_split_kv,
     )
@@ -658,7 +658,7 @@ def _resolve_mla_decode_launch_spec(
             batch_size * two_cta_layout.num_tiles * max(two_cta_split_kv, 1)
         )
 
-        one_cta_launch_shape = resolve_auto_mla_gen_groups_tokens_heads_q_shape(
+        one_cta_launch_shape = resolve_auto_flat_query_launch_shape(
             batch_size=batch_size,
             num_heads_q=num_heads,
             seq_len_q=seq_len_q,
@@ -693,7 +693,7 @@ def _resolve_mla_decode_launch_spec(
             decision,
             split_kv=None,
             *,
-            is_extended_fp8_swaps=False,
+            allow_equal_wave_crossover=False,
         ):
             """Return a complete candidate, or ``None`` for an unavailable profile."""
 
@@ -712,21 +712,21 @@ def _resolve_mla_decode_launch_spec(
                 decision=decision,
                 split_kv=split_kv,
                 work=int(work),
-                is_extended_fp8_swaps=is_extended_fp8_swaps,
+                allow_equal_wave_crossover=allow_equal_wave_crossover,
             )
 
         one_cta_candidate = None
         total_q_rows = num_heads * seq_len_q
-        use_established_family_probe = (
+        use_underfilled_two_cta_probe = (
             total_q_rows > 64
             and two_cta_cluster_work * 4 <= max_active_two_cta_clusters
         )
-        use_small_flat_family_probe = (
+        use_single_tile_one_cta_probe = (
             1 <= total_q_rows <= 64
             and one_cta_launch_shape.tile_size_q in (8, 16, 32, 64)
             and one_cta_launch_shape.seq_len_q == 1
         )
-        if use_established_family_probe:
+        if use_underfilled_two_cta_probe:
             initial_probe = select_one_cta(one_cta_launch_shape)
             if initial_probe.implementation_ready and initial_probe.config is not None:
                 probe_split_kv = wave_fill_split_kv(
@@ -748,12 +748,9 @@ def _resolve_mla_decode_launch_spec(
             and qkv_dtype_name == "e4m3"
             and two_cta_cluster_work <= max_active_two_cta_clusters
         ):
-            # The established probe intentionally covers only a severely
-            # underfilled 2CTA grid.  A second FP8-only probe considers Q16
-            # Swaps when both candidates fit one wave and the Q16 local K span
-            # can be held to two steady-state steps.  This avoids switching
-            # saturated or long-local-K shapes that benefit from the grouped
-            # M128 2CTA schedule.
+            # When both families fit one wave, consider a Swaps candidate only
+            # if its local K span stays within a bounded mainloop. Saturated or
+            # long-local-K shapes retain the M128 2CTA schedule.
             probe_tile_size_q = auto_tile_size_q_for_mla_gen(
                 batch_size=batch_size,
                 num_heads_q=num_heads,
@@ -762,37 +759,38 @@ def _resolve_mla_decode_launch_spec(
                 multi_processor_count=max_active_one_cta_clusters,
             )
             if probe_tile_size_q == 16:
-                extended_launch_shape = FlatQueryLaunchShape.for_tile(
+                one_wave_launch_shape = FlatQueryLaunchShape.for_tile(
                     num_heads,
                     seq_len_q,
                     probe_tile_size_q,
                 )
-                extended_split_kv = fp8_q16_extended_family_probe_split_kv(
+                one_wave_split_kv = bounded_swaps_family_probe_split_kv(
                     batch_size=batch_size,
-                    num_heads_q=extended_launch_shape.num_heads_q,
-                    seq_len_q=extended_launch_shape.seq_len_q,
+                    num_heads_q=one_wave_launch_shape.num_heads_q,
+                    seq_len_q=one_wave_launch_shape.seq_len_q,
                     seq_len_kv=max_kv_len,
+                    tile_size_q=probe_tile_size_q,
                     max_active_clusters=max_active_one_cta_clusters,
                 )
-                if extended_split_kv is not None:
-                    extended_decision = select_one_cta(
-                        extended_launch_shape,
-                        extended_split_kv,
+                if one_wave_split_kv is not None:
+                    one_wave_decision = select_one_cta(
+                        one_wave_launch_shape,
+                        one_wave_split_kv,
                     )
-                    extended_cfg = extended_decision.config
+                    one_wave_cfg = one_wave_decision.config
                     if (
-                        extended_decision.implementation_ready
-                        and extended_cfg is not None
-                        and extended_cfg.kernel_variant == "swaps_mma_ab"
-                        and extended_cfg.tile_size_q == 16
+                        one_wave_decision.implementation_ready
+                        and one_wave_cfg is not None
+                        and one_wave_cfg.kernel_variant == "swaps_mma_ab"
+                        and one_wave_cfg.tile_size_q == probe_tile_size_q
                     ):
                         one_cta_candidate = make_one_cta_candidate(
-                            extended_launch_shape,
-                            extended_decision,
-                            extended_split_kv,
-                            is_extended_fp8_swaps=True,
+                            one_wave_launch_shape,
+                            one_wave_decision,
+                            one_wave_split_kv,
+                            allow_equal_wave_crossover=True,
                         )
-        elif use_small_flat_family_probe:
+        elif use_single_tile_one_cta_probe:
             one_cta_candidate = make_one_cta_candidate(
                 one_cta_launch_shape,
                 select_one_cta(one_cta_launch_shape),
@@ -814,8 +812,8 @@ def _resolve_mla_decode_launch_spec(
             two_cta_cluster_capacity=(
                 max_active_two_cta_clusters if one_cta_candidate is not None else None
             ),
-            one_cta_is_extended_fp8_swaps=(
-                one_cta_candidate.is_extended_fp8_swaps
+            allow_equal_wave_crossover=(
+                one_cta_candidate.allow_equal_wave_crossover
                 if one_cta_candidate is not None
                 else False
             ),
@@ -902,11 +900,6 @@ def _resolve_mla_decode_launch_spec(
                 partial_o_dtype=cutlass.BFloat16,
                 lse_dtype=cutlass.Float32,
             )
-            final_query_layout = FlatQueryTileLayout.for_tile(
-                num_heads,
-                seq_len_q,
-                int(final_cfg.tile_size_q),
-            )
             separate_reducer_impl, reducer_cluster_size = _separate_reducer_provenance(
                 kernel,
                 split_kv=split_kv,
@@ -916,26 +909,12 @@ def _resolve_mla_decode_launch_spec(
                 ("kernel", decision.selected_kernel),
                 ("source", policy_source),
                 ("profile", decision.profile_name),
-                ("logical_num_heads_q", num_heads),
-                ("logical_seq_len_q", seq_len_q),
-                ("total_q_rows", int(final_query_layout.total_rows)),
-                ("num_q_tiles", int(final_query_layout.num_tiles)),
-                ("tail_q_rows", int(final_query_layout.tail_rows)),
                 ("tile_size_q", int(final_cfg.tile_size_q)),
                 ("tile_size_kv", int(final_cfg.tile_size_kv)),
                 ("num_insts_kv", int(final_cfg.num_insts_kv)),
                 ("split_kv", split_kv),
                 ("num_ctas_per_head_dim", int(final_cfg.num_ctas_per_head_dim)),
                 ("head_dim_per_cta_v", int(final_cfg.head_dim_per_cta_v)),
-                (
-                    "producer_ctas",
-                    int(
-                        batch_size
-                        * final_query_layout.num_tiles
-                        * split_kv
-                        * final_cfg.num_ctas_per_head_dim
-                    ),
-                ),
                 ("use_cluster_reduction", bool(final_cfg.use_cluster_reduction)),
                 (
                     "use_persistent_scheduler",
@@ -947,7 +926,6 @@ def _resolve_mla_decode_launch_spec(
                 ),
                 ("separate_reducer_impl", separate_reducer_impl),
                 ("reducer_cluster_size", reducer_cluster_size),
-                ("reducer_rows_per_cta", None),
             )
         else:
             max_active_clusters = max_active_two_cta_clusters
@@ -1015,21 +993,12 @@ def _resolve_mla_decode_launch_spec(
                 ("kernel", decision.selected_kernel),
                 ("source", policy_source),
                 ("profile", None),
-                ("logical_num_heads_q", num_heads),
-                ("logical_seq_len_q", seq_len_q),
-                ("total_q_rows", int(launch_shape.total_rows)),
-                ("num_q_tiles", int(launch_shape.num_tiles)),
-                ("tail_q_rows", int(launch_shape.tail_rows)),
                 ("tile_size_q", 128),
                 ("tile_size_kv", 128),
                 ("num_insts_kv", 1),
                 ("split_kv", int(split_kv)),
                 ("num_ctas_per_head_dim", 2),
                 ("head_dim_per_cta_v", 256),
-                (
-                    "producer_ctas",
-                    int(2 * batch_size * launch_shape.num_tiles * split_kv),
-                ),
                 ("use_cluster_reduction", False),
                 ("use_persistent_scheduler", bool(is_persistent)),
                 (
@@ -1038,12 +1007,6 @@ def _resolve_mla_decode_launch_spec(
                 ),
                 ("separate_reducer_impl", separate_reducer_impl),
                 ("reducer_cluster_size", reducer_cluster_size),
-                (
-                    "reducer_rows_per_cta",
-                    int(kernel.reference_reduction_rows_per_cta)
-                    if separate_reducer_impl == "reference"
-                    else None,
-                ),
             )
         _validate_mla_policy_coordinate_span(policy)
 
@@ -1530,7 +1493,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
     kv_cache : torch.Tensor
         Compact paged latent K/V cache.
     workspace_buffer : torch.Tensor
-        Caller-owned byte workspace for this semantic key.
+        Caller-owned byte workspace for this planned layout.
     kv_lora_rank, qk_rope_head_dim : int
         Latent and RoPE dimensions.
     block_tables : torch.Tensor

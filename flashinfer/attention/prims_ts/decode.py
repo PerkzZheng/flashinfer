@@ -1046,6 +1046,49 @@ def _validate_out(
     _validate_16byte_alignment(out, "out")
 
 
+def _decode_scratch_shapes(
+    cfg: "FmhaDecodeConfig",
+    *,
+    batch_size,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    seq_len_q: int,
+):
+    """Return split-workspace shapes for a static config and batch extent."""
+
+    if not cfg.use_split_kv:
+        return (
+            (1, 1, 1, 1, 1),
+            (1, 1, 1, 1, 2),
+            (1, 1, 1),
+        )
+
+    from .kernels.fmha_decode.fmha_decode_config import make_q_tile_geometry
+
+    head_ratio = num_qo_heads // num_kv_heads
+    geometry = make_q_tile_geometry(
+        rows_per_cta=cfg.tile_size_q,
+        heads_q_per_kv=head_ratio,
+        groups_tokens_heads_q=cfg.groups_tokens_heads_q,
+    )
+    num_q_groups = max(int(geometry.num_q_ctas(seq_len_q)), 1)
+    partial_o_shape = (
+        batch_size,
+        num_kv_heads,
+        int(cfg.max_splits_kv),
+        head_ratio * seq_len_q,
+        head_dim,
+    )
+    partial_stats_shape = (
+        partial_o_shape[:-1]
+        if cfg.use_separate_reduction_kernel
+        else partial_o_shape[:-1] + (2,)
+    )
+    counter_shape = (batch_size, num_kv_heads, num_q_groups)
+    return partial_o_shape, partial_stats_shape, counter_shape
+
+
 def _decode_launch_spec_from_config(
     cfg: "FmhaDecodeConfig",
     *,
@@ -1058,41 +1101,20 @@ def _decode_launch_spec_from_config(
 ) -> _DecodeLaunchSpec:
     """Derive policy and scratch geometry from one finalized FMHA config."""
 
-    from .kernels.fmha_decode.fmha_decode_config import make_q_tile_geometry
-
-    head_ratio = num_qo_heads // num_kv_heads
-    geometry = make_q_tile_geometry(
-        rows_per_cta=cfg.tile_size_q,
-        heads_q_per_kv=head_ratio,
-        groups_tokens_heads_q=cfg.groups_tokens_heads_q,
+    scratch_shapes = _decode_scratch_shapes(
+        cfg,
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
     )
-    num_q_groups = max(int(geometry.num_q_ctas(seq_len_q)), 1)
-    if cfg.use_split_kv:
-        q_output_rows = head_ratio * seq_len_q
-        partial_o_shape = (
-            batch_size,
-            num_kv_heads,
-            int(cfg.max_splits_kv),
-            q_output_rows,
-            head_dim,
-        )
-        partial_stats_shape = (
-            partial_o_shape[:-1]
-            if cfg.use_separate_reduction_kernel
-            else partial_o_shape[:-1] + (2,)
-        )
-        counter_shape = (batch_size, num_kv_heads, num_q_groups)
-    else:
-        # Uniform raw signatures keep minimal placeholders on direct paths.
-        partial_o_shape = (1, 1, 1, 1, 1)
-        partial_stats_shape = (1, 1, 1, 1, 2)
-        counter_shape = (1, 1, 1)
 
     return _DecodeLaunchSpec(
         config=cfg,
         max_active_clusters=int(max_active_clusters),
         policy=_decode_policy_from_config(cfg),
-        scratch_shapes=(partial_o_shape, partial_stats_shape, counter_shape),
+        scratch_shapes=scratch_shapes,
     )
 
 
@@ -1318,10 +1340,7 @@ def _get_compiled_decode(
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
 
-    from .kernels.fmha_decode.fmha_decode_config import (
-        FmhaDecodeConfig,
-        make_q_tile_geometry,
-    )
+    from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
     from .kernels.fmha_decode.fmha_decode_kernel import fmha_decode_launch
 
     dtype_map = {
@@ -1541,32 +1560,14 @@ def _get_compiled_decode(
     )
     indptr_fake = fake_compact(Int32, (runtime_num_kv_offsets,), 4)
     indices_fake = fake_compact(Int32, (logical_pages,), 4)
-    if cfg.use_split_kv:
-        head_ratio = num_qo_heads // num_kv_heads
-        q_output_rows = head_ratio * seq_len_q
-        q_geometry = make_q_tile_geometry(
-            rows_per_cta=cfg.tile_size_q,
-            heads_q_per_kv=head_ratio,
-            groups_tokens_heads_q=cfg.groups_tokens_heads_q,
-        )
-        num_q_groups = max(int(q_geometry.num_q_ctas(seq_len_q)), 1)
-        partial_o_shape = (
-            batch_size,
-            num_kv_heads,
-            int(cfg.max_splits_kv),
-            q_output_rows,
-            head_dim,
-        )
-        partial_stats_shape = (
-            partial_o_shape[:-1]
-            if cfg.use_separate_reduction_kernel
-            else partial_o_shape[:-1] + (2,)
-        )
-        counter_shape = (batch_size, num_kv_heads, num_q_groups)
-    else:
-        partial_o_shape = (1, 1, 1, 1, 1)
-        partial_stats_shape = (1, 1, 1, 1, 2)
-        counter_shape = (1, 1, 1)
+    partial_o_shape, partial_stats_shape, counter_shape = _decode_scratch_shapes(
+        cfg,
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+    )
     partial_o_fake = fake_compact(partial_dtype, partial_o_shape, 16)
     partial_stats_fake = fake_compact(Float32, partial_stats_shape, 16)
     counter_fake = fake_compact(Int32, counter_shape, 4)
@@ -1978,7 +1979,7 @@ def prims_ts_batch_decode_with_kv_cache(
     kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
         Combined or separate paged K/V storage.
     workspace_buffer : torch.Tensor
-        Zero-initialized caller-owned byte workspace for this semantic key.
+        Zero-initialized caller-owned byte workspace for this planned layout.
     paged_kv_indptr, paged_kv_indices : torch.Tensor
         Native CSR row offsets and physical page IDs.
     seq_lens : torch.Tensor
@@ -2063,7 +2064,7 @@ def prims_ts_batch_decode_with_kv_cache(
     _validate_dtype_pair(query.dtype, k_cache.dtype, output_dtype)
     device_index = _validate_runtime_device(query.device)
 
-    semantic_key = (
+    policy_args = (
         device_index,
         batch_size,
         num_qo_heads,
@@ -2080,7 +2081,7 @@ def prims_ts_batch_decode_with_kv_cache(
         use_packed_q,
         window_left,
     )
-    spec = _resolve_decode_launch_spec(*semantic_key)
+    spec = _resolve_decode_launch_spec(*policy_args)
     layout = _make_decode_workspace_layout(
         spec.scratch_shapes,
         output_dtype,
@@ -2351,7 +2352,7 @@ class BatchDecodePagedTSWrapper:
                 )
         exact_max_kv_len = _validate_max_kv_len(exact_max_kv_len, "max_kv_len")
 
-        semantic_key = (
+        policy_args = (
             device_index,
             batch_size,
             num_qo_heads,
@@ -2368,7 +2369,7 @@ class BatchDecodePagedTSWrapper:
             use_packed_q,
             window_left,
         )
-        spec = _resolve_decode_launch_spec(*semantic_key)
+        spec = _resolve_decode_launch_spec(*policy_args)
         static_full_split_prefix = _planned_full_split_prefix(
             spec.config,
             seq_lens_host,

@@ -478,7 +478,7 @@ def _run_parallel_gmem_reduction_shared_stats(
             lane_lse[lane_slot_i] = neg_inf
         local_lse = neg_inf
         if valid_stats:
-            # Form the row view only after validating the grouped output row.
+            # Form the row view only after validating the flat output row.
             # Invalid/padded rows publish a neutral state without an acc_lse
             # address or load.
             row_lse = acc_lse[stats_head_idx, None, q_idx, batch_idx]
