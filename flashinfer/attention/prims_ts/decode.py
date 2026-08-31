@@ -2377,7 +2377,9 @@ class BatchDecodePagedTSWrapper:
             max_kv_len=exact_max_kv_len,
             mask_type=mask_type,
         )
-        kv_prefix_mode = "planned_full" if static_full_split_prefix else "dynamic"
+        kv_prefix_mode: Literal["dynamic", "planned_full"] = (
+            "planned_full" if static_full_split_prefix else "dynamic"
+        )
         # Keep native KV lengths explicit whenever the K domain ends in an
         # incomplete instruction group. The runtime validity predicate keeps
         # the inactive instance out of the softmax tail for both direct and

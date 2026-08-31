@@ -1439,16 +1439,14 @@ def _get_compiled_context(
     if has_variable_window:
         if packed:
             raise RuntimeError("variable-window context requires fixed tensors")
-        fixed_batch_size = q_shape[0]
-        variable_window_shape = (fixed_batch_size * max_seq_len_q,)
+        variable_window_shape = (batch_size * max_seq_len_q,)
         variable_window_tile_size_q = (
             _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
             if head_dim == _CONTEXT_TILE_SIZE_Q
             else _CONTEXT_TILE_SIZE_Q
         )
         variable_window_cta_shape = (
-            fixed_batch_size
-            * cute.ceil_div(max_seq_len_q, variable_window_tile_size_q),
+            batch_size * cute.ceil_div(max_seq_len_q, variable_window_tile_size_q),
         )
     else:
         variable_window_shape = (1,)
