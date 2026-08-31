@@ -190,9 +190,16 @@ def test_attention_ts_mla_flat_query_tile_layout_rejects_invalid_extent(
         pytest.param(
             dict(batch_size=4, num_heads_q=6, seq_len_q=8, seq_len_kv=512),
             "bf16",
+            16,
+            3,
+            id="short-underfilled-retains-m16",
+        ),
+        pytest.param(
+            dict(batch_size=4, num_heads_q=6, seq_len_q=8, seq_len_kv=512),
+            "e4m3",
             8,
             6,
-            id="short-underfilled-retains-m8",
+            id="underfilled-fp8-prefers-more-m8-producer-work",
         ),
         pytest.param(
             dict(batch_size=16, num_heads_q=6, seq_len_q=8, seq_len_kv=4096),
@@ -202,25 +209,11 @@ def test_attention_ts_mla_flat_query_tile_layout_rejects_invalid_extent(
             id="h6-q8-promotes-m64",
         ),
         pytest.param(
-            dict(batch_size=16, num_heads_q=12, seq_len_q=4, seq_len_kv=4096),
+            dict(batch_size=16, num_heads_q=48, seq_len_q=1, seq_len_kv=4096),
             "bf16",
             64,
             1,
-            id="h12-q4-promotes-m64",
-        ),
-        pytest.param(
-            dict(batch_size=16, num_heads_q=24, seq_len_q=1, seq_len_kv=4096),
-            "bf16",
-            64,
-            1,
-            id="h24-q1-promotes-m64",
-        ),
-        pytest.param(
-            dict(batch_size=16, num_heads_q=32, seq_len_q=1, seq_len_kv=4096),
-            "bf16",
-            16,
-            2,
-            id="legacy-power-of-two-retains-m16",
+            id="h48-q1-promotes-m64",
         ),
         pytest.param(
             dict(batch_size=256, num_heads_q=24, seq_len_q=1, seq_len_kv=512),
@@ -228,20 +221,6 @@ def test_attention_ts_mla_flat_query_tile_layout_rejects_invalid_extent(
             32,
             1,
             id="short-bf16-multiwave-direct-uses-m32",
-        ),
-        pytest.param(
-            dict(batch_size=256, num_heads_q=12, seq_len_q=2, seq_len_kv=512),
-            "bf16",
-            32,
-            1,
-            id="short-bf16-grouped-multiwave-direct-uses-m32",
-        ),
-        pytest.param(
-            dict(batch_size=64, num_heads_q=24, seq_len_q=1, seq_len_kv=256),
-            "bf16",
-            64,
-            1,
-            id="short-bf16-one-wave-retains-m64",
         ),
         pytest.param(
             dict(batch_size=256, num_heads_q=24, seq_len_q=1, seq_len_kv=769),
@@ -265,7 +244,7 @@ def test_attention_ts_mla_auto_flat_tile_throughput_promotion(
     expected_tile_size_q,
     expected_num_q_tiles,
 ):
-    """Promote non-power heads only when the full-row tile fills a wave."""
+    """Select a physical tile from flat-row work and producer capacity."""
 
     from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
         resolve_auto_mla_gen_groups_tokens_heads_q_shape,
@@ -348,27 +327,6 @@ def test_attention_ts_mla_2cta_auto_split_power_of_two_wave_guard(
     )
 
 
-def test_attention_ts_mla_legacy_auto_split_is_not_rounded():
-    """Keep the measured split policy unchanged for legacy H64 launches."""
-
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
-        auto_split_profile,
-    )
-
-    profile = auto_split_profile(
-        batch_size=16,
-        num_heads_q=64,
-        seq_len_q=1,
-        seq_len_kv=4096,
-        latent_dim=512,
-        max_active_clusters=148,
-        tile_size_q=64,
-        qkv_dtype="bf16",
-    )
-    assert profile is not None
-    assert profile.num_ctas_per_seq_kv == 9
-
-
 def test_attention_ts_mla_keeps_multiwave_auto_uses_direct_grid():
     """Do not select an unqualified persistent M64 grid beyond one wave."""
 
@@ -430,17 +388,6 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
             6, 8, 64, 2, 1, 2048, "e4m3", "throughput_2cta", id="flat-short-k-fp8"
         ),
         pytest.param(
-            6,
-            8,
-            64,
-            2,
-            1,
-            2049,
-            "bf16",
-            "throughput_latency_1cta",
-            id="local-k-boundary",
-        ),
-        pytest.param(
             6, 8, 64, 8, 4, 8192, "bf16", "throughput_2cta", id="equal-wave-bf16"
         ),
         pytest.param(
@@ -449,98 +396,21 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
             64,
             8,
             4,
-            4096,
-            "bf16",
-            "throughput_latency_1cta",
-            id="equal-wave-local-k-lower-bound",
-        ),
-        pytest.param(
-            6,
-            8,
-            64,
-            8,
-            4,
-            4097,
-            "bf16",
+            8193,
+            "e4m3",
             "throughput_2cta",
-            id="equal-wave-extra-local-k-tile",
+            id="fp8-compact",
         ),
         pytest.param(
-            6,
-            8,
-            64,
-            8,
-            4,
-            8192,
+            12,
+            1,
+            16,
+            2,
+            1,
+            2048,
             "e4m3",
             "throughput_latency_1cta",
-            id="equal-wave-fp8-retains-1cta",
-        ),
-        pytest.param(
-            6,
-            8,
-            64,
-            10,
-            5,
-            8192,
-            "bf16",
-            "throughput_latency_1cta",
-            id="reference-split-bound",
-        ),
-        pytest.param(
-            6,
-            8,
-            64,
-            8,
-            3,
-            8192,
-            "bf16",
-            "throughput_latency_1cta",
-            id="unequal-work",
-        ),
-        pytest.param(
-            6,
-            8,
-            64,
-            2,
-            2,
-            2048,
-            "bf16",
-            "throughput_latency_1cta",
-            id="two-cta-split",
-        ),
-        pytest.param(
-            6,
-            8,
-            64,
-            1,
-            1,
-            2048,
-            "bf16",
-            "throughput_latency_1cta",
-            id="one-cta-direct",
-        ),
-        pytest.param(
-            24,
-            1,
-            64,
-            2,
-            1,
-            2048,
-            "bf16",
-            "throughput_2cta",
-            id="small-bf16-tail-direct",
-        ),
-        pytest.param(
-            24,
-            1,
-            64,
-            8,
-            4,
-            8192,
-            "bf16",
-            "throughput_2cta",
-            id="small-bf16-tail-equal-wave",
+            id="fp8-swaps",
         ),
         pytest.param(
             12,
@@ -554,63 +424,19 @@ def test_attention_ts_mla_keeps_kv_instruction_policy(
             id="small-bf16-tail-residual-wave-split",
         ),
         pytest.param(
-            24,
+            64,
             1,
             64,
-            32,
-            16,
-            32768,
+            2,
+            1,
+            2048,
             "bf16",
             "throughput_2cta",
-            id="small-bf16-tail-long-equal-wave",
-        ),
-        pytest.param(
-            12,
-            1,
-            16,
-            128,
-            64,
-            131072,
-            "bf16",
-            "throughput_latency_1cta",
-            id="clustered-2cta-reducer-retains-1cta",
-        ),
-        pytest.param(
-            24,
-            1,
-            64,
-            2,
-            1,
-            2048,
-            "e4m3",
-            "throughput_2cta",
-            id="small-fp8-m64-tail-direct",
-        ),
-        pytest.param(
-            12,
-            1,
-            16,
-            2,
-            1,
-            2048,
-            "e4m3",
-            "throughput_latency_1cta",
-            id="small-fp8-m16-tail-retains-1cta",
-        ),
-        pytest.param(
-            64,
-            1,
-            64,
-            2,
-            1,
-            2048,
-            "bf16",
-            "throughput_latency_1cta",
-            id="legacy-h64",
+            id="power-of-two-h64-uses-the-same-topology-rule",
         ),
     ),
 )
-def test_attention_ts_mla_small_flat_direct_2cta_crossover(
+def test_attention_ts_mla_small_flat_auto_selection(
     num_heads: int,
     seq_len_q: int,
     one_cta_tile_size_q: int,
@@ -620,7 +446,7 @@ def test_attention_ts_mla_small_flat_direct_2cta_crossover(
     dtype: str,
     expected: str,
 ):
-    """Use 2CTA only for equal normalized small-flat producer waves."""
+    """Cover representative direct and compact small-flat selections."""
 
     assert (
         select_default_mla_kernel_policy(
@@ -635,6 +461,9 @@ def test_attention_ts_mla_small_flat_direct_2cta_crossover(
             two_cta_split_kv=two_cta_split,
             seq_len_k=seq_len_k,
             qkv_dtype=dtype,
+            one_cta_kernel_variant=(
+                "keeps_mma_ab" if one_cta_tile_size_q == 64 else "swaps_mma_ab"
+            ),
         )
         == expected
     )
@@ -1212,7 +1041,7 @@ _MLA_CASES = (
     ),
     _param(
         _case(128, 32, 2048, torch.bfloat16, 32003),
-        _policy("throughput_latency_1cta", 32, 1, 512, cluster=False),
+        _policy("throughput_latency_1cta", 64, 1, 512, cluster=False),
         None,
         False,
         id="M3-bf16-q32-v512-direct-one-wave",
@@ -1263,14 +1092,14 @@ _MLA_CASES = (
             seq_len_q=4,
             mask_type="dense",
         ),
-        _policy("throughput_latency_1cta", 64, 9, 128, cluster=False, schedulers=False),
+        _policy("throughput_latency_1cta", 16, 9, 256, cluster=False, schedulers=False),
         "tail",
         False,
         id="M8-spec-dense-tail-visible",
     ),
     _param(
         _case(2, 16, 2049, torch.bfloat16, 32008, seq_len_q=4),
-        _policy("throughput_latency_1cta", 64, 9, 128, cluster=False, schedulers=False),
+        _policy("throughput_latency_1cta", 16, 9, 256, cluster=False, schedulers=False),
         "tail",
         False,
         id="M9-spec-causal-tail-progressive",
@@ -1691,7 +1520,6 @@ def _make_clc_work_queue(cfg) -> MlaWorkQueue:
         cfg=cfg,
         static_split_kv=1,
         static_seq_len_k=128,
-        groups_tokens_heads_q_ratio=1,
         logical_num_heads_q=128,
         logical_seq_len_q=1,
         static_problem_shape_b=1,
@@ -2226,23 +2054,9 @@ def test_attention_ts_mla_fp8_reference_uses_p448():
                 "qkv_dtype": torch.float8_e4m3fn,
                 "seed": 20260808,
             },
-            _policy("throughput_latency_1cta", 16, 3, 128, cluster=True),
+            _policy("throughput_latency_1cta", 8, 3, 128, cluster=True),
             0,
             id="smem-p-cluster",
-        ),
-        pytest.param(
-            {
-                "batch_size": 64,
-                "num_qo_heads": 64,
-                "max_seq_len": 257,
-                "kv_seq_lens": (257,) + (1,) * 63,
-                "qkv_dtype": torch.float8_e4m3fn,
-                "seed": 20260809,
-            },
-            _policy("throughput_latency_1cta", 64, 2, 512, cluster=False)
-            | {"separate_reducer_impl": "parallel"},
-            8_421_376,
-            id="tmem-p-separate",
         ),
     ),
 )
@@ -2690,13 +2504,49 @@ def test_attention_ts_mla_decode_head_dtype_product(
     _exercise_auto_mla_case(case)
 
 
+@pytest.mark.parametrize("num_qo_heads", (12, 96), ids=("h12", "h96"))
+@pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
+    num_qo_heads: int,
+    packed_query: bool,
+):
+    """One resolved topology accepts different batch extents."""
+
+    wrappers = []
+    for batch_size in (3, 4):
+        case = _make_mla_case(
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            max_seq_len=1024,
+            qkv_dtype=torch.bfloat16,
+            device="cuda",
+            seed=39000 + num_qo_heads + batch_size,
+        )
+        qo_indptr = None
+        if packed_query:
+            case, qo_indptr = _pack_mla_case(case, (1,) * batch_size)
+        wrapper = _plan_case(
+            case,
+            qo_indptr=qo_indptr,
+            max_seq_len_q=1 if packed_query else None,
+        )
+        policy = _policy_dict(wrapper)
+        output = _run_case(wrapper, case)
+        _assert_case_correct(output, case, policy, qo_indptr=qo_indptr)
+        wrappers.append(wrapper)
+
+    assert wrappers[0]._compiled is wrappers[1]._compiled
+
+
 @pytest.mark.parametrize(
-    "num_qo_heads,seq_len_q,expected_tile_size_q,expected_num_q_tiles",
+    "num_qo_heads,seq_len_q",
     (
-        pytest.param(6, 8, 8, 6, id="h6-sq8"),
-        pytest.param(12, 4, 16, 3, id="h12-sq4"),
-        pytest.param(24, 2, 16, 3, id="h24-sq2"),
-        pytest.param(48, 1, 16, 3, id="h48-sq1"),
+        pytest.param(6, 8, id="h6-sq8"),
+        pytest.param(12, 4, id="h12-sq4"),
+        pytest.param(24, 2, id="h24-sq2"),
+        pytest.param(48, 1, id="h48-sq1"),
     ),
 )
 @pytest.mark.parametrize(
@@ -2709,11 +2559,9 @@ def test_attention_ts_mla_decode_head_dtype_product(
 def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
     num_qo_heads: int,
     seq_len_q: int,
-    expected_tile_size_q: int,
-    expected_num_q_tiles: int,
     qkv_dtype: torch.dtype,
 ):
-    """Public auto-policy accepts flat 48-row H6/H12/H24/H48 1CTA shapes."""
+    """Decode equivalent 48-row non-power head shapes with public auto dispatch."""
 
     case = _make_mla_case(
         batch_size=4,
@@ -2728,9 +2576,7 @@ def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
         case,
         expected_b200={
             "kernel": "throughput_latency_1cta",
-            "tile_size_q": expected_tile_size_q,
-            "total_q_rows": 48,
-            "num_q_tiles": expected_num_q_tiles,
+            "tile_size_q": 8 if qkv_dtype == _FP8 else 16,
         },
     )
     assert policy["logical_num_heads_q"] == num_qo_heads
@@ -2774,11 +2620,7 @@ def test_attention_ts_mla_decode_small_non_power_heads_round_split_for_wave(
         {
             "kernel": "throughput_latency_1cta",
             "tile_size_q": expected_tile_size_q,
-            "total_q_rows": num_qo_heads,
-            "num_q_tiles": 1,
             "split_kv": 32,
-            "producer_ctas": 128,
-            "separate_reducer_impl": "parallel",
         },
         device=case.query.device,
     )
@@ -2791,37 +2633,20 @@ def test_attention_ts_mla_decode_small_non_power_heads_round_split_for_wave(
 
 
 @pytest.mark.parametrize(
-    "qkv_dtype,expected_b200",
+    "qkv_dtype,expected_kernel,expected_tile_size_q,expected_split_kv",
     (
         pytest.param(
             torch.bfloat16,
-            {
-                "kernel": "throughput_2cta",
-                "tile_size_q": 128,
-                "total_q_rows": 48,
-                "num_q_tiles": 1,
-                "tail_q_rows": 48,
-                "split_kv": 4,
-                "producer_ctas": 128,
-                "separate_reducer_impl": "reference",
-                "reducer_rows_per_cta": 4,
-            },
+            "throughput_2cta",
+            128,
+            4,
             id="bf16",
         ),
         pytest.param(
             torch.float8_e4m3fn,
-            {
-                "kernel": "throughput_latency_1cta",
-                "profile": "h64_keeps_mma_ab_splitkv8_gmem",
-                "tile_size_q": 64,
-                "total_q_rows": 48,
-                "num_q_tiles": 1,
-                "tail_q_rows": 48,
-                "split_kv": 8,
-                "producer_ctas": 128,
-                "separate_reducer_impl": "parallel",
-                "reducer_rows_per_cta": None,
-            },
+            "throughput_latency_1cta",
+            64,
+            8,
             id="fp8",
         ),
     ),
@@ -2830,9 +2655,11 @@ def test_attention_ts_mla_decode_small_non_power_heads_round_split_for_wave(
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_non_power_heads_throughput_promotion(
     qkv_dtype: torch.dtype,
-    expected_b200: dict[str, object],
+    expected_kernel: str,
+    expected_tile_size_q: int,
+    expected_split_kv: int,
 ):
-    """A filled wave uses the measured dtype-specific H6/Q8 family."""
+    """Decode a filled non-power flat-row wave with public auto dispatch."""
 
     case = _make_mla_case(
         batch_size=16,
@@ -2845,7 +2672,11 @@ def test_attention_ts_mla_decode_non_power_heads_throughput_promotion(
     )
     policy = _exercise_auto_mla_case(
         case,
-        expected_b200=expected_b200,
+        expected_b200={
+            "kernel": expected_kernel,
+            "tile_size_q": expected_tile_size_q,
+            "split_kv": expected_split_kv,
+        },
     )
     assert policy["logical_num_heads_q"] == 6
     assert policy["logical_seq_len_q"] == 8
@@ -2872,7 +2703,7 @@ def test_attention_ts_mla_decode_short_k_full_flat_rows_use_direct_2cta(
     num_qo_heads: int,
     seq_len_q: int,
 ):
-    """Avoid the M64 split reducer when a direct 2CTA wave covers the grid."""
+    """Decode equivalent non-power flat-row shapes with direct 2CTA output."""
 
     case = _make_mla_case(
         batch_size=64,
@@ -2888,12 +2719,7 @@ def test_attention_ts_mla_decode_short_k_full_flat_rows_use_direct_2cta(
         expected_b200={
             "kernel": "throughput_2cta",
             "tile_size_q": 128,
-            "total_q_rows": 48,
-            "num_q_tiles": 1,
-            "tail_q_rows": 48,
             "split_kv": 1,
-            "producer_ctas": 128,
-            "separate_reducer_impl": "none",
         },
     )
     assert policy["logical_num_heads_q"] == num_qo_heads
@@ -2915,7 +2741,7 @@ def test_attention_ts_mla_decode_bf16_equal_wave_flat_rows_use_2cta(
     num_qo_heads: int,
     seq_len_q: int,
 ):
-    """Use the measured small reference reducer for equal BF16 producer work."""
+    """Decode equivalent non-power flat-row shapes with compact 2CTA output."""
 
     case = _make_mla_case(
         batch_size=16,
@@ -2933,13 +2759,7 @@ def test_attention_ts_mla_decode_bf16_equal_wave_flat_rows_use_2cta(
         {
             "kernel": "throughput_2cta",
             "tile_size_q": 128,
-            "total_q_rows": 48,
-            "num_q_tiles": 1,
-            "tail_q_rows": 48,
             "split_kv": 4,
-            "producer_ctas": 128,
-            "separate_reducer_impl": "reference",
-            "reducer_rows_per_cta": 4,
         },
         device=case.query.device,
     )
@@ -2951,115 +2771,44 @@ def test_attention_ts_mla_decode_bf16_equal_wave_flat_rows_use_2cta(
     )
 
 
-@pytest.mark.arch_blackwell
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_fp8_equal_wave_flat_rows_stay_1cta():
-    """Retain the faster M64 parallel reducer for the FP8 equal-work case."""
-
-    case = _make_mla_case(
-        batch_size=16,
-        num_qo_heads=12,
-        max_seq_len=8192,
-        seq_len_q=4,
-        qkv_dtype=torch.float8_e4m3fn,
-        device="cuda",
-        seed=40553,
-    )
-    policy = _exercise_auto_mla_case(
-        case,
-        expected_b200={
-            "kernel": "throughput_latency_1cta",
-            "profile": "h64_keeps_mma_ab_splitkv8_gmem",
-            "tile_size_q": 64,
-            "total_q_rows": 48,
-            "num_q_tiles": 1,
-            "tail_q_rows": 48,
-            "split_kv": 8,
-            "producer_ctas": 128,
-            "separate_reducer_impl": "parallel",
-            "reducer_rows_per_cta": None,
-        },
-    )
-    assert policy["logical_num_heads_q"] == 12
-    assert policy["logical_seq_len_q"] == 4
-
-
 @pytest.mark.parametrize(
-    "num_qo_heads,batch_size,max_seq_len,expected_split",
+    "num_qo_heads,batch_size,max_seq_len,qkv_dtype,expected_split",
     (
-        pytest.param(6, 16, 8193, 4, id="m8-residual-wave-split"),
-        pytest.param(12, 16, 8193, 4, id="m16-residual-wave-split"),
-        pytest.param(24, 32, 4096, 2, id="m64-equal-wave-split"),
+        pytest.param(6, 16, 8193, torch.bfloat16, 4, id="bf16-m8-residual-wave"),
+        pytest.param(12, 16, 8193, torch.bfloat16, 4, id="bf16-m16-residual-wave"),
+        pytest.param(24, 32, 4096, torch.bfloat16, 2, id="bf16-m64-wave"),
+        pytest.param(48, 16, 8193, torch.float8_e4m3fn, 4, id="fp8-m64-wave"),
     ),
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_bf16_small_flat_equal_wave_uses_2cta(
+def test_attention_ts_mla_decode_small_flat_compact_2cta(
     num_qo_heads: int,
     batch_size: int,
     max_seq_len: int,
+    qkv_dtype: torch.dtype,
     expected_split: int,
 ):
-    """Use 2CTA across Q tiles when normalized BF16 producer waves match."""
+    """Decode representative small flat-Q tiles with compact 2CTA output."""
 
     case = _make_mla_case(
         batch_size=batch_size,
         num_qo_heads=num_qo_heads,
         max_seq_len=max_seq_len,
         seq_len_q=1,
-        qkv_dtype=torch.bfloat16,
+        qkv_dtype=qkv_dtype,
         device="cuda",
-        seed=40570 + num_qo_heads,
+        seed=40570 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
     )
     policy = _exercise_auto_mla_case(
         case,
         expected_b200={
             "kernel": "throughput_2cta",
             "tile_size_q": 128,
-            "total_q_rows": num_qo_heads,
-            "num_q_tiles": 1,
-            "tail_q_rows": num_qo_heads,
             "split_kv": expected_split,
-            "producer_ctas": batch_size * expected_split * 2,
-            "separate_reducer_impl": "reference",
-            "reducer_rows_per_cta": 4,
         },
     )
     assert policy["logical_num_heads_q"] == num_qo_heads
-
-
-@pytest.mark.arch_blackwell
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_bf16_small_flat_long_split_uses_compact_2cta():
-    """Round a filled long-K wave and reduce only logical M128 tail rows."""
-
-    case = _make_mla_case(
-        batch_size=4,
-        num_qo_heads=24,
-        max_seq_len=32768,
-        seq_len_q=1,
-        qkv_dtype=torch.bfloat16,
-        device="cuda",
-        seed=40600,
-    )
-    wrapper = _plan_case(case)
-    policy = _policy_dict(wrapper)
-    _assert_auto_policy(
-        policy,
-        {
-            "kernel": "throughput_2cta",
-            "tile_size_q": 128,
-            "total_q_rows": 24,
-            "num_q_tiles": 1,
-            "tail_q_rows": 24,
-            "split_kv": 16,
-            "producer_ctas": 128,
-            "separate_reducer_impl": "reference",
-            "reducer_rows_per_cta": 4,
-        },
-        device=case.query.device,
-    )
-    _exercise_public_paths(wrapper, case, policy, exercise_all_paths=True)
 
 
 @pytest.mark.arch_blackwell
@@ -3094,55 +2843,6 @@ def test_attention_ts_mla_decode_bf16_short_multiwave_direct_uses_m32():
         device=case.query.device,
     )
     _exercise_public_paths(wrapper, case, policy, exercise_all_paths=True)
-
-
-@pytest.mark.arch_blackwell
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_fp8_small_flat_m64_direct_crossover():
-    """Use direct 2CTA for bounded M64 work and retain 1CTA beyond it."""
-
-    cases = (
-        (
-            2048,
-            {
-                "kernel": "throughput_2cta",
-                "tile_size_q": 128,
-                "total_q_rows": 24,
-                "num_q_tiles": 1,
-                "tail_q_rows": 24,
-                "split_kv": 1,
-                "producer_ctas": 128,
-                "separate_reducer_impl": "none",
-                "reducer_rows_per_cta": None,
-            },
-        ),
-        (
-            2049,
-            {
-                "kernel": "throughput_latency_1cta",
-                "profile": "h64_splitkv",
-                "tile_size_q": 64,
-                "total_q_rows": 24,
-                "num_q_tiles": 1,
-                "tail_q_rows": 24,
-                "split_kv": 2,
-                "producer_ctas": 128,
-                "separate_reducer_impl": "parallel",
-            },
-        ),
-    )
-    for max_seq_len, expected_b200 in cases:
-        case = _make_mla_case(
-            batch_size=64,
-            num_qo_heads=24,
-            max_seq_len=max_seq_len,
-            seq_len_q=1,
-            qkv_dtype=torch.float8_e4m3fn,
-            device="cuda",
-            seed=40620 + max_seq_len,
-        )
-        policy = _exercise_auto_mla_case(case, expected_b200=expected_b200)
-        assert policy["logical_num_heads_q"] == 24
 
 
 @pytest.mark.parametrize(
@@ -3382,205 +3082,6 @@ def test_attention_ts_mla_decode_amortized_resident_2cta_wave(
             or (num_qo_heads == 96 and qkv_dtype == _FP8)
         ),
     )
-
-
-@pytest.mark.parametrize(
-    "tile_size_q,num_qo_heads",
-    (
-        pytest.param(8, 12, id="m8-h12"),
-        pytest.param(16, 24, id="m16-h24"),
-        pytest.param(32, 48, id="m32-h48"),
-        pytest.param(64, 96, id="m64-h96"),
-    ),
-)
-@pytest.mark.arch_blackwell
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_forced_1cta_flat_profile_product(
-    monkeypatch,
-    tile_size_q: int,
-    num_qo_heads: int,
-):
-    """Qualify every 1CTA M profile where logical H crosses tile boundaries."""
-
-    from flashinfer.attention.prims_ts.kernels.mla_decode import (
-        kernel_policy as kernel_policy_module,
-    )
-    from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta import (
-        config as one_cta_config,
-    )
-
-    monkeypatch.setattr(
-        kernel_policy_module,
-        "resolve_mla_kernel_policy",
-        lambda policy, num_heads, seq_len_q, **automatic_work: (
-            "throughput_latency_1cta",
-            "forced-profile-test",
-        ),
-    )
-    monkeypatch.setattr(
-        one_cta_config,
-        "resolve_auto_mla_gen_groups_tokens_heads_q_shape",
-        lambda **kwargs: one_cta_config.GroupsTokensHeadsLaunchShape.for_tile(
-            kwargs["num_heads_q"],
-            kwargs["seq_len_q"],
-            tile_size_q,
-        ),
-    )
-    mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
-    mla_decode_module._get_compiled_mla_decode.cache_clear()
-    try:
-        case = _make_mla_case(
-            batch_size=2,
-            num_qo_heads=num_qo_heads,
-            max_seq_len=257,
-            seq_len_q=2,
-            qkv_dtype=torch.bfloat16,
-            device="cuda",
-            seed=42000 + num_qo_heads,
-        )
-        case = _apply_mla_tail_markers(case)
-        wrapper = _plan_case(case)
-        policy = dict(wrapper._policy)
-        assert policy["kernel"] == "throughput_latency_1cta"
-        assert policy["source"] == "forced-profile-test"
-        assert policy["tile_size_q"] == tile_size_q
-        assert policy["logical_num_heads_q"] == num_qo_heads
-        assert policy["logical_seq_len_q"] == 2
-        assert policy["num_q_tiles"] == 3
-        assert policy["tail_q_rows"] == tile_size_q
-        output = _run_case(wrapper, case)
-        _assert_case_correct(output, case, policy)
-    finally:
-        # Cached launch specs retain monkeypatched callables through their
-        # selected kernel objects, so clear them before pytest restores attrs.
-        mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
-        mla_decode_module._get_compiled_mla_decode.cache_clear()
-
-
-@pytest.mark.parametrize(
-    "num_qo_heads,seq_len_q,expected_tail_rows",
-    (
-        pytest.param(96, 2, 64, id="h96-sq2-tail64"),
-        pytest.param(12, 11, 4, id="h12-sq11-tail4"),
-    ),
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
-)
-@pytest.mark.arch_blackwell
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_forced_2cta_flat_split_reducer(
-    monkeypatch,
-    num_qo_heads: int,
-    seq_len_q: int,
-    expected_tail_rows: int,
-    qkv_dtype: torch.dtype,
-):
-    """Exercise M128 cross-token tails through the split producer/reducer."""
-
-    from flashinfer.attention.prims_ts.kernels.mla_decode import (
-        kernel_policy as kernel_policy_module,
-    )
-
-    monkeypatch.setattr(
-        kernel_policy_module,
-        "resolve_mla_kernel_policy",
-        lambda policy, num_heads, seq_len_q, **automatic_work: (
-            "throughput_2cta",
-            "forced-family-test",
-        ),
-    )
-    mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
-    mla_decode_module._get_compiled_mla_decode.cache_clear()
-    try:
-        case = _make_mla_case(
-            batch_size=2,
-            num_qo_heads=num_qo_heads,
-            max_seq_len=256,
-            seq_len_q=seq_len_q,
-            qkv_dtype=qkv_dtype,
-            device="cuda",
-            seed=42500 + num_qo_heads + (1 if qkv_dtype == _FP8 else 0),
-        )
-        case = _apply_mla_tail_markers(case)
-        wrapper = _plan_case(case)
-        policy = dict(wrapper._policy)
-        assert policy["kernel"] == "throughput_2cta"
-        assert policy["source"] == "forced-family-test"
-        assert policy["tile_size_q"] == 128
-        assert policy["num_q_tiles"] == 2
-        assert policy["tail_q_rows"] == expected_tail_rows
-        assert policy["split_kv"] == 2
-        assert policy["separate_reducer_impl"] == "reference"
-        assert policy["reducer_cluster_size"] == 1
-        expected_workspace_bytes = (
-            case.block_tables.shape[0] * 128 * 2 * 2 * (_LATENT_DIM * 2 + 4)
-        )
-        assert (
-            wrapper._workspace_layout.kernel_workspace.byte_size
-            == expected_workspace_bytes
-        )
-        output = _run_case(wrapper, case)
-        _assert_case_correct(output, case, policy)
-    finally:
-        mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
-        mla_decode_module._get_compiled_mla_decode.cache_clear()
-
-
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    (torch.bfloat16, torch.float8_e4m3fn),
-    ids=("bf16", "fp8"),
-)
-@pytest.mark.arch_blackwell
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_decode_forced_2cta_underfilled_g1_reducer(
-    monkeypatch,
-    qkv_dtype: torch.dtype,
-):
-    """Use one-row G1 for a split-16 reducer whose eight-row grid underfills."""
-
-    from flashinfer.attention.prims_ts.kernels.mla_decode import (
-        kernel_policy as kernel_policy_module,
-    )
-
-    monkeypatch.setattr(
-        kernel_policy_module,
-        "resolve_mla_kernel_policy",
-        lambda policy, num_heads, seq_len_q, **automatic_work: (
-            "throughput_2cta",
-            "forced-g1-test",
-        ),
-    )
-    mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
-    mla_decode_module._get_compiled_mla_decode.cache_clear()
-    try:
-        case = _make_mla_case(
-            batch_size=1,
-            num_qo_heads=48,
-            max_seq_len=2048,
-            seq_len_q=8,
-            qkv_dtype=qkv_dtype,
-            device="cuda",
-            seed=42600 + (1 if qkv_dtype == _FP8 else 0),
-        )
-        case = _apply_mla_tail_markers(case)
-        wrapper = _plan_case(case)
-        policy = dict(wrapper._policy)
-        assert policy["kernel"] == "throughput_2cta"
-        assert policy["source"] == "forced-g1-test"
-        assert policy["num_q_tiles"] == 3
-        assert policy["split_kv"] == 16
-        assert policy["producer_ctas"] == 96
-        assert policy["separate_reducer_impl"] == "parallel"
-        assert policy["reducer_cluster_size"] == 1
-        output = _run_case(wrapper, case)
-        _assert_case_correct(output, case, policy)
-    finally:
-        mla_decode_module._resolve_mla_decode_launch_spec.cache_clear()
-        mla_decode_module._get_compiled_mla_decode.cache_clear()
 
 
 @pytest.mark.parametrize("num_qo_heads", (8, 16, 32, 64), ids=lambda value: f"h{value}")

@@ -15,7 +15,7 @@
 """Task-scheduled paged MLA decode with a plan/run lifecycle."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import functools
 from typing import Any, Literal, Optional, cast
 
@@ -65,14 +65,42 @@ _MLA_MAX_KV_LEN = _INT32_MAX - (_MLA_MAX_KV_COORDINATE_SPAN - 1)
 
 @dataclass(frozen=True)
 class _MLADecodeLaunchSpec:
-    """Automatic MLA kernel selection and scratch for one semantic key."""
+    """Automatic MLA policy and scratch geometry for one plan."""
 
     kernel: Any
-    qkv_dtype: object
-    output_dtype: object
     policy: tuple[tuple[str, object], ...]
     kernel_workspace_bytes: int
     split_kv: int
+
+
+@dataclass(frozen=True)
+class _MLAOneCtaCandidate:
+    """One fully resolved 1CTA family candidate used by automatic policy."""
+
+    launch_shape: Any
+    decision: Any
+    split_kv: int | None
+    work: int
+    is_extended_fp8_swaps: bool = False
+
+
+@dataclass(frozen=True)
+class _MLADecodeCompileSpec:
+    """Batch-independent identity and implementation for one MLA compile."""
+
+    device_index: int
+    kernel_signature: tuple[object, ...]
+    num_heads: int
+    kv_lora_rank: int
+    qk_rope_head_dim: int
+    page_size: int
+    q_dtype_key: str
+    output_dtype_key: str
+    max_seq_len_q: int
+    packed_query: bool
+    has_kernel_workspace: bool
+    split_kv: int
+    kernel: Any = field(compare=False, hash=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -571,6 +599,7 @@ def _resolve_mla_decode_launch_spec(
     from cuda.bindings import driver as cuda_drv
 
     from .kernels.mla_decode.kernel_policy import (
+        MlaAutomaticWork,
         resolve_mla_kernel_policy,
         select_mla_ts_kernel,
     )
@@ -581,14 +610,12 @@ def _resolve_mla_decode_launch_spec(
     )
     from .kernels.mla_decode.throughput_2cta.kernel import MlaDecodeTs
     from .kernels.mla_decode.throughput_latency_1cta.config import (
-        GroupsTokensHeadsLaunchShape,
+        FlatQueryLaunchShape,
         auto_tile_size_q_for_mla_gen,
         compute_workspace_size as compute_1cta_workspace_size,
         fp8_q16_extended_family_probe_split_kv,
-        q_tile_work_count,
         resolve_auto_mla_gen_groups_tokens_heads_q_shape,
         resolve_runtime_cluster_reduction_mode,
-        round_auto_split_kv_for_wave,
         wave_fill_split_kv,
     )
     from .kernels.mla_decode.throughput_latency_1cta.kernel import (
@@ -606,12 +633,6 @@ def _resolve_mla_decode_launch_spec(
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
     qkv_dtype_name = _kernel_dtype_name(q_dtype_key)
     output_dtype_name = _kernel_dtype_name(output_dtype_key)
-    dtype_map = {
-        "bf16": cutlass.BFloat16,
-        "e4m3": cutlass.Float8E4M3FN,
-    }
-    qkv_dtype = dtype_map[qkv_dtype_name]
-    output_dtype = dtype_map[output_dtype_name]
 
     with torch.cuda.device(device_index):
         plan_stream = cuda_drv.CUstream(
@@ -645,30 +666,15 @@ def _resolve_mla_decode_launch_spec(
             qkv_dtype=qkv_dtype_name,
             max_active_clusters=max_active_one_cta_clusters,
         )
-        family_probe_decision = None
-        family_probe_split_kv = None
-        family_probe_launch_shape = None
-        family_probe_is_extended_fp8_swaps = False
-        one_cta_work = None
-        total_q_rows = num_heads * seq_len_q
-        use_established_family_probe = (
-            total_q_rows > 64
-            and two_cta_cluster_work * 4 <= max_active_two_cta_clusters
-        )
-        use_small_flat_family_probe = (
-            num_heads & (num_heads - 1) != 0
-            and 1 <= total_q_rows <= 64
-            and one_cta_launch_shape.enabled
-            and one_cta_launch_shape.tile_size_q in (8, 16, 32, 64)
-            and one_cta_launch_shape.seq_len_q == 1
-        )
-        if use_established_family_probe:
-            family_probe_launch_shape = one_cta_launch_shape
-            initial_probe = select_mla_ts_kernel(
+
+        def select_one_cta(launch_shape, split_kv=None):
+            """Resolve one physical 1CTA launch shape with shared inputs."""
+
+            return select_mla_ts_kernel(
                 requested_policy="throughput_latency_1cta",
                 batch_size=batch_size,
-                num_heads=family_probe_launch_shape.num_heads_q,
-                seq_len_q=family_probe_launch_shape.seq_len_q,
+                num_heads=launch_shape.num_heads_q,
+                seq_len_q=launch_shape.seq_len_q,
                 seq_len_k=max_kv_len,
                 latent_dim=kv_lora_rank,
                 rope_dim=qk_rope_head_dim,
@@ -676,49 +682,67 @@ def _resolve_mla_decode_launch_spec(
                 dtype=qkv_dtype_name,
                 out_dtype=output_dtype_name,
                 throughput_latency_profile=None,
-                throughput_latency_tile_size_q=(family_probe_launch_shape.tile_size_q),
+                throughput_latency_tile_size_q=launch_shape.tile_size_q,
                 max_active_clusters=max_active_one_cta_clusters,
-                throughput_latency_split_kv=None,
+                throughput_latency_split_kv=split_kv,
                 throughput_latency_persistent=None,
             )
+
+        def make_one_cta_candidate(
+            launch_shape,
+            decision,
+            split_kv=None,
+            *,
+            is_extended_fp8_swaps=False,
+        ):
+            """Return a complete candidate, or ``None`` for an unavailable profile."""
+
+            cfg = decision.config
+            if not decision.implementation_ready or cfg is None:
+                return None
+            work = (
+                cfg.batch_size
+                * cfg.num_ctas_per_seq_q
+                * cfg.num_ctas_for_all_heads
+                * cfg.num_ctas_per_seq_kv
+                * cfg.num_ctas_per_head_dim
+            )
+            return _MLAOneCtaCandidate(
+                launch_shape=launch_shape,
+                decision=decision,
+                split_kv=split_kv,
+                work=int(work),
+                is_extended_fp8_swaps=is_extended_fp8_swaps,
+            )
+
+        one_cta_candidate = None
+        total_q_rows = num_heads * seq_len_q
+        use_established_family_probe = (
+            total_q_rows > 64
+            and two_cta_cluster_work * 4 <= max_active_two_cta_clusters
+        )
+        use_small_flat_family_probe = (
+            1 <= total_q_rows <= 64
+            and one_cta_launch_shape.tile_size_q in (8, 16, 32, 64)
+            and one_cta_launch_shape.seq_len_q == 1
+        )
+        if use_established_family_probe:
+            initial_probe = select_one_cta(one_cta_launch_shape)
             if initial_probe.implementation_ready and initial_probe.config is not None:
-                family_probe_split_kv = wave_fill_split_kv(
+                probe_split_kv = wave_fill_split_kv(
                     batch_size=batch_size,
-                    num_heads_q=family_probe_launch_shape.num_heads_q,
-                    seq_len_q=family_probe_launch_shape.seq_len_q,
+                    num_heads_q=one_cta_launch_shape.num_heads_q,
+                    seq_len_q=one_cta_launch_shape.seq_len_q,
                     seq_len_kv=max_kv_len,
                     latent_dim=kv_lora_rank,
                     max_active_clusters=max_active_one_cta_clusters,
                     tile_size_q=int(initial_probe.config.tile_size_q),
                 )
-                family_probe_decision = select_mla_ts_kernel(
-                    requested_policy="throughput_latency_1cta",
-                    batch_size=batch_size,
-                    num_heads=family_probe_launch_shape.num_heads_q,
-                    seq_len_q=family_probe_launch_shape.seq_len_q,
-                    seq_len_k=max_kv_len,
-                    latent_dim=kv_lora_rank,
-                    rope_dim=qk_rope_head_dim,
-                    page_size=page_size,
-                    dtype=qkv_dtype_name,
-                    out_dtype=output_dtype_name,
-                    throughput_latency_profile=None,
-                    throughput_latency_tile_size_q=(
-                        family_probe_launch_shape.tile_size_q
-                    ),
-                    max_active_clusters=max_active_one_cta_clusters,
-                    throughput_latency_split_kv=family_probe_split_kv,
-                    throughput_latency_persistent=None,
+                one_cta_candidate = make_one_cta_candidate(
+                    one_cta_launch_shape,
+                    select_one_cta(one_cta_launch_shape, probe_split_kv),
+                    probe_split_kv,
                 )
-                family_cfg = family_probe_decision.config
-                if family_cfg is not None:
-                    one_cta_work = (
-                        family_cfg.batch_size
-                        * family_cfg.num_ctas_per_seq_q
-                        * family_cfg.num_ctas_for_all_heads
-                        * family_cfg.num_ctas_per_seq_kv
-                        * family_cfg.num_ctas_per_head_dim
-                    )
         elif (
             total_q_rows > 64
             and qkv_dtype_name == "e4m3"
@@ -738,7 +762,7 @@ def _resolve_mla_decode_launch_spec(
                 multi_processor_count=max_active_one_cta_clusters,
             )
             if probe_tile_size_q == 16:
-                extended_launch_shape = GroupsTokensHeadsLaunchShape.for_tile(
+                extended_launch_shape = FlatQueryLaunchShape.for_tile(
                     num_heads,
                     seq_len_q,
                     probe_tile_size_q,
@@ -751,22 +775,9 @@ def _resolve_mla_decode_launch_spec(
                     max_active_clusters=max_active_one_cta_clusters,
                 )
                 if extended_split_kv is not None:
-                    extended_decision = select_mla_ts_kernel(
-                        requested_policy="throughput_latency_1cta",
-                        batch_size=batch_size,
-                        num_heads=extended_launch_shape.num_heads_q,
-                        seq_len_q=extended_launch_shape.seq_len_q,
-                        seq_len_k=max_kv_len,
-                        latent_dim=kv_lora_rank,
-                        rope_dim=qk_rope_head_dim,
-                        page_size=page_size,
-                        dtype=qkv_dtype_name,
-                        out_dtype=output_dtype_name,
-                        throughput_latency_profile=None,
-                        throughput_latency_tile_size_q=probe_tile_size_q,
-                        max_active_clusters=max_active_one_cta_clusters,
-                        throughput_latency_split_kv=extended_split_kv,
-                        throughput_latency_persistent=None,
+                    extended_decision = select_one_cta(
+                        extended_launch_shape,
+                        extended_split_kv,
                     )
                     extended_cfg = extended_decision.config
                     if (
@@ -775,101 +786,39 @@ def _resolve_mla_decode_launch_spec(
                         and extended_cfg.kernel_variant == "swaps_mma_ab"
                         and extended_cfg.tile_size_q == 16
                     ):
-                        family_probe_decision = extended_decision
-                        family_probe_split_kv = extended_split_kv
-                        family_probe_launch_shape = extended_launch_shape
-                        family_probe_is_extended_fp8_swaps = True
-                        one_cta_work = (
-                            extended_cfg.batch_size
-                            * extended_cfg.num_ctas_per_seq_q
-                            * extended_cfg.num_ctas_for_all_heads
-                            * extended_cfg.num_ctas_per_seq_kv
-                            * extended_cfg.num_ctas_per_head_dim
+                        one_cta_candidate = make_one_cta_candidate(
+                            extended_launch_shape,
+                            extended_decision,
+                            extended_split_kv,
+                            is_extended_fp8_swaps=True,
                         )
         elif use_small_flat_family_probe:
-            family_probe_launch_shape = one_cta_launch_shape
-            initial_probe = select_mla_ts_kernel(
-                requested_policy="throughput_latency_1cta",
-                batch_size=batch_size,
-                num_heads=family_probe_launch_shape.num_heads_q,
-                seq_len_q=family_probe_launch_shape.seq_len_q,
-                seq_len_k=max_kv_len,
-                latent_dim=kv_lora_rank,
-                rope_dim=qk_rope_head_dim,
-                page_size=page_size,
-                dtype=qkv_dtype_name,
-                out_dtype=output_dtype_name,
-                throughput_latency_profile=None,
-                throughput_latency_tile_size_q=family_probe_launch_shape.tile_size_q,
-                max_active_clusters=max_active_one_cta_clusters,
-                throughput_latency_split_kv=None,
-                throughput_latency_persistent=None,
+            one_cta_candidate = make_one_cta_candidate(
+                one_cta_launch_shape,
+                select_one_cta(one_cta_launch_shape),
             )
-            initial_cfg = initial_probe.config
-            if initial_probe.implementation_ready and initial_cfg is not None:
-                base_work = q_tile_work_count(
-                    batch_size,
-                    family_probe_launch_shape.num_heads_q,
-                    family_probe_launch_shape.seq_len_q,
-                    family_probe_launch_shape.tile_size_q,
-                )
-                rounded_split_kv = round_auto_split_kv_for_wave(
-                    split_kv=int(initial_cfg.num_ctas_per_seq_kv),
-                    base_work=base_work,
-                    target_work=max_active_one_cta_clusters,
-                    tile_size_q=family_probe_launch_shape.tile_size_q,
-                )
-                family_probe_decision = initial_probe
-                if rounded_split_kv != initial_cfg.num_ctas_per_seq_kv:
-                    family_probe_split_kv = rounded_split_kv
-                    family_probe_decision = select_mla_ts_kernel(
-                        requested_policy="throughput_latency_1cta",
-                        batch_size=batch_size,
-                        num_heads=family_probe_launch_shape.num_heads_q,
-                        seq_len_q=family_probe_launch_shape.seq_len_q,
-                        seq_len_k=max_kv_len,
-                        latent_dim=kv_lora_rank,
-                        rope_dim=qk_rope_head_dim,
-                        page_size=page_size,
-                        dtype=qkv_dtype_name,
-                        out_dtype=output_dtype_name,
-                        throughput_latency_profile=None,
-                        throughput_latency_tile_size_q=(
-                            family_probe_launch_shape.tile_size_q
-                        ),
-                        max_active_clusters=max_active_one_cta_clusters,
-                        throughput_latency_split_kv=rounded_split_kv,
-                        throughput_latency_persistent=None,
-                    )
-                family_cfg = family_probe_decision.config
-                if family_cfg is not None:
-                    one_cta_work = (
-                        family_cfg.batch_size
-                        * family_cfg.num_ctas_per_seq_q
-                        * family_cfg.num_ctas_for_all_heads
-                        * family_cfg.num_ctas_per_seq_kv
-                        * family_cfg.num_ctas_per_head_dim
-                    )
 
         family_probe_cfg = (
-            family_probe_decision.config if family_probe_decision is not None else None
+            one_cta_candidate.decision.config if one_cta_candidate is not None else None
         )
-
-        requested_policy, policy_source = resolve_mla_kernel_policy(
-            None,
-            num_heads,
-            seq_len_q,
-            one_cta_work=one_cta_work,
+        automatic_work = MlaAutomaticWork(
+            one_cta_work=(
+                one_cta_candidate.work if one_cta_candidate is not None else None
+            ),
             one_cta_capacity=(
-                max_active_one_cta_clusters if one_cta_work is not None else None
+                max_active_one_cta_clusters if one_cta_candidate is not None else None
             ),
             two_cta_cluster_work=(
-                two_cta_cluster_work if one_cta_work is not None else None
+                two_cta_cluster_work if one_cta_candidate is not None else None
             ),
             two_cta_cluster_capacity=(
-                max_active_two_cta_clusters if one_cta_work is not None else None
+                max_active_two_cta_clusters if one_cta_candidate is not None else None
             ),
-            one_cta_is_extended_fp8_swaps=(family_probe_is_extended_fp8_swaps),
+            one_cta_is_extended_fp8_swaps=(
+                one_cta_candidate.is_extended_fp8_swaps
+                if one_cta_candidate is not None
+                else False
+            ),
             one_cta_tile_size_q=(
                 int(family_probe_cfg.tile_size_q)
                 if family_probe_cfg is not None
@@ -885,73 +834,37 @@ def _resolve_mla_decode_launch_spec(
             ),
             seq_len_k=max_kv_len if family_probe_cfg is not None else None,
             qkv_dtype=qkv_dtype_name,
+            one_cta_kernel_variant=(
+                str(family_probe_cfg.kernel_variant)
+                if family_probe_cfg is not None
+                else None
+            ),
+        )
+
+        requested_policy, policy_source = resolve_mla_kernel_policy(
+            None,
+            num_heads,
+            seq_len_q,
+            automatic_work,
         )
         use_throughput_latency = requested_policy == "throughput_latency_1cta"
 
         kernel: Any
         if use_throughput_latency:
             max_active_clusters = max_active_one_cta_clusters
-            launch_shape = family_probe_launch_shape or one_cta_launch_shape
-            decision = family_probe_decision
-            if decision is None:
-                family_probe_split_kv = None
-                decision = select_mla_ts_kernel(
-                    requested_policy=requested_policy,
-                    batch_size=batch_size,
-                    num_heads=launch_shape.num_heads_q,
-                    seq_len_q=launch_shape.seq_len_q,
-                    seq_len_k=max_kv_len,
-                    latent_dim=kv_lora_rank,
-                    rope_dim=qk_rope_head_dim,
-                    page_size=page_size,
-                    dtype=qkv_dtype_name,
-                    out_dtype=output_dtype_name,
-                    throughput_latency_profile=None,
-                    throughput_latency_tile_size_q=launch_shape.tile_size_q,
-                    max_active_clusters=max_active_clusters,
-                    throughput_latency_split_kv=None,
-                    throughput_latency_persistent=None,
-                )
-                initial_config = decision.config
-                is_non_power_flat_launch = (
-                    num_heads & (num_heads - 1) != 0 and launch_shape.enabled
-                )
-                if (
-                    decision.implementation_ready
-                    and initial_config is not None
-                    and is_non_power_flat_launch
-                ):
-                    base_work = q_tile_work_count(
-                        batch_size,
-                        launch_shape.num_heads_q,
-                        launch_shape.seq_len_q,
-                        launch_shape.tile_size_q,
-                    )
-                    rounded_split_kv = round_auto_split_kv_for_wave(
-                        split_kv=int(initial_config.num_ctas_per_seq_kv),
-                        base_work=base_work,
-                        target_work=max_active_clusters,
-                        tile_size_q=launch_shape.tile_size_q,
-                    )
-                    if rounded_split_kv != initial_config.num_ctas_per_seq_kv:
-                        family_probe_split_kv = rounded_split_kv
-                        decision = select_mla_ts_kernel(
-                            requested_policy=requested_policy,
-                            batch_size=batch_size,
-                            num_heads=launch_shape.num_heads_q,
-                            seq_len_q=launch_shape.seq_len_q,
-                            seq_len_k=max_kv_len,
-                            latent_dim=kv_lora_rank,
-                            rope_dim=qk_rope_head_dim,
-                            page_size=page_size,
-                            dtype=qkv_dtype_name,
-                            out_dtype=output_dtype_name,
-                            throughput_latency_profile=None,
-                            throughput_latency_tile_size_q=(launch_shape.tile_size_q),
-                            max_active_clusters=max_active_clusters,
-                            throughput_latency_split_kv=rounded_split_kv,
-                            throughput_latency_persistent=None,
-                        )
+            launch_shape = (
+                one_cta_candidate.launch_shape
+                if one_cta_candidate is not None
+                else one_cta_launch_shape
+            )
+            decision = (
+                one_cta_candidate.decision
+                if one_cta_candidate is not None
+                else select_one_cta(launch_shape)
+            )
+            selected_one_cta_split_kv = (
+                one_cta_candidate.split_kv if one_cta_candidate is not None else None
+            )
             if not decision.implementation_ready or decision.config is None:
                 raise NotImplementedError(decision.reason)
             reduction_mode = resolve_runtime_cluster_reduction_mode(
@@ -975,11 +888,10 @@ def _resolve_mla_decode_launch_spec(
                 out_dtype=output_dtype_name,
                 profile=decision.profile_name,
                 reduction_mode=reduction_mode,
-                groups_tokens_heads_q_ratio=launch_shape.ratio,
                 logical_num_heads=num_heads,
                 logical_seq_len_q=seq_len_q,
                 tile_size_q=launch_shape.tile_size_q,
-                explicit_split_kv=family_probe_split_kv,
+                explicit_split_kv=selected_one_cta_split_kv,
                 explicit_persistent=None,
                 mask_type=mask_type,
             )
@@ -1137,51 +1049,87 @@ def _resolve_mla_decode_launch_spec(
 
     return _MLADecodeLaunchSpec(
         kernel=kernel,
-        qkv_dtype=qkv_dtype,
-        output_dtype=output_dtype,
         policy=policy,
         kernel_workspace_bytes=int(workspace_size),
         split_kv=int(split_kv),
     )
 
 
-@functools.cache
-def _get_compiled_mla_decode(
+def _mla_kernel_compile_signature(kernel: Any) -> tuple[object, ...]:
+    """Return all static kernel state except the batch extent."""
+
+    make_signature = getattr(kernel, "compile_signature", None)
+    if not callable(make_signature):
+        raise TypeError("MLA kernels must define compile_signature()")
+    signature = (
+        type(kernel).__module__,
+        type(kernel).__qualname__,
+        make_signature(),
+    )
+    try:
+        hash(signature)
+    except TypeError as error:
+        raise TypeError("MLA kernel compile state must be hashable") from error
+    return signature
+
+
+def _make_mla_decode_compile_spec(
+    launch_spec: _MLADecodeLaunchSpec,
+    *,
     device_index: int,
-    batch_size: int,
     num_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     page_size: int,
-    max_kv_len: int,
     q_dtype_key: str,
-    kv_dtype_key: str,
     output_dtype_key: str,
-    mask_type: str,
-    max_seq_len_q: int = 1,
-    packed_query: bool = False,
+    max_seq_len_q: int,
+    packed_query: bool,
+) -> _MLADecodeCompileSpec:
+    """Keep policy resolution plan-specific and JIT identity batch-free."""
+
+    return _MLADecodeCompileSpec(
+        device_index=device_index,
+        kernel_signature=_mla_kernel_compile_signature(launch_spec.kernel),
+        num_heads=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        page_size=page_size,
+        q_dtype_key=q_dtype_key,
+        output_dtype_key=output_dtype_key,
+        max_seq_len_q=max_seq_len_q,
+        packed_query=packed_query,
+        has_kernel_workspace=launch_spec.kernel_workspace_bytes > 0,
+        split_kv=launch_spec.split_kv,
+        kernel=launch_spec.kernel,
+    )
+
+
+@functools.cache
+def _get_compiled_mla_decode(
+    compile_spec: _MLADecodeCompileSpec,
 ):
-    """Compile and cache one exact semantic TS MLA decode plan."""
+    """Compile and cache one batch-dynamic TS MLA topology."""
 
     import cutlass
     import cutlass.cute as cute
 
-    spec = _resolve_mla_decode_launch_spec(
-        device_index,
-        batch_size,
-        num_heads,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        page_size,
-        max_kv_len,
-        q_dtype_key,
-        kv_dtype_key,
-        output_dtype_key,
-        mask_type,
-        max_seq_len_q,
-    )
+    device_index = compile_spec.device_index
+    num_heads = compile_spec.num_heads
+    kv_lora_rank = compile_spec.kv_lora_rank
+    qk_rope_head_dim = compile_spec.qk_rope_head_dim
+    page_size = compile_spec.page_size
+    max_seq_len_q = compile_spec.max_seq_len_q
+    packed_query = compile_spec.packed_query
+    kernel = compile_spec.kernel
+    dtype_map = {
+        "bfloat16": cutlass.BFloat16,
+        "float8_e4m3fn": cutlass.Float8E4M3FN,
+    }
+    qkv_dtype = dtype_map[compile_spec.q_dtype_key]
+    output_dtype = dtype_map[compile_spec.output_dtype_key]
     physical_pages = cute.sym_int()
-    runtime_batch = cute.sym_int()
+    batch_size = cute.sym_int()
     runtime_total_q = cute.sym_int()
 
     # These fake tensors pin the compact public ABI while allowing runtime
@@ -1197,30 +1145,30 @@ def _get_compiled_mla_decode(
         q_stride = (q_stride_h, 1, q_stride_q)
     else:
         q_stride_batch = max_seq_len_q * q_stride_q
-        q_latent_shape = (num_heads, kv_lora_rank, max_seq_len_q, runtime_batch)
+        q_latent_shape = (num_heads, kv_lora_rank, max_seq_len_q, batch_size)
         q_rope_shape = (
             num_heads,
             qk_rope_head_dim,
             max_seq_len_q,
-            runtime_batch,
+            batch_size,
         )
         q_stride = (q_stride_h, 1, q_stride_q, q_stride_batch)
     q_latent_fake = cute.runtime.make_fake_tensor(
-        spec.qkv_dtype, q_latent_shape, stride=q_stride, assumed_align=16
+        qkv_dtype, q_latent_shape, stride=q_stride, assumed_align=16
     )
     q_rope_fake = cute.runtime.make_fake_tensor(
-        spec.qkv_dtype, q_rope_shape, stride=q_stride, assumed_align=16
+        qkv_dtype, q_rope_shape, stride=q_stride, assumed_align=16
     )
     cache_token_stride = _MLA_QUERY_DIM
     cache_page_stride = page_size * _MLA_QUERY_DIM
     c_latent_fake = cute.runtime.make_fake_tensor(
-        spec.qkv_dtype,
+        qkv_dtype,
         (page_size, kv_lora_rank, physical_pages),
         stride=(cache_token_stride, 1, cache_page_stride),
         assumed_align=16,
     )
     c_rope_fake = cute.runtime.make_fake_tensor(
-        spec.qkv_dtype,
+        qkv_dtype,
         (page_size, qk_rope_head_dim, physical_pages),
         stride=(cache_token_stride, 1, cache_page_stride),
         assumed_align=16,
@@ -1228,7 +1176,7 @@ def _get_compiled_mla_decode(
     runtime_page_columns = cute.sym_int()
     page_offsets_fake = cute.runtime.make_fake_tensor(
         cutlass.Int32,
-        (runtime_page_columns, runtime_batch),
+        (runtime_page_columns, batch_size),
         stride=(1, runtime_page_columns),
         assumed_align=16,
     )
@@ -1244,27 +1192,28 @@ def _get_compiled_mla_decode(
         lse_stride = (1, num_heads)
     else:
         out_stride_batch = max_seq_len_q * out_stride_row
-        out_shape = (num_heads, kv_lora_rank, max_seq_len_q, runtime_batch)
+        out_shape = (num_heads, kv_lora_rank, max_seq_len_q, batch_size)
         out_stride = (kv_lora_rank, 1, out_stride_row, out_stride_batch)
-        lse_shape = (num_heads, max_seq_len_q, runtime_batch)
+        lse_shape = (num_heads, max_seq_len_q, batch_size)
         lse_stride = (1, num_heads, max_seq_len_q * num_heads)
     out_fake = cute.runtime.make_fake_tensor(
-        spec.output_dtype, out_shape, stride=out_stride, assumed_align=16
+        output_dtype, out_shape, stride=out_stride, assumed_align=16
     )
     lse_fake = cute.runtime.make_fake_tensor(
         cutlass.Float32, lse_shape, stride=lse_stride, assumed_align=16
     )
     workspace_fake = None
-    if spec.kernel_workspace_bytes > 0:
+    if compile_spec.has_kernel_workspace:
+        workspace_bytes = cute.sym_int()
         workspace_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int8,
-            (spec.kernel_workspace_bytes,),
+            (workspace_bytes,),
             stride_order=(0,),
             assumed_align=32,
         )
     cache_seqs_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (runtime_batch,),
+        (batch_size,),
         stride_order=(0,),
         assumed_align=16,
     )
@@ -1279,59 +1228,11 @@ def _get_compiled_mla_decode(
         )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    # Refresh host-side grouping/reducer traits with a representative compact
-    # extent before lowering. Runtime Q lengths still come only from qo_indptr.
-    representative_total_q = batch_size * max_seq_len_q
-    validation_q_shape: tuple[int, ...]
-    validation_q_rope_shape: tuple[int, ...]
-    validation_out_shape: tuple[int, ...]
-    validation_lse_shape: tuple[int, ...]
-    validation_qo_shape: tuple[int, ...] | None
-    if packed_query:
-        validation_q_shape = (num_heads, kv_lora_rank, representative_total_q)
-        validation_q_rope_shape = (
-            num_heads,
-            qk_rope_head_dim,
-            representative_total_q,
-        )
-        validation_out_shape = (num_heads, kv_lora_rank, representative_total_q)
-        validation_lse_shape = (num_heads, representative_total_q)
-        validation_qo_shape = (batch_size + 1,)
-    else:
-        validation_q_shape = (num_heads, kv_lora_rank, max_seq_len_q, batch_size)
-        validation_q_rope_shape = (
-            num_heads,
-            qk_rope_head_dim,
-            max_seq_len_q,
-            batch_size,
-        )
-        validation_out_shape = (num_heads, kv_lora_rank, max_seq_len_q, batch_size)
-        validation_lse_shape = (num_heads, max_seq_len_q, batch_size)
-        validation_qo_shape = None
-    if dict(spec.policy)["kernel"] == "throughput_latency_1cta":
-        spec.kernel.validate_groups_tokens_heads_launch_shape(
-            validation_q_shape,
-            validation_q_rope_shape,
-            validation_out_shape,
-            validation_lse_shape,
-            num_heads,
-            max_seq_len_q,
-            validation_qo_shape,
-        )
-    else:
-        spec.kernel.validate_groups_tokens_heads_launch_shape(
-            validation_q_shape,
-            validation_q_rope_shape,
-            validation_out_shape,
-            validation_lse_shape,
-            validation_qo_shape,
-        )
-
     # Task objects carry loop-local state through generated control flow, so
     # select the public staged frontend for this compilation.
     with torch.cuda.device(device_index):
         compiled = cute.compile[cute.FrontendNext](
-            spec.kernel,
+            kernel,
             q_latent_fake,
             q_rope_fake,
             c_latent_fake,
@@ -1340,7 +1241,7 @@ def _get_compiled_mla_decode(
             out_fake,
             lse_fake,
             workspace_fake,
-            cutlass.Int32(spec.split_kv),
+            cutlass.Int32(compile_spec.split_kv),
             cache_seqs_fake,
             qo_indptr_fake,
             None,
@@ -1349,7 +1250,7 @@ def _get_compiled_mla_decode(
             stream_fake,
             options=_COMPILE_OPTIONS,
         )
-    return compiled, spec.policy, spec.kernel_workspace_bytes
+    return compiled
 
 
 def get_prims_ts_batch_decode_mla_workspace_size(
@@ -1370,9 +1271,9 @@ def get_prims_ts_batch_decode_mla_workspace_size(
 ) -> int:
     """Return caller-workspace bytes for one automatic MLA policy.
 
-    The arguments define the same semantic JIT key as
-    :func:`prims_ts_batch_decode_with_kv_cache_mla`. Policy and private scratch
-    layout are resolved without compiling a kernel. ``max_seq_len_q`` is the
+    The arguments resolve the same policy and private scratch layout as
+    :func:`prims_ts_batch_decode_with_kv_cache_mla`, without compiling a
+    kernel. ``max_seq_len_q`` is the
     static per-request Q bound for both fixed and packed-query launches;
     ``seq_len_q`` remains a backward-compatible fixed-Q alias. If neither is
     supplied, the bound is one. The returned byte count includes both split-KV
@@ -1616,7 +1517,7 @@ def prims_ts_batch_decode_with_kv_cache_mla(
     nondecreasing, end at ``query.shape[0]``, and have every delta no
     larger than ``max_seq_len_q``. For causal masking, every fixed or packed
     per-request Q length must also be no greater than the corresponding live
-    ``seq_lens`` value. Warm the semantic key before CUDA graph
+    ``seq_lens`` value. Warm the planned topology before CUDA graph
     capture and provide ``out`` to avoid an output allocation. Captured graphs
     must retain stable ``qo_indptr`` storage; its values may change only while
     that packed-offset contract and the captured query/output extent remain
@@ -1758,11 +1659,19 @@ def prims_ts_batch_decode_with_kv_cache_mla(
             qo_indptr=qo_indptr,
             workspace_buffer=workspace_buffer,
         )
-    compiled, policy, kernel_workspace_bytes = _get_compiled_mla_decode(
-        *spec_key, packed_query
+    compile_spec = _make_mla_decode_compile_spec(
+        spec,
+        device_index=device_index,
+        num_heads=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        page_size=page_size,
+        q_dtype_key=_dtype_key(query.dtype),
+        output_dtype_key=_dtype_key(out_dtype),
+        max_seq_len_q=max_seq_len_q,
+        packed_query=packed_query,
     )
-    if kernel_workspace_bytes != spec.kernel_workspace_bytes or policy != spec.policy:
-        raise RuntimeError("MLA workspace policy changed during compilation")
+    compiled = _get_compiled_mla_decode(compile_spec)
     workspace = _bind_mla_workspace(workspace_buffer, layout)
     return _launch_mla_decode(
         runtime,
@@ -1933,7 +1842,7 @@ class BatchMLADecodePagedTSWrapper:
                 f"columns ({required_page_columns}), got {max_num_pages}"
             )
 
-        compiled, policy, workspace_size = _get_compiled_mla_decode(
+        spec = _resolve_mla_decode_launch_spec(
             device_index,
             batch_size,
             num_heads,
@@ -1946,8 +1855,22 @@ class BatchMLADecodePagedTSWrapper:
             _dtype_key(o_data_type),
             mask_type,
             max_seq_len_q,
-            packed_query,
         )
+        compile_spec = _make_mla_decode_compile_spec(
+            spec,
+            device_index=device_index,
+            num_heads=num_heads,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            page_size=page_size,
+            q_dtype_key=_dtype_key(q_data_type),
+            output_dtype_key=_dtype_key(o_data_type),
+            max_seq_len_q=max_seq_len_q,
+            packed_query=packed_query,
+        )
+        compiled = _get_compiled_mla_decode(compile_spec)
+        policy = spec.policy
+        workspace_size = spec.kernel_workspace_bytes
         workspace_layout = _make_mla_workspace_layout(
             workspace_size, batch_size, num_heads, max_seq_len_q
         )

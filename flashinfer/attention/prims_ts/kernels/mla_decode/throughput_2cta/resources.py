@@ -186,10 +186,10 @@ class MlaTsWorkTileInfo:
     ):
         """Initialize the staged tile coordinate and cached K-domain metadata."""
         cluster_idx, seq_q_idx, batch_idx, split_kv_idx = tile_idx
-        self._cluster_idx = cluster_idx
-        self._seq_q_idx = seq_q_idx
-        self._batch_idx = batch_idx
-        self._split_kv_idx = split_kv_idx
+        self._cluster_idx = Int32(cluster_idx)
+        self._seq_q_idx = Int32(seq_q_idx)
+        self._batch_idx = Int32(batch_idx)
+        self._split_kv_idx = Int32(split_kv_idx)
         self._is_valid = Boolean(is_valid)
         self._k_len = Int32(k_len)
         self._k_tile_count = Int32(k_tile_count)
@@ -294,7 +294,6 @@ class MlaWorkQueue(WorkQueue):
     static_split_kv: cutlass.Constexpr = None
     static_seq_len_k: cutlass.Constexpr = None
     cu_seqlens_q: Any = None
-    groups_tokens_heads_q_ratio: cutlass.Constexpr[int] = 1
     logical_num_heads_q: cutlass.Constexpr[int] = 128
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     static_problem_shape_b: cutlass.Constexpr[int] = None
@@ -316,7 +315,6 @@ class MlaWorkQueue(WorkQueue):
         static_split_kv=None,
         static_seq_len_k=None,
         cu_seqlens_q=None,
-        groups_tokens_heads_q_ratio=1,
         logical_num_heads_q=128,
         logical_seq_len_q=1,
         static_problem_shape_b=None,
@@ -345,7 +343,6 @@ class MlaWorkQueue(WorkQueue):
         self.static_split_kv = static_split_kv
         self.static_seq_len_k = static_seq_len_k
         self.cu_seqlens_q = cu_seqlens_q
-        self.groups_tokens_heads_q_ratio = groups_tokens_heads_q_ratio
         self.logical_num_heads_q = logical_num_heads_q
         self.logical_seq_len_q = logical_seq_len_q
         self.static_problem_shape_b = static_problem_shape_b
@@ -831,7 +828,6 @@ class SmemQResource(HighThroughputMlaResource):
     tma_desc_q_latent: Any = None
     tma_desc_q_rope: Any = None
     cu_seqlens_q: Any = None
-    groups_tokens_heads_q_ratio: cutlass.Constexpr[int] = 1
     logical_num_heads_q: cutlass.Constexpr[int] = 128
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
@@ -1646,7 +1642,6 @@ class TmemSResource(HighThroughputMlaResource):
     cache_seqs: Any = None  # per-batch valid K length
     cu_seqlens_q: Any = None  # cumulative compact-Q offsets, or None for fixed Q
     split_kv: Any = None  # per-work-tile split count
-    groups_tokens_heads_q_ratio: cutlass.Constexpr[int] = 1
     logical_num_heads_q: cutlass.Constexpr[int] = 128
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
@@ -3052,7 +3047,6 @@ class GmemOResource(HighThroughputMlaResource):
     smem_exchange: Any = None  # SMEM for row_sum exchange (as Int32 base addr)
     split_kv: Any = None
     cu_seqlens_q: Any = None
-    groups_tokens_heads_q_ratio: cutlass.Constexpr[int] = 1
     logical_num_heads_q: cutlass.Constexpr[int] = 128
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)

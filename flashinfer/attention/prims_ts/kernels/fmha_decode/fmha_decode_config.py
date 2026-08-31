@@ -21,7 +21,7 @@ that should be set before kernel compilation.
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 
 import cutlass.utils as utils
 from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
@@ -1317,6 +1317,14 @@ class FmhaDecodeConfig:
             or self.use_separate_reduction_kernel
         ):
             raise ValueError("block-sparse does not support split-KV reduction")
+
+    def compile_signature(self) -> tuple[tuple[str, object], ...]:
+        """Freeze every static config field for a cached compiled callable."""
+
+        return tuple(
+            (config_field.name, getattr(self, config_field.name))
+            for config_field in fields(self)
+        )
 
     @property
     def uses_q_desc_ref(self) -> bool:

@@ -107,9 +107,7 @@ def _aligned_mla_num_pages_per_seq(seq_len, page_size):
         raise ValueError(f"page_size must be positive, got {page_size}")
     logical_pages = (seq_len + page_size - 1) // page_size
     pages_per_group = max(1, 128 // page_size)
-    return (
-        (logical_pages + pages_per_group - 1) // pages_per_group * pages_per_group
-    )
+    return (logical_pages + pages_per_group - 1) // pages_per_group * pages_per_group
 
 
 def _context_reference_sample_points(qo_indptr_host, num_qo_heads, limit=8):

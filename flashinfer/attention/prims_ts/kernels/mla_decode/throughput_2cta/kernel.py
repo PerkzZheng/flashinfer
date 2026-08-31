@@ -64,7 +64,6 @@ from ..helpers.mask import MaskType, mask_visible_k_length, normalize_mask_type
 from ..helpers.query import (
     FlatQueryTileLayout,
     flat_query_row_state,
-    groups_tokens_heads_q_capacity,
     query_batch_bounds,
     runtime_flat_query_tile_has_rows,
 )
@@ -159,7 +158,6 @@ def build_mla_decode_task_manager(
     cache_seqs=None,
     cu_seqlens_q=None,
     split_kv=None,
-    groups_tokens_heads_ratio=1,
     logical_num_heads_q=128,
     logical_seq_len_q=1,
     tiled_mma_qk=None,
@@ -346,7 +344,6 @@ def build_mla_decode_task_manager(
         tma_desc_q_latent=tma_desc_q_latent,
         tma_desc_q_rope=tma_desc_q_rope,
         cu_seqlens_q=cu_seqlens_q,
-        groups_tokens_heads_q_ratio=groups_tokens_heads_ratio,
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
         cfg=cfg,
@@ -397,7 +394,6 @@ def build_mla_decode_task_manager(
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         split_kv=split_kv,
-        groups_tokens_heads_q_ratio=groups_tokens_heads_ratio,
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
         tiled_mma_qk=tiled_mma_qk,
@@ -439,7 +435,6 @@ def build_mla_decode_task_manager(
         smem_exchange=None,  # set at runtime
         split_kv=None,  # set at runtime
         cu_seqlens_q=cu_seqlens_q,
-        groups_tokens_heads_q_ratio=groups_tokens_heads_ratio,
         logical_num_heads_q=logical_num_heads_q,
         logical_seq_len_q=logical_seq_len_q,
         name="gmem_o",
@@ -725,7 +720,6 @@ class MlaDecodeTs:
         qkv_dtype="bf16",
         out_dtype="bf16",
         rope_dim=64,
-        groups_tokens_heads=False,
         num_heads=128,
         seq_len_q=1,
         batch_size=1,
@@ -767,13 +761,10 @@ class MlaDecodeTs:
             Output dtype name.
         rope_dim : int, optional
             RoPE head dimension.
-        groups_tokens_heads : bool, optional
-            Accepted launch hint. Eligible speculative-decode shapes group
-            tokens and Q heads automatically from ``num_heads`` and the M tile.
         num_heads : int, optional
-            Logical query-head count used to derive groups_tokens_heads_q capacity.
+            Logical query-head count used to derive the flat-row tile count.
         seq_len_q : int, optional
-            Logical query length used to derive the effective grouped shape.
+            Logical query length used to derive the flat-row tile count.
         batch_size : int, optional
             Host-known batch size used to qualify the standalone reducer
             topology.
@@ -830,10 +821,6 @@ class MlaDecodeTs:
                     physical_sm_count=max_active_clusters * 2,
                 )
             )
-        # Retain the legacy attributes for source compatibility with callers
-        # that inspect the object. Device geometry no longer consumes them.
-        self.groups_tokens_heads_ratio = 1
-        self.groups_tokens_heads = False
         self.parallel_reduction_topology: ParallelReductionTopology | None = None
         self.use_parallel_reduction = False
         self._parallel_reduction_shape_is_eligible = (
@@ -851,6 +838,37 @@ class MlaDecodeTs:
         """Return physical row/tile extents used by the split workspace."""
 
         return self.mma_qk_tiler_mn[0], self.num_q_tiles
+
+    def compile_signature(self) -> tuple[object, ...]:
+        """Return the complete batch-independent JIT identity."""
+
+        return (
+            self.acc_dtype,
+            self.lse_dtype,
+            self.mma_qk_tiler_mn,
+            self.mma_pv_tiler_mn,
+            self.max_active_clusters,
+            self.page_size,
+            self.is_persistent,
+            self.is_var_seq,
+            self.is_var_split_kv,
+            self.static_split_kv,
+            self.static_seq_len_k,
+            self.qkv_dtype,
+            self.out_dtype,
+            self.rope_dim,
+            self.num_heads,
+            self.seq_len_q,
+            self.mask_type,
+            self.reduction_split_capacity,
+            self.query_tile_layout,
+            self.num_q_tiles,
+            self.tail_q_rows,
+            self.reference_reduction_rows_per_cta,
+            self._parallel_reduction_shape_is_eligible,
+            self.use_parallel_reduction,
+            self.parallel_reduction_topology,
+        )
 
     def _configure_parallel_reduction_topology(self) -> None:
         """Refresh reducer topology after any host-side launch-shape update."""
@@ -914,140 +932,6 @@ class MlaDecodeTs:
             self.parallel_reduction_topology = topology
             self.use_parallel_reduction = True
 
-    @staticmethod
-    def compute_groups_tokens_heads_ratio(
-        num_heads: int, seq_len_q: int, m_tile: int
-    ) -> int:
-        """Return the groups_tokens_heads_q capacity of one selected Q tile.
-
-        The capacity is deliberately independent of ``seq_len_q``.  A final
-        short group is represented by out-of-bounds Q rows and masked output
-        stores rather than by selecting a different compiled layout.
-        """
-
-        if num_heads <= 0 or seq_len_q <= 0 or m_tile <= 0:
-            return 1
-        return groups_tokens_heads_q_capacity(num_heads, m_tile)
-
-    @property
-    def groups_tokens_heads_q_ratio(self) -> int:
-        """Return the retired grouping ratio for compatibility."""
-
-        return self.groups_tokens_heads_ratio
-
-    def validate_groups_tokens_heads_launch_shape(
-        self,
-        q_latent_shape,
-        q_rope_shape,
-        o_shape,
-        lse_shape,
-        cu_seqlens_q_shape=None,
-    ) -> None:
-        """Validate logical public tensor shapes and refresh groups_tokens_heads_q traits.
-
-        The JIT body cannot convert CuTe symbolic shape values back to Python
-        integers, so the host launch path refreshes grouping traits from the
-        concrete tensor shapes before compilation.
-        """
-
-        num_heads = int(q_latent_shape[0])
-        is_variable_q = len(q_latent_shape) == 3
-        if is_variable_q:
-            total_q = int(q_latent_shape[2])
-            query_tile_layout = FlatQueryTileLayout.for_tile(
-                num_heads, self.seq_len_q, self.mma_qk_tiler_mn[0]
-            )
-            for name, shape in (
-                ("q_latent", q_latent_shape),
-                ("q_rope", q_rope_shape),
-                ("o", o_shape),
-            ):
-                if len(shape) != 3:
-                    raise ValueError(
-                        f"{name} must be rank-3 for compact variable-length Q"
-                    )
-                if int(shape[0]) != num_heads or int(shape[2]) != total_q:
-                    raise ValueError(
-                        "compact variable-length Q tensors must agree on "
-                        f"num_heads/total_q for {name}"
-                    )
-            if len(lse_shape) != 2:
-                raise ValueError("lse must be rank-2 for compact variable-length Q")
-            if int(lse_shape[0]) != num_heads or int(lse_shape[1]) != total_q:
-                raise ValueError(
-                    "compact variable-length Q tensors must agree on "
-                    "num_heads/total_q for lse"
-                )
-            if cu_seqlens_q_shape is None:
-                raise ValueError(
-                    "cu_seqlens_q shape is required for compact variable-length Q"
-                )
-            if len(cu_seqlens_q_shape) != 1:
-                raise ValueError("cu_seqlens_q must be rank-1")
-            batch_size = int(cu_seqlens_q_shape[0]) - 1
-            if batch_size <= 0:
-                raise ValueError("cu_seqlens_q must contain at least two offsets")
-            self.num_heads = num_heads
-            self.batch_size = batch_size
-            self.query_tile_layout = query_tile_layout
-            self.num_q_tiles = query_tile_layout.num_tiles
-            self.tail_q_rows = query_tile_layout.tail_rows
-            self.groups_tokens_heads_ratio = 1
-            self.groups_tokens_heads = False
-            self._configure_parallel_reduction_topology()
-            return
-
-        if cu_seqlens_q_shape is not None:
-            raise ValueError("cu_seqlens_q requires rank-3 compact Q/O and rank-2 LSE")
-
-        if len(q_latent_shape) != 4:
-            raise ValueError("q_latent must be rank-4 for groups_tokens_heads_q launch")
-        seq_len_q = int(q_latent_shape[2])
-        batch_size = int(q_latent_shape[3])
-        query_tile_layout = FlatQueryTileLayout.for_tile(
-            num_heads, seq_len_q, self.mma_qk_tiler_mn[0]
-        )
-
-        def _check_4d(name, shape):
-            """Validate one logical 4D tensor against runtime H and SQ."""
-            if len(shape) != 4:
-                raise ValueError(
-                    f"{name} must be rank-4 for groups_tokens_heads_q launch"
-                )
-            if (
-                int(shape[0]) != num_heads
-                or int(shape[2]) != seq_len_q
-                or int(shape[3]) != batch_size
-            ):
-                raise ValueError(
-                    "groups_tokens_heads_q launch tensors must agree on "
-                    f"num_heads/seq_len_q/batch_size for {name}"
-                )
-
-        _check_4d("q_latent", q_latent_shape)
-        _check_4d("q_rope", q_rope_shape)
-        _check_4d("o", o_shape)
-        if len(lse_shape) != 3:
-            raise ValueError("lse must be rank-3 for groups_tokens_heads_q launch")
-        if (
-            int(lse_shape[0]) != num_heads
-            or int(lse_shape[1]) != seq_len_q
-            or int(lse_shape[2]) != batch_size
-        ):
-            raise ValueError(
-                "groups_tokens_heads_q launch tensors must agree on "
-                "num_heads/seq_len_q/batch_size for lse"
-            )
-        self.num_heads = num_heads
-        self.seq_len_q = seq_len_q
-        self.batch_size = batch_size
-        self.query_tile_layout = query_tile_layout
-        self.num_q_tiles = query_tile_layout.num_tiles
-        self.tail_q_rows = query_tile_layout.tail_rows
-        self.groups_tokens_heads_ratio = 1
-        self.groups_tokens_heads = False
-        self._configure_parallel_reduction_topology()
-
     @cute.jit
     def __call__(
         self,
@@ -1095,6 +979,10 @@ class MlaDecodeTs:
             batch_size = cute.size(cu_seqlens_q) - Int32(1)
         else:
             batch_size = cute.size(o.shape[3])
+            runtime_assert(
+                batch_size == cute.size(cache_seqs),
+                "fixed output batch size must match cache_seqs",
+            )
 
         runtime_assert(
             q_latent.stride[2] == q_latent.shape[0] * q_latent.stride[0],
@@ -1340,11 +1228,6 @@ class MlaDecodeTs:
         # Reduction kernel: combine per-split results when split_kv > 1
         if cutlass.const_expr(acc_o is not None):
             if cutlass.const_expr(self.use_parallel_reduction):
-                runtime_assert(
-                    batch_size == Int32(self.batch_size),
-                    "parallel-reducer runtime batch size must match "
-                    "host-known batch_size",
-                )
                 topology = self.parallel_reduction_topology
                 self.parallel_reduction_kernel(
                     o,
@@ -1561,7 +1444,7 @@ class MlaDecodeTs:
             cluster_idx = query_cluster_idx % Int32(cfg.cluster_shape_mnk[0])
             split_kv_idx, batch_idx = divmod_constexpr_power_of_two_or_fdd(
                 split_batch_idx,
-                self.batch_size,
+                None,
                 tile_sched_params.problem_shape_b_fdd,
             )
             blk_coord = (cluster_idx, seq_q_idx, batch_idx, split_kv_idx)
@@ -1578,7 +1461,7 @@ class MlaDecodeTs:
             )
             current_work_after_batch, batch_idx = divmod_constexpr_power_of_two_or_fdd(
                 current_work_after_seq_q,
-                self.batch_size,
+                None,
                 tile_sched_params.problem_shape_b_fdd,
             )
             _, split_kv_idx = divmod(
@@ -1589,7 +1472,7 @@ class MlaDecodeTs:
             cluster_idx, seq_batch_idx, split_kv_idx = cute.arch.block_idx()
             seq_q_idx, batch_idx = divmod_constexpr_power_of_two_or_fdd(
                 seq_batch_idx,
-                self.batch_size,
+                None,
                 tile_sched_params.problem_shape_b_fdd,
             )
             blk_coord = (cluster_idx, seq_q_idx, batch_idx, split_kv_idx)
@@ -1761,10 +1644,9 @@ class MlaDecodeTs:
                 static_split_kv=self.static_split_kv,
                 static_seq_len_k=self.static_seq_len_k,
                 cu_seqlens_q=cu_seqlens_q,
-                groups_tokens_heads_q_ratio=self.groups_tokens_heads_q_ratio,
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=self.seq_len_q,
-                static_problem_shape_b=self.batch_size,
+                static_problem_shape_b=None,
                 static_problem_shape_s=effective_seq_len_q,
                 use_clc_dynamic=use_clc_dynamic,
                 tile_scheduler_config=work_queue_tile_scheduler_config,
@@ -1796,7 +1678,6 @@ class MlaDecodeTs:
                 cache_seqs=cache_seqs,
                 cu_seqlens_q=cu_seqlens_q,
                 split_kv=max_split_kv,
-                groups_tokens_heads_ratio=self.groups_tokens_heads_q_ratio,
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=self.seq_len_q,
                 tiled_mma_qk=tiled_mma_qk,

@@ -230,9 +230,9 @@ For the standalone workflow, call
 `get_prims_ts_batch_decode_workspace_size()` with the same shape, dtype, mask,
 window, and Q-layout arguments as the launch. Allocate at least that many
 bytes as a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8`
-tensor. Zero it before first use and re-zero it whenever an argument that
-contributes to the semantic JIT key changes, because the internal workspace
-section offsets can change with that key. Do not share it between concurrent
+tensor. Zero it before first use and re-zero it whenever any workspace-layout
+input, including batch size, changes because the internal workspace section
+offsets can move even when the compiled callable is reused. Do not share it between concurrent
 launches or captured graphs. It must not overlap Q, K/V cache, metadata, or
 output storage. The standalone hot path trusts CSR, `seq_lens`, and packed-Q
 values: keep lengths positive and within their static bounds, keep enough page

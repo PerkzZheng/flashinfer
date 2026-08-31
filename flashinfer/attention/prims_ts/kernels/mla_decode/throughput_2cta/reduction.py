@@ -76,9 +76,7 @@ def run_reduction_kernel(
 
     effective_num_heads_q = Int32(cfg.mma_qk_tiler[0])
     logical_query_rows = Int32(kernel.num_heads * kernel.seq_len_q)
-    local_flat_query_row = (
-        flat_query_group_idx * Int32(rows_per_cta) + row_in_cta
-    )
+    local_flat_query_row = flat_query_group_idx * Int32(rows_per_cta) + row_in_cta
     row_is_valid = local_flat_query_row < logical_query_rows
     # Clamp the final CTA's inactive row groups before decomposing the physical
     # workspace coordinate.  ``rows_per_cta`` divides M128, so every CTA
@@ -187,9 +185,7 @@ def run_reduction_kernel(
     )
     row_scale_offset = row_in_cta * Int32(max_splits)
 
-    acc_lse_tile = acc_lse[
-        effective_head_idx, None, query_tile_idx, batch_idx
-    ]
+    acc_lse_tile = acc_lse[effective_head_idx, None, query_tile_idx, batch_idx]
     if row_warp_idx == 0:
         # The first warp for each row owns its log-sum-exp merge.  It publishes
         # one rescale factor per active split for the row's second warp too.
