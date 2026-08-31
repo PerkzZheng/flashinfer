@@ -93,23 +93,6 @@ def _select_reference_output(outputs, priority):
     return None, None
 
 
-def _aligned_mla_num_pages_per_seq(seq_len, page_size):
-    """Return an MLA block-table width aligned to a 128-token boundary.
-
-    The direct TRTLLM-GEN/CuTeDSL MLA API requires the rectangular block-table
-    width to cover an integer number of 128-token groups.  Keep ``seq_len``
-    unchanged and add only unused physical pages so non-aligned benchmark
-    lengths exercise the requested logical workload across every backend.
-    """
-    if seq_len < 0:
-        raise ValueError(f"seq_len must be non-negative, got {seq_len}")
-    if page_size <= 0:
-        raise ValueError(f"page_size must be positive, got {page_size}")
-    logical_pages = (seq_len + page_size - 1) // page_size
-    pages_per_group = max(1, 128 // page_size)
-    return (logical_pages + pages_per_group - 1) // pages_per_group * pages_per_group
-
-
 def _context_reference_sample_points(qo_indptr_host, num_qo_heads, limit=8):
     """Choose deterministic context samples across requests, rows, and heads."""
     batch_size = len(qo_indptr_host) - 1
@@ -473,24 +456,6 @@ def parse_attention_args(line, parser):
             "'modular'/'monolithic' force that impl. If unset (default), "
             "cute_dsl_impl is not passed and the API default ('auto') is used, "
             "preserving existing behavior and perf baselines."
-        ),
-    )
-    parser.add_argument(
-        "--prims_ts_expected_kernel",
-        choices=["throughput_latency_1cta", "throughput_2cta"],
-        default=None,
-        help=(
-            "MLA-only: require prims-ts auto policy to select this kernel family. "
-            "Useful for checked benchmark matrices where a family change must fail "
-            "closed instead of silently changing the comparison."
-        ),
-    )
-    parser.add_argument(
-        "--prims_ts_expected_profile",
-        default=None,
-        help=(
-            "MLA-only: require this exact throughput-latency 1CTA profile. "
-            "Ignored only when prims-ts is not requested."
         ),
     )
 
@@ -3271,8 +3236,7 @@ def testBatchMLAPagedAttentionWrapper(args):
         print(f"[VVERBOSE] {q.shape = }")
 
     # Create KV cache
-    logical_num_pages_per_seq = (s_kv + page_size - 1) // page_size
-    num_pages_per_seq = _aligned_mla_num_pages_per_seq(s_kv, page_size)
+    num_pages_per_seq = (s_kv + page_size - 1) // page_size
     total_num_pages = num_pages_per_seq * batch_size
 
     # Now initialize the page tables
@@ -3286,7 +3250,6 @@ def testBatchMLAPagedAttentionWrapper(args):
     )
 
     if args.verbose >= 2:
-        print(f"[VVERBOSE] {logical_num_pages_per_seq = }")
         print(f"[VVERBOSE] {num_pages_per_seq = }")
         print(f"[VVERBOSE] {total_num_pages = }")
         print(f"[VVERBOSE] {block_tables.shape = }")
@@ -3389,8 +3352,6 @@ def testBatchMLAPagedAttentionWrapper(args):
         kv_cache = kv_cache.to(kv_dtype)
 
     prims_ts_out = None
-    prims_ts_policy: dict[str, object] | None = None
-    prims_ts_kernel_workspace_bytes: int | None = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
         prims_ts_out = torch.empty(
@@ -3416,33 +3377,6 @@ def testBatchMLAPagedAttentionWrapper(args):
             mask_type="causal",
             max_kv_len=s_kv,
         )
-        prims_ts_policy = dict(backend_wrappers["prims-ts"]._policy)
-        prims_ts_kernel_workspace_bytes = int(
-            backend_wrappers["prims-ts"]._workspace_layout.kernel_workspace.byte_size
-        )
-        expected_kernel = getattr(args, "prims_ts_expected_kernel", None)
-        if expected_kernel is not None and prims_ts_policy["kernel"] != expected_kernel:
-            raise AssertionError(
-                "prims-ts MLA policy mismatch: expected kernel "
-                f"{expected_kernel!r}, got {prims_ts_policy['kernel']!r}; "
-                f"policy={prims_ts_policy}"
-            )
-        expected_profile = getattr(args, "prims_ts_expected_profile", None)
-        if (
-            expected_profile is not None
-            and prims_ts_policy["profile"] != expected_profile
-        ):
-            raise AssertionError(
-                "prims-ts MLA policy mismatch: expected profile "
-                f"{expected_profile!r}, got {prims_ts_policy['profile']!r}; "
-                f"policy={prims_ts_policy}"
-            )
-        if args.verbose >= 1:
-            print(
-                "[INFO] prims-ts MLA policy: "
-                f"{prims_ts_policy}; kernel_workspace_bytes="
-                f"{prims_ts_kernel_workspace_bytes}"
-            )
 
     direct_out = None
     if any(backend in backends for backend in ("trtllm-native", "auto", "cute-dsl")):
@@ -3810,10 +3744,6 @@ def testBatchMLAPagedAttentionWrapper(args):
                 2 * attended_pairs * num_qo_heads * (2 * head_dim_ckv + head_dim_kpe)
             )
             tflops = (tflops_total / (median_time * 1e9)).item()
-            query_tokens_per_second = batch_size * s_qo * 1e3 / median_time
-            query_head_rows_per_second = (
-                batch_size * s_qo * num_qo_heads * 1e3 / median_time
-            )
 
             print_perf_metrics(backend, median_time, std_time, tflops, tb_per_sec)
 
@@ -3825,8 +3755,6 @@ def testBatchMLAPagedAttentionWrapper(args):
                 cur_res["std_time"] = std_time
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
-                cur_res["query_tokens_per_second"] = query_tokens_per_second
-                cur_res["query_head_rows_per_second"] = query_head_rows_per_second
                 cur_res["backend"] = backend
                 cur_res["page_size"] = page_size
                 cur_res["batch_size"] = batch_size
@@ -3847,12 +3775,6 @@ def testBatchMLAPagedAttentionWrapper(args):
                 # Same null-preserving rule for cute_dsl_impl.
                 if mla_cute_dsl_impl_arg is not None:
                     cur_res["cute_dsl_impl"] = mla_cute_dsl_impl_arg
-                if prims_ts_policy is not None:
-                    for key, value in prims_ts_policy.items():
-                        cur_res[f"prims_ts_{key}"] = value
-                    cur_res["prims_ts_kernel_workspace_bytes"] = (
-                        prims_ts_kernel_workspace_bytes
-                    )
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
     return res
