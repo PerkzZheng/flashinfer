@@ -22,9 +22,9 @@ locator. The public API names the sparse block size explicitly; the current
 kernel specialization supports size four.
 
 Grouped construction uses one bitmap CTA per query and one pack CTA per group.
-The kernels execute in stream order; programmatic dependent launch is left for
-a separately qualified integration because metadata correctness must not rely
-on an unproven producer/consumer launch contract.
+On SM90 and newer, the bitmap grid releases the dependent pack grid through
+programmatic dependent launch (PDL); older devices retain ordinary stream
+ordering.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ import torch
 import triton
 import triton.language as tl
 
+from ...utils import device_support_pdl
 from ._tensor_aliasing import _validate_tensor_does_not_overlap_inputs
 
 _QSA_SUPPORTED_SPARSE_BLOCK_SIZE = 4
@@ -262,6 +263,7 @@ class _PrimsTSQSAMetadataPlan:
     builder_block_size: int
     pack_block_size: int
     pack_num_warps: int
+    enable_pdl: bool
     block_indices_row_stride: int
     block_indices_column_stride: int
     block_table_request_stride: int
@@ -319,6 +321,7 @@ class _PrimsTSQSAMetadataPlan:
             BITSET_WORDS=self.bitset_words,
             BLOCK_SIZE=self.builder_block_size,
             SEMANTIC_PAGE_SIZE=self.sparse_block_size,
+            ENABLE_PDL=self.enable_pdl,
             num_warps=4,
         )
         _pack_qsa_page4_grouped_union_kernel[(self.groups,)](
@@ -342,7 +345,9 @@ class _PrimsTSQSAMetadataPlan:
             PAGE_MEMBERSHIP_BITS=_QSA_MEMBERSHIP_BITS,
             STORAGE_PAGE_SIZE=self.storage_page_size,
             PAGE_CAPACITY=self.page_capacity,
+            ENABLE_PDL=self.enable_pdl,
             num_warps=self.pack_num_warps,
+            launch_pdl=self.enable_pdl,
         )
 
 
@@ -575,6 +580,7 @@ def _build_qsa_page4_grouped_bitsets_kernel(
     BITSET_WORDS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     SEMANTIC_PAGE_SIZE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ) -> None:
     """Build one compact logical sparse-block bitmap per query."""
 
@@ -657,6 +663,11 @@ def _build_qsa_page4_grouped_bitsets_kernel(
         sem="relaxed",
         scope="cta",
     )
+    if ENABLE_PDL:
+        # Every lane must finish its bitmap atomics before this CTA releases
+        # the dependent pack grid. Grid completion supplies global visibility.
+        tl.debug_barrier()
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 @triton.jit
@@ -681,6 +692,7 @@ def _pack_qsa_page4_grouped_union_kernel(
     PAGE_MEMBERSHIP_BITS: tl.constexpr,
     STORAGE_PAGE_SIZE: tl.constexpr,
     PAGE_CAPACITY: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ) -> None:
     """Pack sorted locator/membership unions from per-query bitmaps."""
 
@@ -725,6 +737,10 @@ def _pack_qsa_page4_grouped_union_kernel(
     offsets = tl.arange(0, BLOCK_SIZE)
     word_live = offsets < BITSET_WORDS
     bitset_base = group * GROUP_SIZE * BITSET_WORDS
+    if ENABLE_PDL:
+        # Semantic route metadata above is independent of the producer. Wait
+        # immediately before the first producer-written bitmap is consumed.
+        tl.extra.cuda.gdc_wait()
     q_word_0 = tl.load(
         bitsets_ptr + bitset_base + offsets,
         mask=word_live,
@@ -1153,8 +1169,9 @@ def _build_prims_ts_qsa_page4_metadata(
     capture. The output table has a fixed row width of
     ``group_size * (block_topk + 1)``; ``seq_lens`` selects the live prefix.
     The workspace may be int8, uint8, or int32 and must not be shared by
-    concurrent launches. Q1 uses one kernel. Q2/Q4/Q5 use a stream-ordered
-    per-query bitmap kernel followed by a union-pack kernel.
+    concurrent launches. Q1 uses one kernel. Q2/Q4/Q5 use a per-query bitmap
+    kernel followed by a union-pack kernel. On SM90 and newer, the two-kernel
+    dependency uses PDL; older devices retain ordinary stream ordering.
     Packed ``qo_indptr`` must be an Int32 device copy of CPU-validated route
     offsets; this builder checks only its structural tensor contract and does
     not read route values back to the host.
@@ -1260,6 +1277,7 @@ def _build_prims_ts_qsa_page4_metadata(
     bitset_words = (logical_block_capacity + 31) // 32
     builder_block_size = triton.next_power_of_2(max(block_topk, bitset_words))
     q_offsets = qsa_block_table if qo_indptr is None else qo_indptr
+    enable_pdl = device_support_pdl(block_indices.device)
     _build_qsa_page4_grouped_bitsets_kernel[(groups, group_size)](
         block_indices,
         token_to_request,
@@ -1276,6 +1294,7 @@ def _build_prims_ts_qsa_page4_metadata(
         BITSET_WORDS=bitset_words,
         BLOCK_SIZE=builder_block_size,
         SEMANTIC_PAGE_SIZE=sparse_block_size,
+        ENABLE_PDL=enable_pdl,
         num_warps=4,
     )
     pack_block_size = triton.next_power_of_2(bitset_words)
@@ -1301,7 +1320,9 @@ def _build_prims_ts_qsa_page4_metadata(
         PAGE_MEMBERSHIP_BITS=_QSA_MEMBERSHIP_BITS,
         STORAGE_PAGE_SIZE=storage_page_size,
         PAGE_CAPACITY=page_capacity,
+        ENABLE_PDL=enable_pdl,
         num_warps=pack_num_warps,
+        launch_pdl=enable_pdl,
     )
     return outputs
 
@@ -1330,8 +1351,9 @@ def build_prims_ts_qsa_metadata(
     Grouped entries additionally reserve the low eight bits for per-query
     membership.
 
-    Q1 uses one kernel. Q2/Q4/Q5 use a stream-ordered per-query bitmap kernel
-    followed by a union-pack kernel. Advanced callers that capture this raw
+    Q1 uses one kernel. Q2/Q4/Q5 use a per-query bitmap kernel followed by a
+    union-pack kernel, connected with PDL on SM90 and newer and ordinary stream
+    ordering on older devices. Advanced callers that capture this raw
     path must preallocate ``out`` and ``workspace_buffer``, warm the same
     metadata geometry once before capture, and retain every tensor at a stable
     address through replay.
@@ -1418,6 +1440,7 @@ def _prepare_prims_ts_qsa_metadata_plan(
         builder_block_size=builder_block_size,
         pack_block_size=pack_block_size,
         pack_num_warps=pack_num_warps,
+        enable_pdl=device_support_pdl(block_indices.device),
         block_indices_row_stride=block_indices.stride(0),
         block_indices_column_stride=block_indices.stride(1),
         block_table_request_stride=block_table.stride(0),
@@ -1705,8 +1728,8 @@ def prims_ts_qsa_attention(
     )
     views = layout.bind(workspace_buffer)
 
-    # Keep metadata -> attention stream ordered until the complete dependency
-    # chain is qualified independently.
+    # The grouped metadata kernels may use their internal PDL handoff, while
+    # completed metadata -> attention remains an ordinary stream dependency.
     _build_prims_ts_qsa_page4_metadata(
         block_indices,
         block_table,

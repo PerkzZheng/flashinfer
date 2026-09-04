@@ -66,14 +66,17 @@ convenience. The lower-level metadata shape, workspace, and
 `build_prims_ts_qsa_metadata` functions are an advanced two-step interface for
 frameworks that manage the resulting route table themselves.
 
-Metadata and the attention producer launch in normal stream order. On a
-fixed-decode split-KV path, the producer remains an ordinary non-PDL launch and
-signals dependents only after completion and TMEM teardown. Only the separate
-reducer uses programmatic dependent launch (PDL). It initializes its register
-state and any required shared-memory storage before acquiring, then acquires
-before reading any producer-written partial output or statistics. Independent
-sequence-length and query-offset metadata may be read before that acquire.
-Packed prefill has no split-KV reducer.
+For grouped QSA metadata, the bitmap producer releases the union-pack consumer
+with programmatic dependent launch (PDL) on SM90 and newer; older devices use
+ordinary stream ordering. The consumer waits immediately before its first
+bitmap read. The completed metadata then precedes attention through normal
+stream order. On a fixed-decode split-KV path, the attention producer remains
+an ordinary non-PDL launch and signals dependents only after completion and
+TMEM teardown. The separate reducer initializes its register state and any
+required shared-memory storage before acquiring, then acquires before reading
+any producer-written partial output or statistics. Independent sequence-length
+and query-offset metadata may be read before that acquire. Packed prefill has
+no split-KV reducer.
 
 For `BlockSparsePagedTSWrapper`, `plan` freezes the logical fixed-Q geometry
 and copies the paged-KV row offsets and optional per-request K/V lengths into

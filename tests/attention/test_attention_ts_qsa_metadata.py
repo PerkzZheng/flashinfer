@@ -1899,6 +1899,7 @@ def test_prepared_qsa_fp8_grouped_tp4_bs256_cuda_graph(group_size: int) -> None:
     )
     assert plan._metadata_plan.pack_block_size == 2048
     assert plan._metadata_plan.pack_num_warps == 8
+    assert plan._metadata_plan.enable_pdl is True
 
     def run() -> None:
         plan.run(
