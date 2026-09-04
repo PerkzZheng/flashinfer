@@ -694,11 +694,11 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 "prims-ts",
                 "requires equal QK/VO head dimensions in {64, 128, 256}",
             )
-        elif page_size not in (16, 32, 64, 128):
+        elif page_size not in (4, 16, 32, 64, 128):
             _drop_backend(
                 backends,
                 "prims-ts",
-                "requires page_size in {16, 32, 64, 128}",
+                "requires page_size in {4, 16, 32, 64, 128}",
             )
         elif num_qo_heads % num_kv_heads != 0 or not (
             1 <= num_qo_heads // num_kv_heads <= 32
@@ -982,9 +982,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
         backend_wrappers["prims-ts"].plan(
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
+            block_tables,
+            actual_seq_lens_kv.flatten(),
             num_qo_heads,
             num_kv_heads,
             head_dim_qk,

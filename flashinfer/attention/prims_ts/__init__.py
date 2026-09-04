@@ -44,7 +44,7 @@ from .mla_decode import (
 )
 from .qsa_metadata import (
     PrimsTSQSAPlan,
-    build_prims_ts_qsa_page4_metadata,
+    build_prims_ts_qsa_metadata,
     get_prims_ts_qsa_metadata_output_shapes,
     get_prims_ts_qsa_metadata_workspace_size,
     get_prims_ts_qsa_workspace_size,
@@ -70,7 +70,7 @@ __all__ = [
     "prepare_prims_ts_batch_decode_with_kv_cache",
     "prims_ts_batch_decode_with_kv_cache",
     "PrimsTSQSAPlan",
-    "build_prims_ts_qsa_page4_metadata",
+    "build_prims_ts_qsa_metadata",
     "get_prims_ts_qsa_metadata_output_shapes",
     "get_prims_ts_qsa_metadata_workspace_size",
     "get_prims_ts_qsa_workspace_size",

@@ -86,7 +86,7 @@ MAX_WARP_GROUPS = 6
 
 # A fused QSA page entry keeps the ordinary encoded page-4 locator in the high
 # bits and one membership bit for each grouped query token in the low byte.
-# Q1 does not encode membership; Q2/Q4/Q5 use the same int32 CSR tensor for
+# Q1 does not encode membership; Q2/Q4/Q5 use the same int32 route table for
 # both the TMA address and per-query softmax mask without another model-facing
 # input. A byte keeps Q5 aligned with Q64/Hq12 and leaves room for Q6--Q8.
 QSA_PAGE_MEMBERSHIP_BITS = 8

@@ -46,9 +46,9 @@ merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
-attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
-prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048.json
-prims_ts_decode_wrapper_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
+attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_ps32_sps4.json
+prims_ts_batch_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_ps32_s2048_sps4.json
+prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_ps32_sps4.json
 prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_batch_decode_mla_h128_d_qk576_ckv512_kpe64_ps32_s2048_sq4.json
 prims_ts_decode_mla_wrapper_h128_d_qk576_ps32_sq4.json
@@ -1631,8 +1631,8 @@ with contextlib.suppress(Exception):
         is_var_seq=False,
     )
 
-# PrimTS FMHA decode: causal SQ4 through the one-shot, caller-workspace, and
-# reusable-wrapper public surfaces (SM100/SM103 only).
+# PrimTS FMHA decode: causal SQ4 with encoded semantic page-4 locators over
+# physical page-32 storage through all three public surfaces (SM100/SM103 only).
 with contextlib.suppress(Exception):
     from flashinfer.attention.prims_ts.decode import (
         BatchDecodePagedTSWrapper as _PrimTSDecodeWrapper,
@@ -1642,9 +1642,11 @@ with contextlib.suppress(Exception):
     )
 
     _pts_B, _pts_SQ, _pts_SK = 4, 4, 2048
-    _pts_Hq, _pts_Hkv, _pts_D, _pts_PS = 32, 4, 128, 32
+    _pts_Hq, _pts_Hkv, _pts_D = 32, 4, 128
+    _pts_PS, _pts_STORAGE_PS = 4, 32
     _pts_pages_per_request = _pts_SK // _pts_PS
-    _pts_num_pages = _pts_B * _pts_pages_per_request
+    _pts_storage_pages_per_request = _pts_SK // _pts_STORAGE_PS
+    _pts_num_pages = _pts_B * _pts_storage_pages_per_request
     _pts_q = torch.randn(
         _pts_B,
         _pts_SQ,
@@ -1656,22 +1658,19 @@ with contextlib.suppress(Exception):
     _pts_k = torch.randn(
         _pts_num_pages,
         _pts_Hkv,
-        _pts_PS,
+        _pts_STORAGE_PS,
         _pts_D,
         dtype=torch.bfloat16,
         device=device,
     )
     _pts_v = torch.randn_like(_pts_k)
-    _pts_indptr = torch.arange(
-        0,
-        _pts_num_pages + 1,
+    # Encoded locator = physical_page * (storage_page_size // 4) + subpage.
+    # Contiguous physical ownership makes the flattened locator range valid.
+    _pts_block_table = torch.arange(
+        _pts_B * _pts_pages_per_request, dtype=torch.int32, device=device
+    ).reshape(
+        _pts_B,
         _pts_pages_per_request,
-        dtype=torch.int32,
-        device=device,
-    )
-    _pts_indices = torch.arange(_pts_num_pages, dtype=torch.int32, device=device)
-    _pts_last_page_len = torch.full(
-        (_pts_B,), _pts_PS, dtype=torch.int32, device=device
     )
     _pts_seq_lens = torch.full((_pts_B,), _pts_SK, dtype=torch.int32, device=device)
     _pts_cache = (_pts_k, _pts_v)
@@ -1679,11 +1678,11 @@ with contextlib.suppress(Exception):
     _attention_ts_decode(
         _pts_q,
         _pts_cache,
-        _pts_indptr,
-        _pts_indices,
-        _pts_last_page_len,
+        _pts_block_table,
+        _pts_seq_lens,
         seq_len_q=_pts_SQ,
         mask_type="causal",
+        page_size=_pts_PS,
     )
 
     _pts_workspace_size = _prims_ts_fmha_ws_size(
@@ -1698,6 +1697,7 @@ with contextlib.suppress(Exception):
         kv_dtype=_pts_k.dtype,
         out_dtype=torch.bfloat16,
         mask_type="causal",
+        storage_page_size=_pts_STORAGE_PS,
         device=_pts_q.device,
     )
     _pts_workspace = torch.zeros(_pts_workspace_size, dtype=torch.int8, device=device)
@@ -1705,20 +1705,19 @@ with contextlib.suppress(Exception):
         _pts_q,
         _pts_cache,
         _pts_workspace,
-        _pts_indptr,
-        _pts_indices,
+        _pts_block_table,
         _pts_seq_lens,
         _pts_SK,
         seq_len_q=_pts_SQ,
         mask_type="causal",
         kv_layout="HND",
+        page_size=_pts_PS,
     )
 
     _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
     _pts_wrapper.plan(
-        _pts_indptr,
-        _pts_indices,
-        _pts_last_page_len,
+        _pts_block_table,
+        _pts_seq_lens,
         _pts_Hq,
         _pts_Hkv,
         _pts_D,
@@ -1729,6 +1728,7 @@ with contextlib.suppress(Exception):
         o_data_type=torch.bfloat16,
         mask_type="causal",
         max_kv_len=_pts_SK,
+        storage_page_size=_pts_STORAGE_PS,
     )
     _pts_wrapper.run(_pts_q, _pts_cache)
 

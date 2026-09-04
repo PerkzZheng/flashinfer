@@ -656,9 +656,9 @@ class FmhaDecodeConfig:
 
     @property
     def uses_encoded_subpage_locators(self) -> bool:
-        """Whether native CSR entries need the scattered-locator route.
+        """Whether native table entries need the scattered-locator route.
 
-        Ordinary callers enter this route when one CSR locator encodes a
+        Ordinary callers enter this route when one table locator encodes a
         physical page plus a semantic subpage. QSA uses the same route even
         when the storage and semantic page sizes are both four: grouped QSA
         still packs its per-query membership mask into each locator word.
@@ -1016,8 +1016,9 @@ class FmhaDecodeConfig:
     # use_paged_kv is enabled. It must divide the 128-token KV tile.
     num_tokens_per_page: int = 32
     # Physical tokens stored in one cache page. Zero selects the semantic page
-    # size. A larger value enables encoded subpage locators for native page-4
-    # CSR: locator = physical_page * subpages_per_storage_page + subpage.
+    # size. A larger value enables encoded subpage locators for a native
+    # page-four table:
+    # locator = physical_page * subpages_per_storage_page + subpage.
     storage_tokens_per_page: int = 0
     # Maximum number of pages per (batch, head_kv) — sizes the page index
     # table stride.
@@ -1903,7 +1904,7 @@ class FmhaDecodeConfig:
             and self.num_insts_kv == 1
             and self.o_stages == 1
             and self.uses_qsa_encoded_page4_route
-            and self.mask_type in (DENSE, CAUSAL)
+            and self.mask_type == CAUSAL
             and not self.use_cluster_smem_reduction
             and not self.use_persistent_scheduler
             and not self.use_attention_sinks
@@ -1918,7 +1919,7 @@ class FmhaDecodeConfig:
             raise ValueError(
                 "QSA grouped KeepsMmaAb requires an encoded page-4 Q group "
                 "that fits Q64, the qualified D256/KV128 arithmetic recipe, "
-                "and a supported direct or split launch"
+                "and a supported causal direct or split launch"
             )
 
     @property
@@ -3874,14 +3875,20 @@ def _validate_profile_support(
         use_split_kv
         and cfg.supports_reduction_dtypes
         and (seq_len_q == 1 or cfg.use_variable_seqlens_q or use_groups_tokens_heads_q)
-        and (tile_size_q in (16, 32) or qualified_fp8_q8_separate_reduction_supported)
+        and (
+            tile_size_q in (16, 32)
+            or qualified_fp8_q8_separate_reduction_supported
+            # QSA's staged D256 publisher and standalone reducer both index
+            # actual logical rows, so a partial TileQ8 is also valid.
+            or (tile_size_q == 8 and cfg.uses_qsa_encoded_page4_route)
+        )
         and headdim >= 64
     )
     if use_separate_reduction_kernel and not separate_reduction_supported:
         raise ValueError(
             "separate reduction SwapsMmaAb profiles require fixed SQ=1, "
-            "fixed grouped Q, or packed variable Q; tile_size_q in {16,32} "
-            "or a fixed FP8 Q8/HqPerKv8 profile (legacy D128 with FP8 output, "
+            "fixed grouped Q, or packed variable Q; tile_size_q in {16,32}, "
+            "QSA TileQ8, or a fixed FP8 Q8/HqPerKv8 profile (legacy D128 with FP8 output, "
             "plus grouped paged-KV/page-32 D64 with FP8 output or D256 with "
             "FP16 output); valid reduction dtypes and static split-KV are required"
         )

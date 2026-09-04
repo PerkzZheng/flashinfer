@@ -1,9 +1,9 @@
 {
-  "name": "prims_ts_batch_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32_s2048",
-  "description": "Standalone PrimTS GQA decode over FlashInfer native CSR page metadata using the tuple HND cache form and caller-owned workspace. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
+  "name": "prims_ts_decode_wrapper_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_ps32_sps4",
+  "description": "Reusable PrimTS GQA decode wrapper. The dense block table, sequence lengths, Q offsets, mask, window, and static bounds are retained by plan(); run() receives only Q, the HND cache, scales, and an optional output buffer. The plan uses encoded semantic page-4 locators over larger physical cache pages.",
   "op_type": "gqa_paged",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.decode.prims_ts_batch_decode_with_kv_cache",
+    "fi_api:flashinfer.attention.prims_ts.decode.BatchDecodePagedTSWrapper.run",
     "stage:decode",
     "backend:prims-ts",
     "status:experimental"
@@ -34,44 +34,32 @@
       "type": "var",
       "description": "Physical KV-cache page capacity."
     },
-    "page_size": {
+    "storage_page_size": {
       "type": "const",
-      "value": 32
-    },
-    "workspace_size": {
-      "type": "var",
-      "description": "Caller workspace size in bytes."
-    },
-    "len_indptr": {
-      "type": "var",
-      "description": "Length of the native CSR indptr."
-    },
-    "num_kv_indices": {
-      "type": "var",
-      "description": "Number of referenced page IDs."
+      "value": 32,
+      "description": "Physical token extent of each KV-cache page."
     },
     "len_qo_indptr": {
       "type": "var",
-      "description": "Length of cumulative Q offsets."
+      "description": "Length of plan-owned cumulative Q offsets."
     },
-    "max_seq_len": {
+    "page_size": {
       "type": "const",
-      "value": 2048,
-      "description": "Exact compiled maximum KV sequence length."
+      "value": 4,
+      "description": "Semantic block-table page size for encoded subpage locators."
     }
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
-    "page_size in (16, 32, 64, 128)",
-    "len_indptr == batch_size + 1",
+    "storage_page_size > page_size",
+    "storage_page_size % page_size == 0",
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 32",
-    "kv_layout == 'HND'",
     "window_left == -1 or mask_type == 'causal'",
     "seq_len_q >= 2"
   ],
   "inputs": {
-    "query": {
+    "q": {
       "shape": [
         "batch_size",
         "seq_len_q",
@@ -84,7 +72,7 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
@@ -93,70 +81,22 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
-    },
-    "workspace_buffer": {
-      "shape": [
-        "workspace_size"
-      ],
-      "dtype": "int8",
-      "description": "Exclusive caller-owned int8/uint8 scratch buffer."
-    },
-    "paged_kv_indptr": {
-      "shape": [
-        "len_indptr"
-      ],
-      "dtype": "int32"
-    },
-    "paged_kv_indices": {
-      "shape": [
-        "num_kv_indices"
-      ],
-      "dtype": "int32"
-    },
-    "seq_lens": {
-      "shape": [
-        "batch_size"
-      ],
-      "dtype": "int32"
-    },
-    "max_seq_len": {
-      "shape": null,
-      "dtype": "int32"
-    },
-    "seq_len_q": {
-      "shape": null,
-      "dtype": "int32",
-      "optional": true
     },
     "qo_indptr": {
       "shape": [
         "len_qo_indptr"
       ],
       "dtype": "int32",
-      "optional": true
+      "optional": true,
+      "description": "Cumulative Q offsets retained by plan()."
     },
     "max_seq_len_q": {
       "shape": null,
       "dtype": "int32",
-      "optional": true
-    },
-    "bmm1_scale": {
-      "shape": null,
-      "dtype": "float32",
-      "optional": true
-    },
-    "bmm2_scale": {
-      "shape": null,
-      "dtype": "float32",
-      "optional": true
-    },
-    "out_dtype": {
-      "shape": null,
-      "dtype": "dtype",
       "optional": true
     },
     "mask_type": {
@@ -169,9 +109,14 @@
       "dtype": "int32",
       "optional": true
     },
-    "kv_layout": {
+    "bmm1_scale": {
       "shape": null,
-      "dtype": "string",
+      "dtype": "float32",
+      "optional": true
+    },
+    "bmm2_scale": {
+      "shape": null,
+      "dtype": "float32",
       "optional": true
     }
   },

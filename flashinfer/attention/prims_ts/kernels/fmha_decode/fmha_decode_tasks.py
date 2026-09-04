@@ -70,6 +70,7 @@ from .fmha_decode_resources.helpers_common import (
     _warp_broadcast_i32,
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import (
+    _runtime_last_valid_page_idx,
     _runtime_total_kv_tiles,
     _sliding_window_start_idx,
 )
@@ -327,9 +328,9 @@ def _can_hold_native_page_window(
     if cfg.uses_encoded_subpage_locators:
         # The page-offset resource gives every QSA route one stage sized for
         # its complete instruction-aligned local span. Holding that stage lets
-        # K and V reuse the same native CSR locators, including -1 padding for
+        # K and V reuse the same dense-row locators, including -1 padding for
         # a short or odd tail. This applies to direct and persistent kernels as
-        # well as split-KV: each work tile still owns one independent CSR row.
+        # well as split-KV: each work tile stages its own slice of that row.
         return smem_page_offsets.holds_encoded_locator_window
     if not cfg.use_split_kv:
         return False
@@ -678,7 +679,6 @@ class DecodeGenTask(Task):
         """Capture decode-specific task config and initialize cache slots."""
         self.cfg = kwargs.pop("cfg", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
-        self.paged_kv_indptr = kwargs.pop("paged_kv_indptr", None)
         self.sparse_row_route_offsets = kwargs.pop("sparse_row_route_offsets", None)
         self.sparse_row_route_counts = kwargs.pop("sparse_row_route_counts", None)
         self.num_heads_kv = kwargs.pop("num_heads_kv", None)
@@ -975,18 +975,22 @@ class DecodeGenTask(Task):
         # can use the configured max length; variable-seqlen kernels read the
         # batch-specific length from GMEM.
         b_idx = cutlass.Int32(tile_coord[2])
-        if cutlass.const_expr(self.paged_kv_indptr is not None):
-            request_begin = cutlass.Int32(self.paged_kv_indptr[b_idx])
-            request_end = cutlass.Int32(self.paged_kv_indptr[b_idx + cutlass.Int32(1)])
-            self._kv_request_begin = request_begin
-            self._kv_page_idx_ub = request_end - request_begin - cutlass.Int32(1)
         if self.seqlens_kv is None:
-            if not self.cfg.use_split_kv and not self.cfg.uses_runtime_q_kv_union:
-                return self.domain
             seq_len_kv = cutlass.Int32(self.max_seq_len_kv)
         else:
             seq_len_kv = cutlass.Int32(self.seqlens_kv[b_idx])
         self._seq_len_kv = seq_len_kv
+        if cutlass.const_expr(self.cfg.use_paged_kv):
+            # Native paged KV uses a fixed-stride dense page table. The row's
+            # live extent therefore comes from seq_lens; padded entries beyond
+            # this bound must never be staged.
+            self._kv_page_idx_ub = _runtime_last_valid_page_idx(self.cfg, seq_len_kv)
+        if (
+            self.seqlens_kv is None
+            and not self.cfg.use_split_kv
+            and not self.cfg.uses_runtime_q_kv_union
+        ):
+            return self.domain
         tile_size_kv = cutlass.Int32(self.cfg.tile_size_kv)
 
         # Q-independent full-K nonsplit decode has no leading window skip.
@@ -1397,7 +1401,7 @@ def create_page_offsets_task(
         smem_page_offsets.init_load_state()
         if hold_page_window:
             # K0's held window covers every tile assigned to this CTA work
-            # item, and native CSR uses those same locators for V.
+            # item, and native paged KV uses those same locators for V.
             _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
             # Preserve the runtime domain contract even though this fast path
             # needs no per-iteration page-window work.

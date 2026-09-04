@@ -62,7 +62,8 @@ _WORKSPACE_DTYPES = (torch.int8, torch.uint8)
 _QSA_GROUPING_MAX_TILE_SIZE_Q = 64
 _QSA_SUPPORTED_GROUP_SIZES = (1, 2, 4, 5)
 # Largest QSA fanout qualified with the shared BF16/FP8 standalone reducer.
-# The work-aware selector may choose any smaller power-of-two fanout.
+# Fixed decode selects the largest useful fanout that stays within the first
+# service wave; packed prefill remains nonsplit.
 _QSA_MAX_SPLITS_KV = 8
 
 
@@ -149,14 +150,15 @@ class _NativePagedKVCache:
 
 @dataclass(frozen=True)
 class PrimsTSBatchDecodePlan:
-    """Validated dynamic-CSR PrimTS launch state for framework hot paths.
+    """Validated dense-page-table PrimTS state for framework hot paths.
 
-    The plan retains the K/V cache, CSR tensor storage, compiled callables, and
-    typed workspace views validated at construction.  CSR *values* may change
-    between completed launches, which is the contract needed by QSA metadata
-    builders.  Query and output storage may also change, but must preserve the
-    exact shape, dtype, device, and strides proven by the representative
-    tensors passed to :func:`prepare_prims_ts_batch_decode_with_kv_cache`.
+    The plan retains the K/V cache, dense block-table storage, compiled
+    callables, and typed workspace views validated at construction. Block-table
+    and sequence-length values may change between completed launches, which is
+    the contract needed by QSA metadata builders. Query and output storage may
+    also change, but must preserve the exact shape, dtype, device, and strides
+    proven by the representative tensors passed to
+    :func:`prepare_prims_ts_batch_decode_with_kv_cache`.
 
     ``run`` deliberately omits the expensive cache-stride proof, workspace
     rebinding, semantic-policy resolution, and allocation-alias proof.  A
@@ -176,8 +178,7 @@ class PrimsTSBatchDecodePlan:
     _cache: _NativePagedKVCache
     _seq_lens: torch.Tensor
     _qo_indptr: Optional[torch.Tensor]
-    _paged_kv_indptr: torch.Tensor
-    _paged_kv_indices: torch.Tensor
+    _block_table: torch.Tensor
     _workspace: _DecodeWorkspaceViews
     _compiled_main: Callable[..., object]
     _compiled_reducer: Optional[Callable[..., object]]
@@ -239,8 +240,7 @@ class PrimsTSBatchDecodePlan:
             out,
             self._seq_lens,
             q_offsets,
-            self._paged_kv_indptr,
-            self._paged_kv_indices,
+            self._block_table,
             self._workspace.partial_o,
             self._workspace.partial_stats,
             self._workspace.split_kv_counter,
@@ -379,8 +379,8 @@ def _planned_kv_lengths_mode(
     """Classify immutable plan lengths for fixed-length kernel scheduling.
 
     The wrapper owns ``seq_lens`` for the lifetime of a plan. When every
-    request is exactly the compiled maximum, native CSR page addressing still
-    uses the runtime indptr/indices while task domains and masks can use the
+    request is exactly the compiled maximum, native dense-table page addressing
+    still reads the runtime page IDs while task domains and masks can use the
     compile-time length. This is an equality proof, not a size heuristic.
     """
 
@@ -1208,22 +1208,20 @@ def _normalize_native_paged_kv_cache(
     )
 
 
-def _validate_paged_kv_row_metadata(
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+def _validate_block_table_metadata(
+    block_table: torch.Tensor,
     row_metadata: torch.Tensor,
     row_metadata_name: str,
-) -> tuple[torch.device, int]:
+) -> tuple[torch.device, int, int]:
     metadata = (
-        (paged_kv_indptr, "paged_kv_indptr"),
-        (paged_kv_indices, "paged_kv_indices"),
-        (row_metadata, row_metadata_name),
+        (block_table, "block_table", 2),
+        (row_metadata, row_metadata_name, 1),
     )
-    for tensor, name in metadata:
+    for tensor, name, ndim in metadata:
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
-        if tensor.ndim != 1:
-            raise ValueError(f"{name} must be one-dimensional")
+        if tensor.ndim != ndim:
+            raise ValueError(f"{name} must be rank {ndim}, got rank {tensor.ndim}")
         if tensor.dtype != torch.int32:
             raise TypeError(f"{name} must have dtype torch.int32")
         if tensor.device.type != "cuda":
@@ -1233,71 +1231,41 @@ def _validate_paged_kv_row_metadata(
         if tensor.data_ptr() % 4 != 0:
             raise ValueError(f"{name} data pointer must be 4-byte aligned")
 
-    device = paged_kv_indptr.device
-    if paged_kv_indices.device != device or row_metadata.device != device:
+    device = block_table.device
+    if row_metadata.device != device:
         raise ValueError("all paged-KV metadata tensors must be on the same device")
     batch_size = int(row_metadata.numel())
     if batch_size <= 0:
         raise ValueError(f"{row_metadata_name} must contain at least one request")
-    if paged_kv_indptr.numel() != batch_size + 1:
+    if block_table.shape[0] != batch_size:
         raise ValueError(
-            "paged_kv_indptr must have B + 1 elements: expected "
-            f"{batch_size + 1}, got {paged_kv_indptr.numel()}"
+            "block_table must have one row per request: expected "
+            f"{batch_size}, got {block_table.shape[0]}"
         )
-    return device, batch_size
+    max_num_pages = int(block_table.shape[1])
+    if max_num_pages <= 0:
+        raise ValueError("block_table must contain at least one page column")
+    if block_table.numel() > _MAX_INT32:
+        raise ValueError("block_table element count must fit in signed int32")
+    return device, batch_size, max_num_pages
 
 
-def _validate_paged_kv_metadata(
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: torch.Tensor,
-) -> tuple[torch.device, int]:
-    return _validate_paged_kv_row_metadata(
-        paged_kv_indptr,
-        paged_kv_indices,
-        paged_kv_last_page_len,
-        "paged_kv_last_page_len",
-    )
-
-
-def _read_paged_kv_plan_values(
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: torch.Tensor,
+def _read_block_table_plan_values(
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
     *,
     page_size: int,
 ) -> tuple[int, ...]:
-    """Validate CSR values at plan time and return per-request K/V lengths."""
+    """Validate dense-table lengths at plan time and return them on the host."""
 
-    batch_size = int(paged_kv_last_page_len.numel())
-    values = torch.cat((paged_kv_indptr, paged_kv_last_page_len)).tolist()
-    indptr = tuple(int(value) for value in values[: batch_size + 1])
-    last_page_lens = tuple(int(value) for value in values[batch_size + 1 :])
-
-    if indptr[0] != 0:
-        raise ValueError("paged_kv_indptr must start at zero")
-    if any(end <= start for start, end in zip(indptr[:-1], indptr[1:], strict=True)):
+    seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
+    capacity_tokens = int(block_table.shape[1]) * page_size
+    if any(length < 1 or length > capacity_tokens for length in seq_lens_host):
         raise ValueError(
-            "paged_kv_indptr must be strictly increasing so every request "
-            "contains at least one page"
+            "seq_lens values must be in [1, block_table.shape[1] * page_size] "
+            f"([1, {capacity_tokens}])"
         )
-    if indptr[-1] != int(paged_kv_indices.numel()):
-        raise ValueError(
-            "the final paged_kv_indptr offset must equal paged_kv_indices.numel(): "
-            f"expected {paged_kv_indices.numel()}, got {indptr[-1]}"
-        )
-    if any(length < 1 or length > page_size for length in last_page_lens):
-        raise ValueError(f"paged_kv_last_page_len values must be in [1, {page_size}]")
-
-    return tuple(
-        (end - start - 1) * page_size + last_page_len
-        for start, end, last_page_len in zip(
-            indptr[:-1],
-            indptr[1:],
-            last_page_lens,
-            strict=True,
-        )
-    )
+    return seq_lens_host
 
 
 def _decode_output_shape(
@@ -1432,7 +1400,6 @@ def _resolve_decode_launch_spec(
     import cutlass
 
     from .kernels.fmha_decode.fmha_decode_config import (
-        enumerate_grouped_q_mma_candidates,
         get_max_active_clusters_for_cluster_size,
         make_decode_config,
         make_q_tile_geometry,
@@ -1503,223 +1470,167 @@ def _resolve_decode_launch_spec(
     # Device capacity participates in automatic selection. Resolve it in the
     # target device context without introducing caller-visible policy knobs.
     with torch.cuda.device(device_index):
-        config_overrides = {}
-        if use_packed_q:
-            config_overrides["use_variable_seqlens_q"] = True
-        if use_qsa_route:
-            config_overrides["use_qsa_route"] = True
-        cfg = make_config(config_overrides or None)
         max_active_clusters = get_max_active_clusters_for_cluster_size(1)
-
-        # An encoded page-4 QSA group must stay in one CTA so that all grouped
-        # queries consume the same union of selected K/V pages. Select the
-        # smallest grouped-Q tile that owns the complete group. Eight producer
-        # warps distribute the independent page-4 transactions.
-        qsa_d256_dtype_shape = (
-            q_dtype_key == kv_dtype_key == output_dtype_key == "bfloat16"
-            or (
-                q_dtype_key == kv_dtype_key == "float8_e4m3fn"
+        if use_qsa_route:
+            heads_q_per_kv = num_qo_heads // num_kv_heads
+            _validate_prims_ts_qsa_group_capacity(
+                seq_len_q,
+                num_qo_heads,
+                num_kv_heads,
+            )
+            qsa_dtype_supported = q_dtype_key == output_dtype_key == "bfloat16" or (
+                q_dtype_key == "float8_e4m3fn"
                 and output_dtype_key in ("float16", "bfloat16")
             )
-        )
-        encoded_page4_union_shape = (
-            use_qsa_route
-            and page_size == 4
-            and seq_len_q in (2, 4, 5)
-            and head_dim == 256
-            and qsa_d256_dtype_shape
-            and mask_type in ("dense", "causal")
-            and window_left < 0
-        )
-        bf16_encoded_page4_q1_shape = (
-            use_qsa_route
-            and page_size == 4
-            and seq_len_q == 1
-            and head_dim == 256
-            and q_dtype_key == kv_dtype_key == output_dtype_key == "bfloat16"
-            and mask_type in ("dense", "causal")
-            and window_left < 0
-        )
-        if encoded_page4_union_shape or bf16_encoded_page4_q1_shape:
-            heads_q_per_kv = num_qo_heads // num_kv_heads
-            # Reuse the dense grouped-Q geometry and select the smallest
-            # canonical tile that owns the complete QSA union. This caps
-            # TP4/TP8 at TileQ32/16 instead of padding them to TileQ64.
-            # TODO(qsa): Qualify Q6--Q8 before extending the supported QSA
-            # grouping set, then calibrate the dense candidate cost model for
-            # scattered page-4 loads and grouped-union metadata.
-            one_cta_mma = next(
-                (
-                    candidate
-                    for candidate in enumerate_grouped_q_mma_candidates(
-                        heads_q_per_kv=heads_q_per_kv,
-                        seq_len_q=seq_len_q,
-                    )
-                    if candidate.q_tiles == 1 and candidate.tile_size_q <= 64
-                ),
-                None,
-            )
-            tile_size_q = one_cta_mma.tile_size_q if one_cta_mma is not None else 8
-            # Keeps is the accuracy-qualified BF16 path. Retain the established
-            # FP8 Q4 Keeps configuration when its complete group fits TileQ64.
-            use_q64_keeps = one_cta_mma is not None and (
-                (
-                    (encoded_page4_union_shape or bf16_encoded_page4_q1_shape)
-                    and q_dtype_key == kv_dtype_key == output_dtype_key == "bfloat16"
-                    and seq_len_q in (1, 2, 4, 5)
-                    and heads_q_per_kv * seq_len_q <= 64
-                )
-                or (one_cta_mma.variant == "keeps_mma_ab")
-            )
-            if one_cta_mma is not None:
-                if use_q64_keeps:
-                    # The caller fixes the QSA group; split-KV is selected
-                    # independently from the resulting one-CTA-per-group grid.
-                    qsa_wave_splits = select_splits_kv(
-                        seq_len_kv=max_kv_len,
-                        batch_size=batch_size,
-                        num_heads_kv=num_kv_heads,
-                        tile_size_kv=128,
-                        num_insts_kv=1,
-                        num_q_tiles=1,
-                        service_capacity=max_active_clusters,
-                        max_splits_kv=_QSA_MAX_SPLITS_KV,
-                    )
-                    q64_splits = qsa_wave_splits
-                    cfg = make_config(
-                        {
-                            "use_variable_seqlens_q": use_packed_q,
-                            "use_qsa_route": use_qsa_route,
-                            "use_keeps_mma_ab": True,
-                            "groups_tokens_heads_q": True,
-                            "tile_size_q": 64,
-                            "tile_size_kv": 128,
-                            "head_dim_per_stage_kv": 128,
-                            "num_insts_kv": 1,
-                            "o_stages": 1,
-                            "use_persistent_scheduler": False,
-                            "correction_num_warps": 4,
-                            "mma_warp_idx": 12,
-                            "page_offsets_warp_idx": 13,
-                            "load_warp_idx": 16,
-                            "load_num_warps": 8,
-                        },
-                        split_kv_mode=(
-                            "gmem_reduction_with_separate_kernel"
-                            if q64_splits > 1
-                            else "disabled"
-                        ),
-                        splits_kv=q64_splits,
-                        max_splits_kv=q64_splits,
-                    )
-                else:
-                    # Use the production D128 grouped-Swaps pipeline for D256.
-                    cfg = make_config(
-                        {
-                            "use_variable_seqlens_q": use_packed_q,
-                            "use_qsa_route": use_qsa_route,
-                            "groups_tokens_heads_q": True,
-                            "tile_size_q": tile_size_q,
-                            "head_dim_per_stage_kv": 128,
-                            "num_insts_kv": 2,
-                            "use_persistent_scheduler": False,
-                            "correction_num_warps": 4,
-                            "mma_warp_idx": 12,
-                            "page_offsets_warp_idx": 13,
-                            "load_warp_idx": 16,
-                            "load_num_warps": 8,
-                        }
-                    )
-
-        # A grouped fixed-Q launch can leave most of the first service wave
-        # idle. In that regime, evaluate the narrowest supported Swaps head
-        # band. Keep it only when the extra head-band CTAs fit in the same
-        # resident wave without reducing KV fanout or changing the launch and
-        # reduction topology. The grouped cost selector excludes SQ1, so both
-        # configs below remain KV128; this legacy Q8-only adjustment cannot
-        # participate in or override automatic KV256 promotion.
-        if (
-            seq_len_q == 1
-            and not use_packed_q
-            and cfg.groups_tokens_heads_q
-            and not cfg.use_keeps_mma_ab
-        ):
-            grouped_q_ctas = q_ctas(cfg)
-            head_band_geometry = make_q_tile_geometry(
-                rows_per_cta=8,
-                heads_q_per_kv=num_qo_heads // num_kv_heads,
-                groups_tokens_heads_q=False,
-            )
-            head_band_q_ctas = max(int(head_band_geometry.num_q_ctas(seq_len_q)), 1)
-            head_band_cfg = None
-            if head_band_q_ctas > grouped_q_ctas and fits_one_service_wave(
-                cfg, head_band_q_ctas
+            if not (
+                page_size == 4
+                and head_dim == 256
+                and qsa_dtype_supported
+                and mask_type == "causal"
+                and window_left < 0
             ):
-                try:
-                    head_band_cfg = make_config(
-                        {"groups_tokens_heads_q": False, "tile_size_q": 8}
-                    )
-                except ValueError:
-                    head_band_cfg = None
-            if head_band_cfg is not None:
-                same_launch_topology = all(
-                    getattr(cfg, field) == getattr(head_band_cfg, field)
-                    for field in (
-                        "use_split_kv",
-                        "splits_kv",
-                        "max_splits_kv",
-                        "use_cluster_smem_reduction",
-                        "use_separate_reduction_kernel",
-                        "use_persistent_scheduler",
-                    )
+                raise ValueError(
+                    "PrimTS QSA requires sparse_block_size=4, head_dim=256, "
+                    "BF16 Q/K/V/output or FP8 Q/K/V with FP16/BF16 output, "
+                    "and a causal non-windowed mask"
                 )
-                if same_launch_topology and fits_one_service_wave(
-                    head_band_cfg, q_ctas(head_band_cfg)
-                ):
-                    cfg = head_band_cfg
 
-        encoded_page4_fp8 = (
-            page_size == 4
-            and (storage_page_size > page_size or use_qsa_route)
-            and q_dtype_key == "float8_e4m3fn"
-        )
-        unsafe_direct_swaps = not cfg.use_split_kv and not cfg.use_keeps_mma_ab
-        unsafe_split_publisher = (
-            cfg.use_split_kv and not cfg.use_separate_reduction_kernel
-        )
-        if encoded_page4_fp8 and (unsafe_direct_swaps or unsafe_split_publisher):
-            # Direct, fused-GMEM, and cluster-SMEM publication are not
-            # qualified with encoded subpage locators on the FP8 pipeline.
-            # They can leave peers waiting indefinitely. Preserve an existing
-            # split fanout, or introduce the minimum two-way split for a direct
-            # profile, and route partials through the separate reducer.
-            safe_splits = int(cfg.splits_kv) if cfg.use_split_kv else 2
-            if seq_len_q == 1:
-                # Encoded FP8 Q1 uses the smallest qualified standalone
-                # reduction fanout independent of batch or model geometry.
-                safe_splits = min(safe_splits, 2)
-            # Rebuilding only the split policy would fall back to the generic
-            # TileQ8 recipe and discard a grouped Q2/Q4 union selected above.
-            # TileQ8 is not a qualified separate-reduction profile. Preserve
-            # the selected query geometry, widening SQ1's control profile to
-            # the smallest supported separate-reduction tile when necessary.
-            safe_tile_size_q = max(int(cfg.tile_size_q), 16)
-            safe_profile = {
-                "groups_tokens_heads_q": cfg.groups_tokens_heads_q,
-                "tile_size_q": safe_tile_size_q,
+            group_rows = heads_q_per_kv * seq_len_q
+            qsa_tile_size_q = next(
+                tile_size_q
+                for tile_size_q in (8, 16, 32, 64)
+                if group_rows <= tile_size_q
+            )
+            qsa_use_keeps = qsa_tile_size_q == 64
+            qsa_num_insts_kv = 1 if qsa_use_keeps else 2
+
+            # Packed prefill keeps its caller-provided routes nonsplit. Fixed
+            # decode fills, but never crosses, the first service wave; the
+            # fanout is independent of QSA group size because one CTA owns the
+            # complete group.
+            qsa_splits = 1
+            if not use_packed_q:
+                qsa_splits = select_splits_kv(
+                    seq_len_kv=max_kv_len,
+                    batch_size=batch_size,
+                    num_heads_kv=num_kv_heads,
+                    tile_size_kv=128,
+                    num_insts_kv=qsa_num_insts_kv,
+                    num_q_tiles=1,
+                    service_capacity=max_active_clusters,
+                    max_splits_kv=_QSA_MAX_SPLITS_KV,
+                )
+
+            # FP8 Swaps publication with encoded subpages is not qualified on
+            # a direct path. Use the same KV128 Q64 Keeps profile instead of
+            # introducing an artificial second wave solely as a workaround.
+            if q_dtype_key == "float8_e4m3fn" and qsa_splits == 1:
+                qsa_tile_size_q = 64
+                qsa_use_keeps = True
+                qsa_num_insts_kv = 1
+
+            qsa_profile = {
+                "use_variable_seqlens_q": use_packed_q,
+                "use_qsa_route": True,
+                "use_keeps_mma_ab": qsa_use_keeps,
+                "groups_tokens_heads_q": True,
+                "tile_size_q": qsa_tile_size_q,
+                "tile_size_kv": 128,
+                "head_dim_per_stage_kv": 128,
+                "num_insts_kv": qsa_num_insts_kv,
+                "use_persistent_scheduler": False,
+                "correction_num_warps": 4,
+                "mma_warp_idx": 12,
+                "page_offsets_warp_idx": 13,
+                "load_warp_idx": 16,
+                "load_num_warps": 8,
             }
-            safe_profile.update(
-                {
-                    "use_variable_seqlens_q": use_packed_q,
-                    "use_qsa_route": use_qsa_route,
-                }
-            )
+            if qsa_use_keeps:
+                qsa_profile["o_stages"] = 1
             cfg = make_config(
-                safe_profile,
-                split_kv_mode="gmem_reduction_with_separate_kernel",
-                splits_kv=safe_splits,
-                max_splits_kv=safe_splits,
+                qsa_profile,
+                split_kv_mode=(
+                    "gmem_reduction_with_separate_kernel"
+                    if qsa_splits > 1
+                    else "disabled"
+                ),
+                splits_kv=qsa_splits,
+                max_splits_kv=qsa_splits,
             )
+        else:
+            config_overrides = (
+                {"use_variable_seqlens_q": True} if use_packed_q else None
+            )
+            cfg = make_config(config_overrides)
+
+            # A grouped fixed-Q launch can leave most of the first service wave
+            # idle. In that regime, evaluate the narrowest supported Swaps head
+            # band. Keep it only when the extra head-band CTAs fit in the same
+            # resident wave without reducing KV fanout or changing topology.
+            if (
+                seq_len_q == 1
+                and not use_packed_q
+                and cfg.groups_tokens_heads_q
+                and not cfg.use_keeps_mma_ab
+            ):
+                grouped_q_ctas = q_ctas(cfg)
+                head_band_geometry = make_q_tile_geometry(
+                    rows_per_cta=8,
+                    heads_q_per_kv=num_qo_heads // num_kv_heads,
+                    groups_tokens_heads_q=False,
+                )
+                head_band_q_ctas = max(int(head_band_geometry.num_q_ctas(seq_len_q)), 1)
+                head_band_cfg = None
+                if head_band_q_ctas > grouped_q_ctas and fits_one_service_wave(
+                    cfg, head_band_q_ctas
+                ):
+                    try:
+                        head_band_cfg = make_config(
+                            {"groups_tokens_heads_q": False, "tile_size_q": 8}
+                        )
+                    except ValueError:
+                        head_band_cfg = None
+                if head_band_cfg is not None:
+                    same_launch_topology = all(
+                        getattr(cfg, field) == getattr(head_band_cfg, field)
+                        for field in (
+                            "use_split_kv",
+                            "splits_kv",
+                            "max_splits_kv",
+                            "use_cluster_smem_reduction",
+                            "use_separate_reduction_kernel",
+                            "use_persistent_scheduler",
+                        )
+                    )
+                    if same_launch_topology and fits_one_service_wave(
+                        head_band_cfg, q_ctas(head_band_cfg)
+                    ):
+                        cfg = head_band_cfg
+
+            encoded_page4_fp8 = (
+                page_size == 4
+                and storage_page_size > page_size
+                and q_dtype_key == "float8_e4m3fn"
+            )
+            unsafe_direct_swaps = not cfg.use_split_kv and not cfg.use_keeps_mma_ab
+            unsafe_split_publisher = (
+                cfg.use_split_kv and not cfg.use_separate_reduction_kernel
+            )
+            if encoded_page4_fp8 and (unsafe_direct_swaps or unsafe_split_publisher):
+                # Direct, fused-GMEM, and cluster-SMEM publication are not
+                # qualified with encoded subpage locators on the FP8 pipeline.
+                safe_splits = int(cfg.splits_kv) if cfg.use_split_kv else 2
+                safe_tile_size_q = max(int(cfg.tile_size_q), 16)
+                cfg = make_config(
+                    {
+                        "groups_tokens_heads_q": cfg.groups_tokens_heads_q,
+                        "tile_size_q": safe_tile_size_q,
+                        "use_variable_seqlens_q": use_packed_q,
+                    },
+                    split_kv_mode="gmem_reduction_with_separate_kernel",
+                    splits_kv=safe_splits,
+                    max_splits_kv=safe_splits,
+                )
 
     _validate_decode_policy_kv_tile_size(cfg)
     return _decode_launch_spec_from_config(
@@ -1821,8 +1732,7 @@ def _get_compiled_decode(
         out: cute.Tensor,
         seq_lens: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
-        paged_kv_indptr: cute.Tensor,
-        paged_kv_indices: cute.Tensor,
+        block_table: cute.Tensor,
         partial_o: cute.Tensor,
         partial_stats: cute.Tensor,
         split_kv_counter: cute.Tensor,
@@ -1848,7 +1758,7 @@ def _get_compiled_decode(
         static_full_split_prefix: cutlass.Constexpr[bool],
         static_native_uniform_kv: cutlass.Constexpr[bool],
     ) -> None:
-        """Adapt TVM-FFI tensors to the raw native-CSR pointer launcher."""
+        """Adapt TVM-FFI tensors to the dense block-table pointer launcher."""
 
         q_offsets_iter = cu_seqlens_q.iterator
         total_q_tokens = Int32(static_batch_size * static_seq_len_q)
@@ -1875,7 +1785,7 @@ def _get_compiled_decode(
             seq_lens.iterator,
             q_offsets_iter,
             total_q_tokens,
-            paged_kv_indices.iterator,
+            block_table.iterator,
             partial_o.iterator,
             partial_stats.iterator,
             split_kv_counter.iterator,
@@ -1889,8 +1799,7 @@ def _get_compiled_decode(
             static_max_kv_len,
             False,
             True,
-            paged_kv_indptr.iterator,
-            paged_kv_indices.iterator,
+            Int32(block_table.shape[1]),
             num_physical_kv_pages,
             k_page_stride,
             k_head_stride,
@@ -2026,8 +1935,7 @@ def _get_compiled_decode(
     cu_seqlens_q_fake = fake_compact(
         Int32, (batch_size + 1,) if use_packed_q else (1,), 4
     )
-    indptr_fake = fake_compact(Int32, (batch_size + 1,), 4)
-    indices_fake = fake_compact(Int32, (logical_pages,), 4)
+    block_table_fake = fake_compact(Int32, (batch_size, logical_pages), 4)
     partial_o_fake = fake_compact(partial_dtype, partial_o_shape, 16)
     partial_stats_fake = fake_compact(Float32, partial_stats_shape, 16)
     counter_fake = fake_compact(Int32, counter_shape, 4)
@@ -2043,8 +1951,7 @@ def _get_compiled_decode(
             out_fake,
             seq_lens_fake,
             cu_seqlens_q_fake,
-            indptr_fake,
-            indices_fake,
+            block_table_fake,
             partial_o_fake,
             partial_stats_fake,
             counter_fake,
@@ -2102,6 +2009,18 @@ def _get_compiled_decode(
     return compiled_main, compiled_reducer, policy, spec.scratch_shapes
 
 
+def _validate_prims_ts_qsa_group_value(group_size: int) -> int:
+    """Validate one caller-selected QSA grouping value."""
+
+    group_size = _validate_positive_int(group_size, "group_size")
+    if group_size not in _QSA_SUPPORTED_GROUP_SIZES:
+        raise ValueError(
+            "QSA group_size must be one of "
+            f"{_QSA_SUPPORTED_GROUP_SIZES}, got {group_size}"
+        )
+    return group_size
+
+
 def _validate_prims_ts_qsa_group_capacity(
     group_size: int,
     num_qo_heads: int,
@@ -2113,12 +2032,7 @@ def _validate_prims_ts_qsa_group_capacity(
         QSA_PAGE_MEMBERSHIP_BITS,
     )
 
-    group_size = _validate_positive_int(group_size, "group_size")
-    if group_size not in _QSA_SUPPORTED_GROUP_SIZES:
-        raise ValueError(
-            "QSA group_size must be one of "
-            f"{_QSA_SUPPORTED_GROUP_SIZES}, got {group_size}"
-        )
+    group_size = _validate_prims_ts_qsa_group_value(group_size)
     _validate_head_geometry(num_qo_heads, num_kv_heads)
     heads_q_per_kv = num_qo_heads // num_kv_heads
     max_group_size = min(
@@ -2232,12 +2146,7 @@ def make_prims_ts_qsa_qo_indptr(
     the packed-Q QSA APIs together with ``max_seq_len_q=group_size``.
     """
 
-    group_size = _validate_positive_int(group_size, "group_size")
-    if group_size not in _QSA_SUPPORTED_GROUP_SIZES:
-        raise ValueError(
-            "QSA group_size must be one of "
-            f"{_QSA_SUPPORTED_GROUP_SIZES}, got {group_size}"
-        )
+    group_size = _validate_prims_ts_qsa_group_value(group_size)
     num_query_tokens = _validate_positive_int(num_query_tokens, "num_query_tokens")
     if (
         not isinstance(query_start_loc_cpu, torch.Tensor)
@@ -2515,9 +2424,7 @@ def _validate_decode_output_aliasing(
     *,
     seq_lens: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: Optional[torch.Tensor],
+    block_table: torch.Tensor,
     workspace_buffer: torch.Tensor,
 ) -> None:
     """Keep output disjoint from every live FMHA decode allocation."""
@@ -2529,9 +2436,7 @@ def _validate_decode_output_aliasing(
         ("v_cache", runtime.v_cache),
         ("seq_lens", seq_lens),
         ("qo_indptr", qo_indptr),
-        ("paged_kv_indptr", paged_kv_indptr),
-        ("paged_kv_indices", paged_kv_indices),
-        ("paged_kv_last_page_len", paged_kv_last_page_len),
+        ("block_table", block_table),
         ("workspace_buffer", workspace_buffer),
     )
 
@@ -2541,8 +2446,7 @@ def _launch_decode(
     *,
     seq_lens: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_table: torch.Tensor,
     workspace: _DecodeWorkspaceViews,
     compiled_main: Callable[..., object],
     compiled_reducer: Optional[Callable[..., object]],
@@ -2557,8 +2461,7 @@ def _launch_decode(
         runtime.out,
         seq_lens,
         q_offsets,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_table,
         workspace.partial_o,
         workspace.partial_stats,
         workspace.split_kv_counter,
@@ -2591,8 +2494,7 @@ def _prepare_prims_ts_batch_decode_plan(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
     workspace_buffer: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
     *,
@@ -2607,7 +2509,7 @@ def _prepare_prims_ts_batch_decode_plan(
     page_size: Optional[int],
     use_qsa_route: bool = False,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
-    """Validate and freeze one dynamic-CSR PrimTS launch contract."""
+    """Validate and freeze one dense-block-table PrimTS launch contract."""
 
     _validate_layout(kv_layout)
     _validate_mask(mask_type)
@@ -2620,9 +2522,8 @@ def _prepare_prims_ts_batch_decode_plan(
     )
     assert resolved_seq_len_q is not None
     seq_len_q = resolved_seq_len_q
-    metadata_device, batch_size = _validate_paged_kv_row_metadata(
-        paged_kv_indptr,
-        paged_kv_indices,
+    metadata_device, batch_size, max_num_pages = _validate_block_table_metadata(
+        block_table,
         seq_lens,
         "seq_lens",
     )
@@ -2658,6 +2559,12 @@ def _prepare_prims_ts_batch_decode_plan(
     )
     storage_page_size = _validate_storage_page_size(page_size, storage_page_size)
     max_seq_len = _validate_max_kv_len(max_seq_len, "max_seq_len")
+    required_page_columns = (max_seq_len + page_size - 1) // page_size
+    if max_num_pages < required_page_columns:
+        raise ValueError(
+            "block_table must have at least ceil(max_seq_len / page_size) "
+            f"columns ({required_page_columns}), got {max_num_pages}"
+        )
     output_dtype = out_dtype
     if output_dtype is None:
         if out is not None and not isinstance(out, torch.Tensor):
@@ -2741,17 +2648,14 @@ def _prepare_prims_ts_batch_decode_plan(
         ("v_cache", runtime.v_cache),
         ("seq_lens", seq_lens),
         ("qo_indptr", qo_indptr),
-        ("paged_kv_indptr", paged_kv_indptr),
-        ("paged_kv_indices", paged_kv_indices),
+        ("block_table", block_table),
     )
     if caller_provided_out:
         _validate_decode_output_aliasing(
             runtime,
             seq_lens=seq_lens,
             qo_indptr=qo_indptr,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
-            paged_kv_last_page_len=None,
+            block_table=block_table,
             workspace_buffer=workspace_buffer,
         )
     compiled_main, compiled_reducer, _, scratch_shapes = _get_compiled_decode(
@@ -2779,8 +2683,7 @@ def _prepare_prims_ts_batch_decode_plan(
         _cache=normalized_cache,
         _seq_lens=seq_lens,
         _qo_indptr=qo_indptr,
-        _paged_kv_indptr=paged_kv_indptr,
-        _paged_kv_indices=paged_kv_indices,
+        _block_table=block_table,
         _workspace=workspace,
         _compiled_main=compiled_main,
         _compiled_reducer=compiled_reducer,
@@ -2793,8 +2696,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
     workspace_buffer: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
     *,
@@ -2808,10 +2710,10 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
     kv_layout: Literal["HND"] = "HND",
     page_size: Optional[int] = None,
 ) -> PrimsTSBatchDecodePlan:
-    """Validate and prepare a reusable dynamic-CSR PrimTS launch.
+    """Validate and prepare a reusable dense-block-table PrimTS launch.
 
-    This setup API is intended for frameworks that keep K/V, CSR metadata, and
-    workspace storage stable while changing their values between launches.
+    This setup API is intended for frameworks that keep K/V, block-table
+    metadata, and workspace storage stable while changing their values between launches.
     Call :meth:`PrimsTSBatchDecodePlan.run` on the hot path.  The returned plan
     is CUDA-graph compatible as long as captured tensor storage remains alive.
     """
@@ -2822,8 +2724,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         query,
         kv_cache,
         workspace_buffer,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_table,
         seq_lens,
         max_seq_len,
         seq_len_q=seq_len_q,
@@ -2847,8 +2748,7 @@ def prims_ts_batch_decode_with_kv_cache(
     query: torch.Tensor,
     kv_cache: PagedKVCache,
     workspace_buffer: torch.Tensor,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
+    block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     max_seq_len: int,
     *,
@@ -2864,7 +2764,7 @@ def prims_ts_batch_decode_with_kv_cache(
     kv_layout: Literal["HND"] = "HND",
     page_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """Launch fixed or packed-Q native-CSR FMHA decode with caller scratch.
+    """Launch fixed or packed-Q dense-table FMHA decode with caller scratch.
 
     For ``seq_len_q=1``, ``query`` and the returned output both have shape
     ``[B, Hq, D]``. For ``seq_len_q>1``, both use compact token-major
@@ -2886,7 +2786,7 @@ def prims_ts_batch_decode_with_kv_cache(
     page IDs. Tuple members are logical HND views; their page, head, and token
     strides may describe compact HND storage or gapped K/V slices of either
     HND- or NHD-physical packed storage. Passing ``page_size=4`` with a larger
-    physical extent interprets each CSR entry as::
+    physical extent interprets each live block-table entry as::
 
         locator = physical_page * (storage_page_size // 4) + subpage
 
@@ -2895,21 +2795,22 @@ def prims_ts_batch_decode_with_kv_cache(
     used for automatic policy selection and JIT caching.
     It must be no larger than ``2,147,483,392`` so the padded 256-token K/V
     tile endpoint remains representable as signed Int32.
-    Each request must own enough CSR entries for its live length::
+    ``block_table`` is contiguous CUDA Int32 with shape ``[B, max_pages]``.
+    The live prefix of row ``b`` contains::
 
-        (seq_lens[b] + page_size - 1) // page_size <= (
-            paged_kv_indptr[b + 1] - paged_kv_indptr[b]
-        )
+        (seq_lens[b] + page_size - 1) // page_size
+
+    locators; columns after that prefix are ignored. The table width must cover
+    ``ceil(max_seq_len / page_size)`` so graph replays may change live lengths
+    without changing tensor storage.
 
     A graph-padding request may use the reserved inert-row encoding
     ``seq_lens[b] == 1`` with its first live locator equal to ``-1``. The TMA
     out-of-bounds path supplies zero K/V and the row produces exact zero output
     without a separate output-masking kernel. Negative locators are otherwise
-    invalid in a live CSR prefix.
-
-    The indptr must start at zero, increase strictly, and end at
-    ``paged_kv_indices.numel()``. Except for the reserved inert locator, every
-    live ordinary page ID or encoded locator must resolve inside ``kv_cache``.
+    invalid in a live table prefix. Except for the reserved inert locator,
+    every live ordinary page ID or encoded locator must resolve inside
+    ``kv_cache``.
 
     ``workspace_buffer`` must be zero-initialized before its first use and
     re-zeroed whenever an argument contributing to the semantic JIT key changes,
@@ -2917,7 +2818,7 @@ def prims_ts_batch_decode_with_kv_cache(
     to one in-flight launch or captured graph and must not overlap query, K/V
     cache, metadata, or output storage. Runtime sequence lengths must remain
     positive and no larger than ``max_seq_len``; this hot path
-    deliberately does not read device metadata back to the host. Live CSR,
+    deliberately does not read device metadata back to the host. Live table,
     length, page-ID, and packed-Q values may change between completed launches
     or graph replays only while all of their contracts remain valid. They must
     not be mutated concurrently with a launch or replay that reads them. Warm
@@ -2938,8 +2839,8 @@ def prims_ts_batch_decode_with_kv_cache(
         Combined or separate paged K/V storage.
     workspace_buffer : torch.Tensor
         Zero-initialized caller-owned byte workspace for this semantic key.
-    paged_kv_indptr, paged_kv_indices : torch.Tensor
-        Native CSR row offsets and physical page IDs.
+    block_table : torch.Tensor
+        Dense ``[B, max_pages]`` physical-page or encoded-locator table.
     seq_lens : torch.Tensor
         Live K/V sequence lengths for each request.
     max_seq_len : int
@@ -2963,16 +2864,16 @@ def prims_ts_batch_decode_with_kv_cache(
     kv_layout : {"HND"}
         Layout of the paged K/V cache.
     page_size : int, optional
-        Semantic CSR page size. It defaults to the physical cache-page extent;
-        pass four to enable encoded subpage locators for larger storage pages.
+        Semantic block-table page size. It defaults to the physical cache-page
+        extent; pass four to enable encoded subpage locators for larger storage
+        pages.
     """
 
     plan, prepared_out = _prepare_prims_ts_batch_decode_plan(
         query,
         kv_cache,
         workspace_buffer,
-        paged_kv_indptr,
-        paged_kv_indices,
+        block_table,
         seq_lens,
         max_seq_len,
         seq_len_q=seq_len_q,
@@ -2995,7 +2896,7 @@ def prims_ts_batch_decode_with_kv_cache(
 
 
 class BatchDecodePagedTSWrapper:
-    """Plan and reuse task-scheduled native-CSR paged decode launches."""
+    """Plan and reuse task-scheduled dense-block-table decode launches."""
 
     @flashinfer_api
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
@@ -3013,9 +2914,8 @@ class BatchDecodePagedTSWrapper:
     @flashinfer_api
     def plan(
         self,
-        paged_kv_indptr: torch.Tensor,
-        paged_kv_indices: torch.Tensor,
-        paged_kv_last_page_len: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -3032,7 +2932,7 @@ class BatchDecodePagedTSWrapper:
         max_kv_len: Optional[int] = None,
         storage_page_size: Optional[int] = None,
     ) -> None:
-        """Prepare native CSR metadata, policy, compiled callables, and scratch.
+        """Prepare dense page metadata, policy, compiled callables, and scratch.
 
         Without ``qo_indptr``, ``seq_len_q`` is fixed by the plan. SQ1 runs
         retain ``[B, Hq, D]`` query/output tensors and fixed multi-Q uses
@@ -3061,19 +2961,20 @@ class BatchDecodePagedTSWrapper:
         complete instruction groups. Sliding-window plans retain runtime K/V
         lengths because leading-tile skips change the effective domain;
         persistent Q-dependent causal plans do the same while recycling the
-        task graph. Because the launch still uses the planned CSR row starts, both
-        ``paged_kv_indptr`` and
-        ``paged_kv_last_page_len`` values must remain unchanged until the next
-        successful plan. Valid ``paged_kv_indices`` values may be remapped only
-        between completed runs or graph replays; no retained metadata tensor may
-        be mutated concurrently with a run or replay that reads it. One wrapper
-        instance supports only one in-flight run or captured-graph replay because
-        it owns mutable scratch; use separate wrappers for concurrent execution.
+        task graph. ``seq_lens`` values must remain unchanged until the next
+        successful plan because they may prove a fixed-length specialization.
+        Live ``block_table`` entries may be remapped only between completed runs
+        or graph replays; no retained metadata tensor may be mutated concurrently
+        with a run or replay that reads it. One wrapper instance supports only
+        one in-flight run or captured-graph replay because it owns mutable
+        scratch; use separate wrappers for concurrent execution.
 
         Parameters
         ----------
-        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
-            Native CSR page metadata retained by the plan.
+        block_table : torch.Tensor
+            Dense ``[B, max_pages]`` page metadata retained by the plan.
+        seq_lens : torch.Tensor
+            Planned live K/V length for each request.
         num_qo_heads, num_kv_heads, head_dim, page_size : int
             Attention head geometry and K/V page size.
         seq_len_q : int
@@ -3110,10 +3011,10 @@ class BatchDecodePagedTSWrapper:
             page_size if storage_page_size is None else storage_page_size,
         )
         _validate_head_geometry(num_qo_heads, num_kv_heads)
-        device, batch_size = _validate_paged_kv_metadata(
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
+        device, batch_size, max_num_pages = _validate_block_table_metadata(
+            block_table,
+            seq_lens,
+            "seq_lens",
         )
         device_index = _validate_runtime_device(device)
         planned_total_q_tokens: Optional[int] = None
@@ -3158,12 +3059,10 @@ class BatchDecodePagedTSWrapper:
             o_data_type,
         )
 
-        # Validate the CSR during the plan's existing metadata synchronization
-        # before deriving the device-side lengths used by the raw native path.
-        seq_lens_host = _read_paged_kv_plan_values(
-            paged_kv_indptr,
-            paged_kv_indices,
-            paged_kv_last_page_len,
+        # Validate lengths during the plan's existing metadata synchronization.
+        seq_lens_host = _read_block_table_plan_values(
+            block_table,
+            seq_lens,
             page_size=page_size,
         )
         if mask_type == "causal":
@@ -3176,10 +3075,6 @@ class BatchDecodePagedTSWrapper:
                         "no greater than its K/V length; request "
                         f"{request_idx} has Q={q_len} and K/V={kv_len}"
                     )
-        # This is the only metadata-derived device tensor needed by the raw
-        # native path. It remains stable across every run of this plan.
-        num_pages = paged_kv_indptr[1:] - paged_kv_indptr[:-1]
-        seq_lens = ((num_pages - 1) * page_size + paged_kv_last_page_len).contiguous()
         metadata_max_kv_len = max(seq_lens_host)
         if max_kv_len is None:
             exact_max_kv_len = metadata_max_kv_len
@@ -3191,6 +3086,12 @@ class BatchDecodePagedTSWrapper:
                     f"max_kv_len ({exact_max_kv_len}): got {metadata_max_kv_len}"
                 )
         exact_max_kv_len = _validate_max_kv_len(exact_max_kv_len, "max_kv_len")
+        required_page_columns = (exact_max_kv_len + page_size - 1) // page_size
+        if max_num_pages < required_page_columns:
+            raise ValueError(
+                "block_table must have at least ceil(max_kv_len / page_size) "
+                f"columns ({required_page_columns}), got {max_num_pages}"
+            )
 
         semantic_key = (
             device_index,
@@ -3285,9 +3186,7 @@ class BatchDecodePagedTSWrapper:
         self._mask_type = mask_type
         self._window_left = window_left
         self._max_kv_len = exact_max_kv_len
-        self._paged_kv_indptr = paged_kv_indptr
-        self._paged_kv_indices = paged_kv_indices
-        self._paged_kv_last_page_len = paged_kv_last_page_len
+        self._block_table = block_table
         self._seq_lens = seq_lens
         self._workspace_buffer = workspace_buffer
         self._workspace_layout = workspace_layout
@@ -3372,17 +3271,14 @@ class BatchDecodePagedTSWrapper:
                 runtime,
                 seq_lens=self._seq_lens,
                 qo_indptr=self._qo_indptr,
-                paged_kv_indptr=self._paged_kv_indptr,
-                paged_kv_indices=self._paged_kv_indices,
-                paged_kv_last_page_len=self._paged_kv_last_page_len,
+                block_table=self._block_table,
                 workspace_buffer=self._workspace_buffer,
             )
         return _launch_decode(
             runtime,
             seq_lens=self._seq_lens,
             qo_indptr=self._qo_indptr,
-            paged_kv_indptr=self._paged_kv_indptr,
-            paged_kv_indices=self._paged_kv_indices,
+            block_table=self._block_table,
             workspace=self._workspace,
             compiled_main=self._compiled_main,
             compiled_reducer=self._compiled_reducer,
@@ -3393,9 +3289,8 @@ class BatchDecodePagedTSWrapper:
 def batch_decode_with_paged_kv_cache(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
-    paged_kv_indptr: torch.Tensor,
-    paged_kv_indices: torch.Tensor,
-    paged_kv_last_page_len: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
     *,
     seq_len_q: int = 1,
     qo_indptr: Optional[torch.Tensor] = None,
@@ -3409,7 +3304,7 @@ def batch_decode_with_paged_kv_cache(
     out_dtype: Optional[torch.dtype] = None,
     page_size: Optional[int] = None,
 ) -> torch.Tensor:
-    """One-shot fixed or packed-Q native-CSR paged decode.
+    """One-shot fixed or packed-Q dense-block-table paged decode.
 
     SQ1 preserves the ``[B, Hq, D]`` query/output contract. For fixed
     ``seq_len_q>1``, query and output are both token-major
@@ -3423,8 +3318,10 @@ def batch_decode_with_paged_kv_cache(
         Fixed or packed query tensor.
     paged_kv_cache : torch.Tensor or tuple[torch.Tensor, torch.Tensor]
         Combined or separate paged K/V storage.
-    paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
-        Native CSR page metadata.
+    block_table : torch.Tensor
+        Dense ``[B, max_pages]`` physical-page table.
+    seq_lens : torch.Tensor
+        Live K/V sequence lengths.
     seq_len_q : int
         Fixed query length when ``qo_indptr`` is omitted.
     qo_indptr : torch.Tensor, optional
@@ -3444,7 +3341,7 @@ def batch_decode_with_paged_kv_cache(
     out_dtype : torch.dtype, optional
         Output dtype; defaults to ``out.dtype`` or the query dtype.
     page_size : int, optional
-        Semantic CSR page size. It defaults to the physical cache-page extent;
+        Semantic block-table page size. It defaults to the physical cache-page extent;
         pass four to enable encoded subpage locators.
     """
 
@@ -3457,10 +3354,10 @@ def batch_decode_with_paged_kv_cache(
         max_seq_len_q=max_seq_len_q,
         require_packed_max=False,
     )
-    metadata_device, batch_size = _validate_paged_kv_metadata(
-        paged_kv_indptr,
-        paged_kv_indices,
-        paged_kv_last_page_len,
+    metadata_device, batch_size, _ = _validate_block_table_metadata(
+        block_table,
+        seq_lens,
+        "seq_lens",
     )
     if metadata_device != q.device:
         raise ValueError(
@@ -3540,9 +3437,8 @@ def batch_decode_with_paged_kv_cache(
 
     wrapper = BatchDecodePagedTSWrapper(kv_layout=kv_layout)
     wrapper.plan(
-        paged_kv_indptr,
-        paged_kv_indices,
-        paged_kv_last_page_len,
+        block_table,
+        seq_lens,
         num_qo_heads,
         num_kv_heads,
         head_dim,
@@ -3571,6 +3467,7 @@ __all__ = [
     "PrimsTSBatchDecodePlan",
     "batch_decode_with_paged_kv_cache",
     "get_prims_ts_batch_decode_workspace_size",
+    "make_prims_ts_qsa_qo_indptr",
     "validate_prims_ts_qsa_group_size",
     "prepare_prims_ts_batch_decode_with_kv_cache",
     "prims_ts_batch_decode_with_kv_cache",

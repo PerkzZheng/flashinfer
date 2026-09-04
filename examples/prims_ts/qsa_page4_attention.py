@@ -21,6 +21,15 @@ route-offset tensor. Both paths prepare metadata and attention together so the
 hot-path call accepts only current semantic inputs and a framework-owned output;
 workspace-owned intermediate metadata remains hidden.
 
+The caller fixes ``G``. QSA chooses the smallest qualified TileQ in 8/16/32/64
+that can hold ``G * (Hq / Hkv)`` rows and always uses a 128-token K/V tile;
+TileQ8 supports both direct and split execution. Packed prefill is nonsplit;
+fixed decode may use at most eight K/V splits to fill, but not cross, the first
+active-CTA service wave. The current production route is causal and non-windowed.
+``sparse_block_size`` is an explicit power-of-two API parameter
+so integrations do not bake the current specialization into their interface,
+although only block size four is implemented today.
+
 Run on SM100 or SM103 after installing FlashInfer with PrimTS support. To keep
 the example compact, requests share the same physical cache pages; a serving
 framework normally provides distinct physical mappings.
@@ -30,7 +39,7 @@ from __future__ import annotations
 
 import torch
 
-from flashinfer.decode import (
+from flashinfer.attention.prims_ts import (
     get_prims_ts_qsa_workspace_size,
     make_prims_ts_qsa_qo_indptr,
     prepare_prims_ts_qsa_attention,
@@ -42,6 +51,7 @@ _NUM_QO_HEADS = 12
 _NUM_KV_HEADS = 1
 _HEAD_DIM = 256
 _BLOCK_TOPK = 512
+_SPARSE_BLOCK_SIZE = 4
 _STORAGE_PAGE_SIZE = 16
 _CONTEXT_LENGTH = 8192
 
@@ -81,7 +91,7 @@ def _make_block_indices(
 
 
 def run_packed_prefill(device: torch.device) -> None:
-    """Run variable-length prefill with packed queries and explicit routes."""
+    """Run variable-length, causal prefill with packed, nonsplit routes."""
 
     request_q_lengths = (5, 3)
     num_requests = len(request_q_lengths)
@@ -133,6 +143,7 @@ def run_packed_prefill(device: torch.device) -> None:
         k_cache,
         block_table,
         block_topk=_BLOCK_TOPK,
+        sparse_block_size=_SPARSE_BLOCK_SIZE,
         out_dtype=output.dtype,
         qo_indptr=qo_indptr,
         max_seq_len_q=group_size,
@@ -147,6 +158,7 @@ def run_packed_prefill(device: torch.device) -> None:
         token_to_request,
         query_positions,
         workspace,
+        sparse_block_size=_SPARSE_BLOCK_SIZE,
         out=output,
         qo_indptr=qo_indptr,
         max_seq_len_q=group_size,
@@ -168,7 +180,7 @@ def run_packed_prefill(device: torch.device) -> None:
 
 
 def run_fixed_mtp_decode(device: torch.device) -> None:
-    """Run uniform MTP decode with the fixed five-dimensional layout."""
+    """Run causal MTP decode with one caller-fixed group per route."""
 
     batch_size = 8
     num_query_groups = 1
@@ -212,6 +224,7 @@ def run_fixed_mtp_decode(device: torch.device) -> None:
         k_cache,
         block_table,
         block_topk=_BLOCK_TOPK,
+        sparse_block_size=_SPARSE_BLOCK_SIZE,
         out_dtype=output.dtype,
     )
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
@@ -223,6 +236,7 @@ def run_fixed_mtp_decode(device: torch.device) -> None:
         token_to_request,
         query_positions,
         workspace,
+        sparse_block_size=_SPARSE_BLOCK_SIZE,
         out=output,
     )
 
@@ -253,9 +267,8 @@ def run_fixed_mtp_decode(device: torch.device) -> None:
     print(
         "fixed MTP decode: "
         f"query={tuple(query.shape)}, group_size={group_size}, "
-        f"workspace_bytes={workspace_bytes}, "
-        f"metadata=({tuple(plan.qsa_page_indptr.shape)}, "
-        f"{tuple(plan.qsa_page_indices.shape)}, {tuple(plan.seq_lens.shape)})"
+        f"sparse_block_size={_SPARSE_BLOCK_SIZE}, "
+        f"workspace_bytes={workspace_bytes}"
     )
 
 

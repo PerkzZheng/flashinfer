@@ -14,11 +14,12 @@
 
 """CUDA-graph-safe compact QSA metadata construction.
 
-The public attention kernel consumes native page-four CSR metadata.  Q1 rows
-map their compact selected logical blocks directly to encoded physical
-subpage locators.  Q2/Q4/Q5 rows additionally union the selected blocks of
+The public attention kernel consumes a dense sparse-block route table. Q1
+rows map their compact selected logical blocks directly to encoded physical
+subpage locators. Q2/Q4/Q5 rows additionally union the selected blocks of
 every adjacent query and pack one low-byte membership bit per query into each
-locator.
+locator. The public API names the sparse block size explicitly; the current
+kernel specialization supports size four.
 
 Grouped construction uses one bitmap CTA per query and one pack CTA per group.
 The kernels execute in stream order; programmatic dependent launch is left for
@@ -35,8 +36,12 @@ import torch
 import triton
 import triton.language as tl
 
-_QSA_PAGE_SIZE = 4
+from ._tensor_aliasing import _validate_tensor_does_not_overlap_inputs
+
+_QSA_SUPPORTED_SPARSE_BLOCK_SIZE = 4
 _QSA_MEMBERSHIP_BITS = 8
+_QSA_INT32_LOCATOR_CAPACITY = 1 << 31
+_QSA_PACKED_LOCATOR_CAPACITY = 1 << (31 - _QSA_MEMBERSHIP_BITS)
 _QSA_WORKSPACE_ALIGNMENT = 256
 _QSA_WIDE_PACK_BLOCK_SIZE = 1024
 
@@ -51,8 +56,7 @@ def _qsa_pack_num_warps(pack_block_size: int) -> int:
 class _PrimsTSQSAWorkspaceViews:
     """Typed views bound to one caller-owned QSA attention workspace."""
 
-    qsa_page_indptr: torch.Tensor
-    qsa_page_indices: torch.Tensor
+    qsa_block_table: torch.Tensor
     seq_lens: torch.Tensor
     metadata_scratch_buffer: torch.Tensor
     attention_workspace_buffer: torch.Tensor
@@ -98,11 +102,96 @@ def _validate_qsa_plan_tensor(
         )
 
 
+def _validate_qsa_paged_kv_cache(
+    paged_kv_cache: object,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate and return the two rank-four QSA cache tensors."""
+
+    if (
+        not isinstance(paged_kv_cache, tuple)
+        or len(paged_kv_cache) != 2
+        or not all(isinstance(cache, torch.Tensor) for cache in paged_kv_cache)
+    ):
+        raise TypeError("paged_kv_cache must be a (k_cache, v_cache) tuple")
+    k_cache, v_cache = paged_kv_cache
+    if k_cache.ndim != 4:
+        raise ValueError(
+            "K and V cache tensors must have shape [pages,Hkv,storage_page_size,D]"
+        )
+    if (
+        v_cache.shape != k_cache.shape
+        or v_cache.device != k_cache.device
+        or v_cache.dtype != k_cache.dtype
+    ):
+        raise ValueError(
+            "K and V cache tensors must have matching shapes, devices, and dtypes"
+        )
+    return k_cache, v_cache
+
+
+def _validate_qsa_workspace_aliasing(
+    workspace_buffer: torch.Tensor,
+    *,
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_request: torch.Tensor,
+    query_positions: torch.Tensor,
+    qo_indptr: Optional[torch.Tensor],
+    out: Optional[torch.Tensor],
+) -> None:
+    """Keep the unified workspace disjoint from every live QSA tensor."""
+
+    _validate_tensor_does_not_overlap_inputs(
+        workspace_buffer,
+        "workspace_buffer",
+        ("query", query),
+        ("k_cache", k_cache),
+        ("v_cache", v_cache),
+        ("block_indices", block_indices),
+        ("block_table", block_table),
+        ("token_to_request", token_to_request),
+        ("query_positions", query_positions),
+        ("qo_indptr", qo_indptr),
+        ("out", out),
+    )
+
+
+def _validate_qsa_locator_capacity(
+    k_cache: torch.Tensor,
+    *,
+    group_size: int,
+    sparse_block_size: int,
+) -> None:
+    """Keep every valid encoded cache locator nonnegative in Int32."""
+
+    storage_page_size = int(k_cache.shape[2])
+    _validate_storage_page_size(storage_page_size, sparse_block_size)
+    num_encoded_locators = (
+        int(k_cache.shape[0]) * storage_page_size // sparse_block_size
+    )
+    capacity = (
+        _QSA_INT32_LOCATOR_CAPACITY if group_size == 1 else _QSA_PACKED_LOCATOR_CAPACITY
+    )
+    if num_encoded_locators > capacity:
+        suffix = (
+            ""
+            if group_size == 1
+            else f" after reserving {_QSA_MEMBERSHIP_BITS} membership bits"
+        )
+        raise NotImplementedError(
+            "the encoded QSA cache-locator extent must fit in nonnegative "
+            f"signed int32{suffix}: got {num_encoded_locators}, limit is {capacity}"
+        )
+
+
 @dataclass(frozen=True)
 class _PrimsTSQSAWorkspaceLayout:
     """Layout of QSA metadata outputs and disjoint kernel scratch.
 
-    The CSR indptr, page indices, and compact sequence lengths remain live from
+    The dense route table and compact sequence lengths remain live from
     metadata construction through the attention launch. Grouped-union bitmaps
     and attention scratch occupy disjoint regions: a decode split-KV plan must
     preserve its partials and self-resetting completion counters independently
@@ -111,9 +200,8 @@ class _PrimsTSQSAWorkspaceLayout:
     Semantic inputs such as block tables and query mappings remain outside.
     """
 
-    qsa_page_indptr_bytes: int
-    qsa_page_indices_byte_offset: int
-    qsa_page_indices_bytes: int
+    qsa_block_table_shape: tuple[int, int]
+    qsa_block_table_bytes: int
     seq_lens_byte_offset: int
     seq_lens_bytes: int
     metadata_scratch_byte_offset: int
@@ -129,13 +217,11 @@ class _PrimsTSQSAWorkspaceLayout:
 
         _validate_qsa_attention_workspace(workspace_buffer, self.total_bytes)
         workspace_bytes = workspace_buffer.reshape(-1).view(torch.uint8)
-        qsa_page_indptr = workspace_bytes[: self.qsa_page_indptr_bytes].view(
-            torch.int32
+        qsa_block_table = (
+            workspace_bytes[: self.qsa_block_table_bytes]
+            .view(torch.int32)
+            .view(self.qsa_block_table_shape)
         )
-        qsa_page_indices = workspace_bytes[
-            self.qsa_page_indices_byte_offset : self.qsa_page_indices_byte_offset
-            + self.qsa_page_indices_bytes
-        ].view(torch.int32)
         seq_lens = workspace_bytes[
             self.seq_lens_byte_offset : self.seq_lens_byte_offset + self.seq_lens_bytes
         ].view(torch.int32)
@@ -148,8 +234,7 @@ class _PrimsTSQSAWorkspaceLayout:
             + self.attention_scratch_bytes
         ]
         return _PrimsTSQSAWorkspaceViews(
-            qsa_page_indptr=qsa_page_indptr,
-            qsa_page_indices=qsa_page_indices,
+            qsa_block_table=qsa_block_table,
             seq_lens=seq_lens,
             metadata_scratch_buffer=metadata_scratch_buffer,
             attention_workspace_buffer=attention_workspace_buffer,
@@ -160,8 +245,7 @@ class _PrimsTSQSAWorkspaceLayout:
 class _PrimsTSQSAMetadataPlan:
     """Unchecked metadata launch state with all geometry pre-resolved."""
 
-    paged_kv_indptr: torch.Tensor
-    paged_kv_indices: torch.Tensor
+    qsa_block_table: torch.Tensor
     seq_lens: torch.Tensor
     bitsets: Optional[torch.Tensor]
     qo_indptr: Optional[torch.Tensor]
@@ -172,6 +256,7 @@ class _PrimsTSQSAMetadataPlan:
     use_packed_q: bool
     block_topk: int
     page_capacity: int
+    sparse_block_size: int
     storage_page_size: int
     bitset_words: int
     builder_block_size: int
@@ -198,8 +283,7 @@ class _PrimsTSQSAMetadataPlan:
                 block_table,
                 token_to_request,
                 query_positions,
-                self.paged_kv_indptr,
-                self.paged_kv_indices,
+                self.qsa_block_table,
                 self.seq_lens,
                 self.block_indices_row_stride,
                 self.block_indices_column_stride,
@@ -209,7 +293,7 @@ class _PrimsTSQSAMetadataPlan:
                 self.num_requests,
                 BLOCK_TOPK=self.block_topk,
                 BLOCK_SIZE=self.builder_block_size,
-                SEMANTIC_PAGE_SIZE=_QSA_PAGE_SIZE,
+                SEMANTIC_PAGE_SIZE=self.sparse_block_size,
                 PAGE_TABLE_WIDTH=self.page_table_width,
                 STORAGE_PAGE_SIZE=self.storage_page_size,
                 PAGE_CAPACITY=self.page_capacity,
@@ -218,7 +302,7 @@ class _PrimsTSQSAMetadataPlan:
             return
 
         assert self.bitsets is not None
-        qo_indptr = self.paged_kv_indptr if self.qo_indptr is None else self.qo_indptr
+        qo_indptr = self.qsa_block_table if self.qo_indptr is None else self.qo_indptr
         _build_qsa_page4_grouped_bitsets_kernel[(self.groups, self.group_size)](
             block_indices,
             token_to_request,
@@ -234,7 +318,7 @@ class _PrimsTSQSAMetadataPlan:
             BLOCK_TOPK=self.block_topk,
             BITSET_WORDS=self.bitset_words,
             BLOCK_SIZE=self.builder_block_size,
-            SEMANTIC_PAGE_SIZE=_QSA_PAGE_SIZE,
+            SEMANTIC_PAGE_SIZE=self.sparse_block_size,
             num_warps=4,
         )
         _pack_qsa_page4_grouped_union_kernel[(self.groups,)](
@@ -243,8 +327,7 @@ class _PrimsTSQSAMetadataPlan:
             token_to_request,
             query_positions,
             qo_indptr,
-            self.paged_kv_indptr,
-            self.paged_kv_indices,
+            self.qsa_block_table,
             self.seq_lens,
             self.block_table_request_stride,
             self.block_table_page_stride,
@@ -255,7 +338,7 @@ class _PrimsTSQSAMetadataPlan:
             BITSET_WORDS=self.bitset_words,
             BLOCK_SIZE=self.pack_block_size,
             PAGE_TABLE_WIDTH=self.page_table_width,
-            SEMANTIC_PAGE_SIZE=_QSA_PAGE_SIZE,
+            SEMANTIC_PAGE_SIZE=self.sparse_block_size,
             PAGE_MEMBERSHIP_BITS=_QSA_MEMBERSHIP_BITS,
             STORAGE_PAGE_SIZE=self.storage_page_size,
             PAGE_CAPACITY=self.page_capacity,
@@ -290,24 +373,6 @@ class PrimsTSQSAPlan:
     _query_positions: _QSATensorDescriptor
     _out: _QSATensorDescriptor
     _fixed_query_group_size: Optional[int] = None
-
-    @property
-    def qsa_page_indptr(self) -> torch.Tensor:
-        """Graph-stable CSR indptr view owned by the byte workspace."""
-
-        return self._metadata_plan.paged_kv_indptr
-
-    @property
-    def qsa_page_indices(self) -> torch.Tensor:
-        """Graph-stable packed page-four locator view owned by the workspace."""
-
-        return self._metadata_plan.paged_kv_indices
-
-    @property
-    def seq_lens(self) -> torch.Tensor:
-        """Graph-stable compact-KV lengths owned by the byte workspace."""
-
-        return self._metadata_plan.seq_lens
 
     def run(
         self,
@@ -388,8 +453,7 @@ def _build_qsa_page4_q1_metadata_kernel(
     block_table_ptr,
     token_to_request_ptr,
     query_positions_ptr,
-    paged_kv_indptr_ptr,
-    paged_kv_indices_ptr,
+    qsa_block_table_ptr,
     seq_lens_ptr,
     stride_indices_row,
     stride_indices_column,
@@ -404,7 +468,7 @@ def _build_qsa_page4_q1_metadata_kernel(
     STORAGE_PAGE_SIZE: tl.constexpr,
     PAGE_CAPACITY: tl.constexpr,
 ) -> None:
-    """Map one compact QSA row directly to page-four CSR metadata."""
+    """Map one compact QSA row directly to a dense page-four route."""
 
     row = tl.program_id(0)
     page_ranks = tl.arange(0, BLOCK_SIZE)
@@ -448,7 +512,7 @@ def _build_qsa_page4_q1_metadata_kernel(
     # vector-covered slot so a shorter replay cannot expose stale locators.
     output_locator = tl.where(table_live & (physical_page >= 0), locator, -1)
     tl.store(
-        paged_kv_indices_ptr + row * PAGE_CAPACITY + page_ranks,
+        qsa_block_table_ptr + row * PAGE_CAPACITY + page_ranks,
         output_locator,
         mask=(row < rows) & (page_ranks < PAGE_CAPACITY),
     )
@@ -457,7 +521,7 @@ def _build_qsa_page4_q1_metadata_kernel(
     # PAGE_CAPACITY (513) to 1,024 lanes. Clear the one scalar slot outside the
     # vector block before the optional causal tail overwrites it below.
     tl.store(
-        paged_kv_indices_ptr + row * PAGE_CAPACITY + PAGE_CAPACITY - 1,
+        qsa_block_table_ptr + row * PAGE_CAPACITY + PAGE_CAPACITY - 1,
         -1,
         mask=row < rows,
     )
@@ -484,17 +548,14 @@ def _build_qsa_page4_q1_metadata_kernel(
     tail_subpage = (tail_logical_token % STORAGE_PAGE_SIZE) // SEMANTIC_PAGE_SIZE
     tail_locator = tail_physical_page * subpages_per_storage_page + tail_subpage
     tl.store(
-        paged_kv_indices_ptr + row * PAGE_CAPACITY + complete_pages,
+        qsa_block_table_ptr + row * PAGE_CAPACITY + complete_pages,
         tail_locator,
         mask=tail_live & (tail_physical_page >= 0),
     )
 
     if row < rows:
         compact_length = complete_pages * SEMANTIC_PAGE_SIZE + tail_tokens
-        tl.store(paged_kv_indptr_ptr + row, row * PAGE_CAPACITY)
         tl.store(seq_lens_ptr + row, tl.maximum(compact_length, 1))
-        if row == rows - 1:
-            tl.store(paged_kv_indptr_ptr + rows, rows * PAGE_CAPACITY)
 
 
 @triton.jit
@@ -515,7 +576,7 @@ def _build_qsa_page4_grouped_bitsets_kernel(
     BLOCK_SIZE: tl.constexpr,
     SEMANTIC_PAGE_SIZE: tl.constexpr,
 ) -> None:
-    """Build one compact logical-page bitmap per query."""
+    """Build one compact logical sparse-block bitmap per query."""
 
     group = tl.program_id(0)
     q_index = tl.program_id(1)
@@ -605,8 +666,7 @@ def _pack_qsa_page4_grouped_union_kernel(
     token_to_request_ptr,
     query_positions_ptr,
     qo_indptr_ptr,
-    paged_kv_indptr_ptr,
-    paged_kv_indices_ptr,
+    qsa_block_table_ptr,
     seq_lens_ptr,
     stride_table_request,
     stride_table_page,
@@ -737,9 +797,9 @@ def _pack_qsa_page4_grouped_union_kernel(
         )
         packed = (locator << PAGE_MEMBERSHIP_BITS) | membership
         tl.store(
-            paged_kv_indices_ptr + group * PAGE_CAPACITY + rank,
-            packed,
-            mask=table_live & (physical_page >= 0),
+            qsa_block_table_ptr + group * PAGE_CAPACITY + rank,
+            tl.where(physical_page >= 0, packed, -1),
+            mask=table_live,
         )
 
     tail_tokens = (last_position + 1) % SEMANTIC_PAGE_SIZE
@@ -749,18 +809,12 @@ def _pack_qsa_page4_grouped_union_kernel(
         SEMANTIC_PAGE_SIZE - tail_tokens,
     )
     seq_len = union_pages * SEMANTIC_PAGE_SIZE - tail_padding
-    tl.store(paged_kv_indptr_ptr + group, group * PAGE_CAPACITY)
     tl.store(seq_lens_ptr + group, tl.where(group_valid, seq_len, 1))
     tl.store(
-        paged_kv_indices_ptr + group * PAGE_CAPACITY,
+        qsa_block_table_ptr + group * PAGE_CAPACITY,
         -1,
         mask=~group_valid,
     )
-    if group == tl.num_programs(0) - 1:
-        tl.store(
-            paged_kv_indptr_ptr + group + 1,
-            (group + 1) * PAGE_CAPACITY,
-        )
 
 
 def get_prims_ts_qsa_metadata_output_shapes(
@@ -769,9 +823,15 @@ def get_prims_ts_qsa_metadata_output_shapes(
     group_size: int,
     *,
     num_query_groups: Optional[int] = None,
-) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    """Return ``(indptr, indices, seq_lens)`` shapes for compact QSA input."""
+    sparse_block_size: int = 4,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return ``(qsa_block_table, seq_lens)`` shapes for compact QSA input.
 
+    ``sparse_block_size`` must be a positive power of two; only four is
+    implemented today.
+    """
+
+    _validate_sparse_block_size(sparse_block_size)
     _validate_shape_parameters(num_query_tokens, block_topk, group_size)
     groups = _resolve_num_query_groups(
         num_query_tokens,
@@ -779,7 +839,7 @@ def get_prims_ts_qsa_metadata_output_shapes(
         num_query_groups,
     )
     page_capacity = group_size * (block_topk + 1)
-    return (groups + 1,), (groups * page_capacity,), (groups,)
+    return (groups, page_capacity), (groups,)
 
 
 def get_prims_ts_qsa_metadata_workspace_size(
@@ -789,12 +849,15 @@ def get_prims_ts_qsa_metadata_workspace_size(
     group_size: int,
     *,
     num_query_groups: Optional[int] = None,
+    sparse_block_size: int = 4,
 ) -> int:
     """Return caller-workspace bytes for compact QSA metadata construction.
 
-    Q1 performs no union and requires no scratch.  Q2/Q4/Q5 reserve one logical
-    page bitmap per input query.  The storage is stable across CUDA graph
+    Q1 performs no union and requires no scratch. Q2/Q4/Q5 reserve one logical
+    sparse-block bitmap per input query. The storage is stable across CUDA graph
     capture and is completely reinitialized by every launch.
+    ``sparse_block_size`` must be a positive power of two; only four is
+    implemented today.
     """
 
     if not isinstance(max_num_storage_pages, int) or isinstance(
@@ -803,7 +866,8 @@ def get_prims_ts_qsa_metadata_workspace_size(
         raise TypeError("max_num_storage_pages must be an integer")
     if max_num_storage_pages <= 0:
         raise ValueError("max_num_storage_pages must be positive")
-    _validate_storage_page_size(storage_page_size)
+    sparse_block_size = _validate_sparse_block_size(sparse_block_size)
+    _validate_storage_page_size(storage_page_size, sparse_block_size)
     _validate_shape_parameters(num_query_tokens, 1, group_size)
     if group_size == 1:
         return 0
@@ -812,7 +876,9 @@ def get_prims_ts_qsa_metadata_workspace_size(
         group_size,
         num_query_groups,
     )
-    logical_block_capacity = max_num_storage_pages * storage_page_size // _QSA_PAGE_SIZE
+    logical_block_capacity = (
+        max_num_storage_pages * storage_page_size // sparse_block_size
+    )
     bitset_words = (logical_block_capacity + 31) // 32
     # Packed routes reserve G bitmap slots even when their final query group
     # has fewer than G live rows. This keeps each route's bitmap base static
@@ -836,18 +902,20 @@ def _get_prims_ts_qsa_workspace_layout(
     device: Optional[torch.device | str | int] = None,
     num_query_groups: Optional[int] = None,
     use_packed_q: bool = False,
+    sparse_block_size: int = 4,
 ) -> _PrimsTSQSAWorkspaceLayout:
     """Return the unified allocation layout for QSA metadata and attention.
 
-    The workspace owns the CSR metadata outputs, transient page indices, and
-    kernel scratch. The caller continues to provide block tables, request
-    mappings, and query positions as explicit semantic inputs.
+    The workspace owns the dense QSA route table, compact sequence lengths,
+    and kernel scratch. The caller continues to provide the model block table,
+    request mappings, and query positions as explicit semantic inputs.
 
     Metadata and attention use disjoint regions. Direct prefill policies have
     no split-KV storage; decode policies that select split-KV own dedicated
     partial-output, statistics, and completion-counter storage.
     """
 
+    sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     _validate_shape_parameters(num_query_tokens, block_topk, group_size)
     if num_query_tokens == 0:
         raise ValueError("num_query_tokens must be positive for QSA attention")
@@ -857,7 +925,7 @@ def _get_prims_ts_qsa_workspace_layout(
         raise TypeError("max_num_storage_pages must be an integer")
     if max_num_storage_pages <= 0:
         raise ValueError("max_num_storage_pages must be positive")
-    _validate_storage_page_size(storage_page_size)
+    _validate_storage_page_size(storage_page_size, sparse_block_size)
 
     from .decode import (
         _resolve_decode_workspace_layout,
@@ -876,14 +944,9 @@ def _get_prims_ts_qsa_workspace_layout(
         num_query_groups,
     )
     page_capacity = group_size * (block_topk + 1)
-    qsa_page_indptr_numel = groups + 1
-    qsa_page_indptr_bytes = qsa_page_indptr_numel * 4
-    qsa_page_indices_byte_offset = _align_up_qsa_workspace(qsa_page_indptr_bytes)
-    qsa_page_indices_numel = groups * page_capacity
-    qsa_page_indices_bytes = qsa_page_indices_numel * 4
-    seq_lens_byte_offset = _align_up_qsa_workspace(
-        qsa_page_indices_byte_offset + qsa_page_indices_bytes
-    )
+    qsa_block_table_shape = (groups, page_capacity)
+    qsa_block_table_bytes = groups * page_capacity * 4
+    seq_lens_byte_offset = _align_up_qsa_workspace(qsa_block_table_bytes)
     seq_lens_numel = groups
     seq_lens_bytes = seq_lens_numel * 4
     metadata_scratch_bytes = get_prims_ts_qsa_metadata_workspace_size(
@@ -892,11 +955,12 @@ def _get_prims_ts_qsa_workspace_layout(
         storage_page_size,
         group_size,
         num_query_groups=groups,
+        sparse_block_size=sparse_block_size,
     )
     max_seq_len = (
-        block_topk * _QSA_PAGE_SIZE + (_QSA_PAGE_SIZE - 1)
+        block_topk * sparse_block_size + (sparse_block_size - 1)
         if group_size == 1
-        else page_capacity * _QSA_PAGE_SIZE
+        else page_capacity * sparse_block_size
     )
     if kv_dtype is None:
         kv_dtype = q_dtype
@@ -907,7 +971,7 @@ def _get_prims_ts_qsa_workspace_layout(
         num_qo_heads,
         num_kv_heads,
         head_dim,
-        _QSA_PAGE_SIZE,
+        sparse_block_size,
         max_seq_len,
         group_size,
         q_dtype,
@@ -929,9 +993,8 @@ def _get_prims_ts_qsa_workspace_layout(
         metadata_scratch_byte_offset + metadata_scratch_bytes
     )
     return _PrimsTSQSAWorkspaceLayout(
-        qsa_page_indptr_bytes=qsa_page_indptr_bytes,
-        qsa_page_indices_byte_offset=qsa_page_indices_byte_offset,
-        qsa_page_indices_bytes=qsa_page_indices_bytes,
+        qsa_block_table_shape=qsa_block_table_shape,
+        qsa_block_table_bytes=qsa_block_table_bytes,
         seq_lens_byte_offset=seq_lens_byte_offset,
         seq_lens_bytes=seq_lens_bytes,
         metadata_scratch_byte_offset=metadata_scratch_byte_offset,
@@ -953,6 +1016,7 @@ def get_prims_ts_qsa_workspace_size(
     out_dtype: Optional[torch.dtype] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    sparse_block_size: int = 4,
 ) -> int:
     """Return bytes for QSA metadata outputs and kernel scratch.
 
@@ -963,11 +1027,13 @@ def get_prims_ts_qsa_workspace_size(
     not require query-offset metadata. The first two fixed axes are flattened
     into the attention route axis without copying tensor storage.
 
-    CSR indptr, packed page indices, and compact sequence lengths are owned by
-    the workspace. Metadata and attention scratch are disjoint. The attention
+    The dense QSA block table and compact sequence lengths are owned by the
+    workspace. Metadata and attention scratch are disjoint. The attention
     region contains split-KV partials, statistics, and counters only when the
     resolved policy uses split-KV; direct prefill retains only small
     uniform-ABI placeholders.
+    ``sparse_block_size`` must be a positive power of two; only four is
+    implemented today.
     """
 
     return _get_prims_ts_qsa_workspace_layout_from_tensors(
@@ -978,6 +1044,7 @@ def get_prims_ts_qsa_workspace_size(
         out_dtype=out_dtype,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
+        sparse_block_size=sparse_block_size,
     ).total_bytes
 
 
@@ -990,9 +1057,17 @@ def _get_prims_ts_qsa_workspace_layout_from_tensors(
     out_dtype: Optional[torch.dtype],
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    sparse_block_size: int = 4,
 ) -> _PrimsTSQSAWorkspaceLayout:
-    if not isinstance(query, torch.Tensor) or not query.is_cuda:
+    sparse_block_size = _validate_sparse_block_size(sparse_block_size)
+    if not isinstance(query, torch.Tensor):
+        raise TypeError("query must be a torch.Tensor")
+    if not query.is_cuda:
         raise ValueError("query must be a CUDA tensor")
+    if not isinstance(k_cache, torch.Tensor):
+        raise TypeError("k_cache must be a torch.Tensor")
+    if not isinstance(block_table, torch.Tensor):
+        raise TypeError("block_table must be a torch.Tensor")
     use_packed_q = qo_indptr is not None
     if not use_packed_q and max_seq_len_q is not None:
         raise ValueError("max_seq_len_q is only valid with packed QSA qo_indptr")
@@ -1005,7 +1080,7 @@ def _get_prims_ts_qsa_workspace_layout_from_tensors(
         group_size = int(max_seq_len_q)
         groups = int(qo_indptr.numel()) - 1
         num_query_tokens, num_qo_heads, head_dim = query.shape
-    elif query.ndim == 5 and query.shape[2] in (1, 2, 4, 5):
+    elif query.ndim == 5:
         batch_size, groups_per_request, group_size, num_qo_heads, head_dim = query.shape
         if batch_size <= 0 or groups_per_request <= 0:
             raise ValueError("fixed QSA batch and query-group counts must be positive")
@@ -1013,7 +1088,7 @@ def _get_prims_ts_qsa_workspace_layout_from_tensors(
     else:
         raise ValueError(
             "query must be packed [total_q,Hq,D] with qo_indptr or fixed "
-            "[B,Nq,1|2|4|5,Hq,D] without qo_indptr"
+            "[B,Nq,G,Hq,D] without qo_indptr"
         )
     if k_cache.ndim != 4:
         raise ValueError("k_cache must have shape [pages, Hkv, storage_page_size, D]")
@@ -1023,6 +1098,11 @@ def _get_prims_ts_qsa_workspace_layout_from_tensors(
         raise ValueError("block_table must be a rank-two int32 tensor")
     if block_table.device != query.device:
         raise ValueError("block_table must be on the query device")
+    _validate_qsa_locator_capacity(
+        k_cache,
+        group_size=int(group_size),
+        sparse_block_size=sparse_block_size,
+    )
     if out_dtype is None:
         out_dtype = query.dtype
     return _get_prims_ts_qsa_workspace_layout(
@@ -1040,6 +1120,7 @@ def _get_prims_ts_qsa_workspace_layout_from_tensors(
         device=query.device,
         num_query_groups=groups,
         use_packed_q=use_packed_q,
+        sparse_block_size=sparse_block_size,
     )
 
 
@@ -1052,20 +1133,24 @@ def _build_prims_ts_qsa_page4_metadata(
     *,
     group_size: int,
     storage_page_size: int,
+    sparse_block_size: int = 4,
     qo_indptr: Optional[torch.Tensor] = None,
-    out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build native page-four QSA CSR metadata from compact block IDs.
+    out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a dense page-four QSA route table from compact block IDs.
 
     ``block_indices`` contains compact logical four-token block IDs with shape
     ``[num_query_tokens, block_topk]``.  Adjacent Q2/Q4/Q5 rows must belong to
     the same request and have consecutive positions.  Q1 output locators are
     ordinary encoded subpage locators.  Grouped output words use
     ``(locator << 8) | membership``, where membership bit ``i`` marks visibility
-    for query ``i`` in the group.
+    for query ``i`` in the group. Valid grouped locators must be smaller than
+    ``2**23`` so the packed word remains nonnegative signed Int32; the combined
+    attention APIs prove this from the cache capacity, while callers of this
+    advanced metadata-only API own that input-value contract.
 
     Pass preallocated ``out`` and ``workspace_buffer`` tensors for CUDA graph
-    capture.  Output row strides are fixed at
+    capture. The output table has a fixed row width of
     ``group_size * (block_topk + 1)``; ``seq_lens`` selects the live prefix.
     The workspace may be int8, uint8, or int32 and must not be shared by
     concurrent launches. Q1 uses one kernel. Q2/Q4/Q5 use a stream-ordered
@@ -1082,6 +1167,7 @@ def _build_prims_ts_qsa_page4_metadata(
         query_positions,
         group_size,
         storage_page_size,
+        sparse_block_size,
     )
     rows, block_topk = block_indices.shape
     use_packed_q = qo_indptr is not None
@@ -1096,6 +1182,7 @@ def _build_prims_ts_qsa_page4_metadata(
         block_topk,
         group_size,
         num_query_groups=groups,
+        sparse_block_size=sparse_block_size,
     )
     if out is None:
         outputs = tuple(
@@ -1103,8 +1190,8 @@ def _build_prims_ts_qsa_page4_metadata(
             for shape in expected_shapes
         )
     else:
-        if not isinstance(out, tuple) or len(out) != 3:
-            raise TypeError("out must be an (indptr, indices, seq_lens) tuple")
+        if not isinstance(out, tuple) or len(out) != 2:
+            raise TypeError("out must be a (qsa_block_table, seq_lens) tuple")
         outputs = out
         for tensor, shape in zip(outputs, expected_shapes, strict=True):
             if (
@@ -1117,10 +1204,9 @@ def _build_prims_ts_qsa_page4_metadata(
                     "QSA metadata outputs must be contiguous int32 tensors with "
                     f"shapes {expected_shapes} on {block_indices.device}"
                 )
-    paged_kv_indptr, paged_kv_indices, seq_lens = outputs
+    qsa_block_table, seq_lens = outputs
     groups = _resolve_num_query_groups(rows, group_size, groups)
     if groups == 0:
-        paged_kv_indptr.zero_()
         return outputs
 
     page_capacity = group_size * (block_topk + 1)
@@ -1130,8 +1216,7 @@ def _build_prims_ts_qsa_page4_metadata(
             block_table,
             token_to_request,
             query_positions,
-            paged_kv_indptr,
-            paged_kv_indices,
+            qsa_block_table,
             seq_lens,
             block_indices.stride(0),
             block_indices.stride(1),
@@ -1141,7 +1226,7 @@ def _build_prims_ts_qsa_page4_metadata(
             block_table.shape[0],
             BLOCK_TOPK=block_topk,
             BLOCK_SIZE=triton.next_power_of_2(block_topk),
-            SEMANTIC_PAGE_SIZE=_QSA_PAGE_SIZE,
+            SEMANTIC_PAGE_SIZE=sparse_block_size,
             PAGE_TABLE_WIDTH=block_table.shape[1],
             STORAGE_PAGE_SIZE=storage_page_size,
             PAGE_CAPACITY=page_capacity,
@@ -1155,6 +1240,7 @@ def _build_prims_ts_qsa_page4_metadata(
         storage_page_size,
         group_size,
         num_query_groups=groups,
+        sparse_block_size=sparse_block_size,
     )
     if workspace_buffer is None:
         workspace_buffer = torch.empty(
@@ -1168,10 +1254,12 @@ def _build_prims_ts_qsa_page4_metadata(
     else:
         bitsets = workspace_buffer.flatten()[:workspace_bytes].view(torch.int32)
 
-    logical_block_capacity = block_table.shape[1] * storage_page_size // _QSA_PAGE_SIZE
+    logical_block_capacity = (
+        block_table.shape[1] * storage_page_size // sparse_block_size
+    )
     bitset_words = (logical_block_capacity + 31) // 32
     builder_block_size = triton.next_power_of_2(max(block_topk, bitset_words))
-    q_offsets = paged_kv_indptr if qo_indptr is None else qo_indptr
+    q_offsets = qsa_block_table if qo_indptr is None else qo_indptr
     _build_qsa_page4_grouped_bitsets_kernel[(groups, group_size)](
         block_indices,
         token_to_request,
@@ -1187,7 +1275,7 @@ def _build_prims_ts_qsa_page4_metadata(
         BLOCK_TOPK=block_topk,
         BITSET_WORDS=bitset_words,
         BLOCK_SIZE=builder_block_size,
-        SEMANTIC_PAGE_SIZE=_QSA_PAGE_SIZE,
+        SEMANTIC_PAGE_SIZE=sparse_block_size,
         num_warps=4,
     )
     pack_block_size = triton.next_power_of_2(bitset_words)
@@ -1198,8 +1286,7 @@ def _build_prims_ts_qsa_page4_metadata(
         token_to_request,
         query_positions,
         q_offsets,
-        paged_kv_indptr,
-        paged_kv_indices,
+        qsa_block_table,
         seq_lens,
         block_table.stride(0),
         block_table.stride(1),
@@ -1210,7 +1297,7 @@ def _build_prims_ts_qsa_page4_metadata(
         BITSET_WORDS=bitset_words,
         BLOCK_SIZE=pack_block_size,
         PAGE_TABLE_WIDTH=block_table.shape[1],
-        SEMANTIC_PAGE_SIZE=_QSA_PAGE_SIZE,
+        SEMANTIC_PAGE_SIZE=sparse_block_size,
         PAGE_MEMBERSHIP_BITS=_QSA_MEMBERSHIP_BITS,
         STORAGE_PAGE_SIZE=storage_page_size,
         PAGE_CAPACITY=page_capacity,
@@ -1219,7 +1306,7 @@ def _build_prims_ts_qsa_page4_metadata(
     return outputs
 
 
-def build_prims_ts_qsa_page4_metadata(
+def build_prims_ts_qsa_metadata(
     block_indices: torch.Tensor,
     block_table: torch.Tensor,
     token_to_request: torch.Tensor,
@@ -1228,10 +1315,20 @@ def build_prims_ts_qsa_page4_metadata(
     *,
     group_size: int,
     storage_page_size: int,
+    sparse_block_size: int = 4,
     qo_indptr: Optional[torch.Tensor] = None,
-    out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build native page-four QSA CSR metadata from compact block IDs.
+    out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a dense QSA route table from compact sparse-block IDs.
+
+    ``block_indices`` is ``[num_query_tokens, block_topk]`` and contains
+    selected logical sparse-block IDs. ``block_table`` is the model's dense
+    ``[num_requests, max_storage_pages]`` physical storage-page table. The
+    returned ``qsa_block_table`` has shape
+    ``[num_query_groups, group_size * (block_topk + 1)]``; ``seq_lens`` gives
+    each row's live token prefix. Q1 entries are encoded cache locators.
+    Grouped entries additionally reserve the low eight bits for per-query
+    membership.
 
     Q1 uses one kernel. Q2/Q4/Q5 use a stream-ordered per-query bitmap kernel
     followed by a union-pack kernel. Advanced callers that capture this raw
@@ -1240,6 +1337,10 @@ def build_prims_ts_qsa_page4_metadata(
     address through replay.
     Packed ``qo_indptr`` must be an Int32 device copy of CPU-validated route
     offsets and is checked structurally without a host-side value read.
+
+    ``sparse_block_size`` defaults to four. The API validates power-of-two
+    values so future kernel specializations can use the same interface; only
+    block size four is implemented today.
     """
 
     return _build_prims_ts_qsa_page4_metadata(
@@ -1250,6 +1351,7 @@ def build_prims_ts_qsa_page4_metadata(
         workspace_buffer,
         group_size=group_size,
         storage_page_size=storage_page_size,
+        sparse_block_size=sparse_block_size,
         qo_indptr=qo_indptr,
         out=out,
     )
@@ -1261,16 +1363,17 @@ def _prepare_prims_ts_qsa_metadata_plan(
     token_to_request: torch.Tensor,
     query_positions: torch.Tensor,
     metadata_workspace: torch.Tensor,
-    qsa_page_indptr: torch.Tensor,
-    qsa_page_indices: torch.Tensor,
+    qsa_block_table: torch.Tensor,
     seq_lens: torch.Tensor,
     *,
     group_size: int,
     storage_page_size: int,
+    sparse_block_size: int = 4,
     qo_indptr: Optional[torch.Tensor] = None,
 ) -> _PrimsTSQSAMetadataPlan:
     """Freeze validated metadata tensors and launch constants."""
 
+    sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     rows, block_topk = block_indices.shape
     use_packed_q = qo_indptr is not None
     groups = _resolve_num_query_groups(
@@ -1279,7 +1382,9 @@ def _prepare_prims_ts_qsa_metadata_plan(
         int(qo_indptr.numel()) - 1 if use_packed_q else None,
     )
     page_capacity = group_size * (block_topk + 1)
-    logical_block_capacity = block_table.shape[1] * storage_page_size // _QSA_PAGE_SIZE
+    logical_block_capacity = (
+        block_table.shape[1] * storage_page_size // sparse_block_size
+    )
     bitset_words = (logical_block_capacity + 31) // 32 if group_size > 1 else 0
     builder_block_size = triton.next_power_of_2(max(block_topk, bitset_words))
     pack_block_size = triton.next_power_of_2(bitset_words) if group_size > 1 else 1
@@ -1292,11 +1397,11 @@ def _prepare_prims_ts_qsa_metadata_plan(
             storage_page_size,
             group_size,
             num_query_groups=groups,
+            sparse_block_size=sparse_block_size,
         )
         bitsets = metadata_workspace[:metadata_bytes].view(torch.int32)
     return _PrimsTSQSAMetadataPlan(
-        paged_kv_indptr=qsa_page_indptr,
-        paged_kv_indices=qsa_page_indices,
+        qsa_block_table=qsa_block_table,
         seq_lens=seq_lens,
         bitsets=bitsets,
         qo_indptr=qo_indptr,
@@ -1307,6 +1412,7 @@ def _prepare_prims_ts_qsa_metadata_plan(
         use_packed_q=use_packed_q,
         block_topk=block_topk,
         page_capacity=page_capacity,
+        sparse_block_size=sparse_block_size,
         storage_page_size=storage_page_size,
         bitset_words=bitset_words,
         builder_block_size=builder_block_size,
@@ -1334,6 +1440,7 @@ def prepare_prims_ts_qsa_attention(
     bmm2_scale: float = 1.0,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    sparse_block_size: int = 4,
 ) -> PrimsTSQSAPlan:
     """Prepare one graph-stable metadata-plus-attention QSA launch.
 
@@ -1344,9 +1451,10 @@ def prepare_prims_ts_qsa_attention(
     internal attention route count through a zero-copy view.
 
     Frameworks call :meth:`PrimsTSQSAPlan.run` with current inputs that preserve
-    the prepared geometry. The plan owns all CSR metadata views inside
-    ``workspace_buffer`` and resolves metadata geometry and the PrimTS attention
-    launch only once. Packed ``qo_indptr`` must be an Int32 device copy of
+    the prepared geometry. The plan owns its dense route table and compact
+    sequence lengths inside ``workspace_buffer`` and resolves metadata geometry
+    and the PrimTS attention launch only once. Packed ``qo_indptr`` must be an
+    Int32 device copy of
     CPU-validated route offsets, such as those from
     :func:`make_prims_ts_qsa_qo_indptr`. Preparation checks only its structural
     tensor contract and does not materialize its values on the host.
@@ -1354,23 +1462,15 @@ def prepare_prims_ts_qsa_attention(
     Call ``run`` once outside CUDA graph capture to compile and initialize the
     plan, then capture with all semantic inputs, output, and workspace storage
     kept at stable addresses.
+
+    ``sparse_block_size`` defaults to four and is reserved for kernel
+    specialization. Other positive power-of-two sizes are not implemented.
     """
 
-    if (
-        not isinstance(paged_kv_cache, tuple)
-        or len(paged_kv_cache) != 2
-        or not all(isinstance(cache, torch.Tensor) for cache in paged_kv_cache)
-    ):
-        raise TypeError("paged_kv_cache must be a (k_cache, v_cache) tuple")
-    k_cache, v_cache = paged_kv_cache
-    if (
-        v_cache.shape != k_cache.shape
-        or v_cache.device != k_cache.device
-        or v_cache.dtype != k_cache.dtype
-    ):
-        raise ValueError(
-            "K and V cache tensors must have matching shapes, devices, and dtypes"
-        )
+    sparse_block_size = _validate_sparse_block_size(sparse_block_size)
+    k_cache, v_cache = _validate_qsa_paged_kv_cache(paged_kv_cache)
+    if not isinstance(query, torch.Tensor):
+        raise TypeError("query must be a torch.Tensor")
     if not isinstance(out, torch.Tensor):
         raise TypeError("out must be a caller-owned torch.Tensor")
 
@@ -1390,8 +1490,6 @@ def prepare_prims_ts_qsa_attention(
         attention_query = query
         attention_out = out
     elif query.ndim == 5:
-        if query.shape[2] not in (1, 2, 4, 5):
-            raise ValueError("fixed QSA group size must be one, two, four, or five")
         if out.shape != query.shape:
             raise ValueError("fixed QSA output must have the same shape as query")
         if not query.is_contiguous() or not out.is_contiguous():
@@ -1404,7 +1502,7 @@ def prepare_prims_ts_qsa_attention(
     else:
         raise ValueError(
             "query must be packed [total_q,Hq,D] with qo_indptr or fixed "
-            "[B,Nq,1|2|4|5,Hq,D] without qo_indptr"
+            "[B,Nq,G,Hq,D] without qo_indptr"
         )
 
     _validate_inputs(
@@ -1414,6 +1512,7 @@ def prepare_prims_ts_qsa_attention(
         query_positions,
         group_size,
         int(k_cache.shape[2]),
+        sparse_block_size,
     )
     if block_indices.shape[0] != num_query_tokens:
         raise ValueError("block_indices must have one row per flattened query token")
@@ -1426,6 +1525,19 @@ def prepare_prims_ts_qsa_attention(
         out_dtype=out.dtype,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
+        sparse_block_size=sparse_block_size,
+    )
+    _validate_qsa_workspace_aliasing(
+        workspace_buffer,
+        query=query,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_indices=block_indices,
+        block_table=block_table,
+        token_to_request=token_to_request,
+        query_positions=query_positions,
+        qo_indptr=qo_indptr,
+        out=out,
     )
     views = layout.bind(workspace_buffer)
     metadata_plan = _prepare_prims_ts_qsa_metadata_plan(
@@ -1434,11 +1546,11 @@ def prepare_prims_ts_qsa_attention(
         token_to_request,
         query_positions,
         views.metadata_scratch_buffer,
-        views.qsa_page_indptr,
-        views.qsa_page_indices,
+        views.qsa_block_table,
         views.seq_lens,
         group_size=group_size,
         storage_page_size=int(k_cache.shape[2]),
+        sparse_block_size=sparse_block_size,
         qo_indptr=qo_indptr,
     )
     from .decode import _prepare_prims_ts_batch_decode_plan, _validate_scale
@@ -1452,8 +1564,7 @@ def prepare_prims_ts_qsa_attention(
         attention_query,
         paged_kv_cache,
         views.attention_workspace_buffer,
-        views.qsa_page_indptr,
-        views.qsa_page_indices,
+        views.qsa_block_table,
         views.seq_lens,
         layout.max_seq_len,
         out=attention_out,
@@ -1464,7 +1575,7 @@ def prepare_prims_ts_qsa_attention(
         mask_type="causal",
         window_left=-1,
         kv_layout="HND",
-        page_size=_QSA_PAGE_SIZE,
+        page_size=sparse_block_size,
         use_qsa_route=True,
     )
     if prepared_attention_out is not attention_out:
@@ -1499,16 +1610,18 @@ def prims_ts_qsa_attention(
     out_dtype: Optional[torch.dtype] = None,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
+    sparse_block_size: int = 4,
 ) -> torch.Tensor:
-    """Build compact page metadata and launch QSA from one byte workspace.
+    """Build compact sparse-block metadata and launch QSA from one byte workspace.
 
     Packed Q/O use ``[num_query_tokens, Hq, D]``; ``qo_indptr`` supplies
     request-safe route boundaries and ``max_seq_len_q`` supplies their maximum
     length. Fixed Q/O use ``[B, Nq, G, Hq, D]`` without ``qo_indptr``.
 
     All semantic input tensors remain explicit. The workspace internally owns
-    CSR metadata outputs and disjoint metadata/attention scratch regions. This
-    is an eager convenience that performs preparation on every call. Repeated
+    the dense route table, compact sequence lengths, and disjoint
+    metadata/attention scratch regions. This is an eager convenience that
+    performs preparation on every call. Repeated
     launches and CUDA graphs should use :func:`prepare_prims_ts_qsa_attention`,
     run the prepared plan once before capture, and retain stable input, output,
     and workspace addresses through replay.
@@ -1518,23 +1631,13 @@ def prims_ts_qsa_attention(
     checks only the tensor's structural contract so it can remain
     synchronization-free; callers retain responsibility for valid route values
     and stable storage throughout a launch or CUDA-graph replay.
+
+    ``sparse_block_size`` defaults to four and is reserved for kernel
+    specialization. Other positive power-of-two sizes are not implemented.
     """
 
-    if (
-        not isinstance(paged_kv_cache, tuple)
-        or len(paged_kv_cache) != 2
-        or not all(isinstance(cache, torch.Tensor) for cache in paged_kv_cache)
-    ):
-        raise TypeError("paged_kv_cache must be a (k_cache, v_cache) tuple")
-    k_cache, v_cache = paged_kv_cache
-    if (
-        v_cache.shape != k_cache.shape
-        or v_cache.device != k_cache.device
-        or v_cache.dtype != k_cache.dtype
-    ):
-        raise ValueError(
-            "K and V cache tensors must have matching shapes, devices, and dtypes"
-        )
+    sparse_block_size = _validate_sparse_block_size(sparse_block_size)
+    k_cache, v_cache = _validate_qsa_paged_kv_cache(paged_kv_cache)
     if not isinstance(block_indices, torch.Tensor) or block_indices.ndim != 2:
         raise ValueError("block_indices must be a rank-two tensor")
     if out is not None and not isinstance(out, torch.Tensor):
@@ -1549,6 +1652,7 @@ def prims_ts_qsa_attention(
         out_dtype=out_dtype,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
+        sparse_block_size=sparse_block_size,
     )
     use_packed_q = qo_indptr is not None
     fixed_query_group_size = None
@@ -1560,8 +1664,6 @@ def prims_ts_qsa_attention(
         attention_query = query
         attention_out = out
     elif query.ndim == 5:
-        if query.shape[2] not in (1, 2, 4, 5):
-            raise ValueError("fixed QSA group size must be one, two, four, or five")
         if out is not None and out.shape != query.shape:
             raise ValueError("fixed QSA output must have the same shape as query")
         if not query.is_contiguous() or (out is not None and not out.is_contiguous()):
@@ -1576,10 +1678,31 @@ def prims_ts_qsa_attention(
     else:
         raise ValueError(
             "query must be packed [total_q,Hq,D] with qo_indptr or fixed "
-            "[B,Nq,1|2|4|5,Hq,D] without qo_indptr"
+            "[B,Nq,G,Hq,D] without qo_indptr"
         )
     if block_indices.shape[0] != num_query_tokens:
         raise ValueError("block_indices must have one row per flattened query token")
+    _validate_inputs(
+        block_indices,
+        block_table,
+        token_to_request,
+        query_positions,
+        group_size,
+        int(k_cache.shape[2]),
+        sparse_block_size,
+    )
+    _validate_qsa_workspace_aliasing(
+        workspace_buffer,
+        query=query,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        block_indices=block_indices,
+        block_table=block_table,
+        token_to_request=token_to_request,
+        query_positions=query_positions,
+        qo_indptr=qo_indptr,
+        out=out,
+    )
     views = layout.bind(workspace_buffer)
 
     # Keep metadata -> attention stream ordered until the complete dependency
@@ -1592,8 +1715,9 @@ def prims_ts_qsa_attention(
         views.metadata_scratch_buffer,
         group_size=group_size,
         storage_page_size=k_cache.shape[2],
+        sparse_block_size=sparse_block_size,
         qo_indptr=qo_indptr,
-        out=(views.qsa_page_indptr, views.qsa_page_indices, views.seq_lens),
+        out=(views.qsa_block_table, views.seq_lens),
     )
 
     from .decode import _prepare_prims_ts_batch_decode_plan
@@ -1602,8 +1726,7 @@ def prims_ts_qsa_attention(
         attention_query,
         paged_kv_cache,
         views.attention_workspace_buffer,
-        views.qsa_page_indptr,
-        views.qsa_page_indices,
+        views.qsa_block_table,
         views.seq_lens,
         layout.max_seq_len,
         seq_len_q=group_size,
@@ -1614,7 +1737,7 @@ def prims_ts_qsa_attention(
         mask_type="causal",
         window_left=-1,
         kv_layout="HND",
-        page_size=_QSA_PAGE_SIZE,
+        page_size=sparse_block_size,
         use_qsa_route=True,
     )
     result = attention_plan.run(
@@ -1647,8 +1770,9 @@ def _validate_shape_parameters(
         raise ValueError("num_query_tokens must be nonnegative")
     if block_topk <= 0:
         raise ValueError("block_topk must be positive")
-    if group_size not in (1, 2, 4, 5):
-        raise ValueError("group_size must be one, two, four, or five")
+    from .decode import _validate_prims_ts_qsa_group_value
+
+    _validate_prims_ts_qsa_group_value(group_size)
 
 
 def _resolve_num_query_groups(
@@ -1704,11 +1828,30 @@ def _validate_qsa_qo_indptr_tensor(
         )
 
 
-def _validate_storage_page_size(storage_page_size: int) -> None:
+def _validate_sparse_block_size(sparse_block_size: int) -> int:
+    """Validate the generic sparse-block API and current specialization."""
+
+    if not isinstance(sparse_block_size, int) or isinstance(sparse_block_size, bool):
+        raise TypeError("sparse_block_size must be an integer")
+    if sparse_block_size <= 0 or sparse_block_size & (sparse_block_size - 1):
+        raise ValueError("sparse_block_size must be a positive power of two")
+    if sparse_block_size != _QSA_SUPPORTED_SPARSE_BLOCK_SIZE:
+        raise NotImplementedError(
+            "PrimTS QSA currently supports only sparse_block_size=4"
+        )
+    return sparse_block_size
+
+
+def _validate_storage_page_size(
+    storage_page_size: int,
+    sparse_block_size: int,
+) -> None:
     if not isinstance(storage_page_size, int) or isinstance(storage_page_size, bool):
         raise TypeError("storage_page_size must be an integer")
-    if storage_page_size < _QSA_PAGE_SIZE or storage_page_size % _QSA_PAGE_SIZE:
-        raise ValueError("storage_page_size must be a positive multiple of four")
+    if storage_page_size < sparse_block_size or storage_page_size % sparse_block_size:
+        raise ValueError(
+            "storage_page_size must be a positive multiple of sparse_block_size"
+        )
 
 
 def _align_up_qsa_workspace(value: int) -> int:
@@ -1726,14 +1869,24 @@ def _validate_inputs(
     query_positions: torch.Tensor,
     group_size: int,
     storage_page_size: int,
+    sparse_block_size: int,
 ) -> None:
+    sparse_block_size = _validate_sparse_block_size(sparse_block_size)
+    for name, tensor in (
+        ("block_indices", block_indices),
+        ("block_table", block_table),
+        ("token_to_request", token_to_request),
+        ("query_positions", query_positions),
+    ):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
     if not block_indices.is_cuda:
         raise ValueError("QSA metadata inputs must be CUDA tensors")
     if block_indices.ndim != 2 or block_indices.dtype != torch.int32:
         raise ValueError("block_indices must be a rank-two int32 tensor")
     rows, block_topk = block_indices.shape
     _validate_shape_parameters(rows, block_topk, group_size)
-    _validate_storage_page_size(storage_page_size)
+    _validate_storage_page_size(storage_page_size, sparse_block_size)
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
         raise ValueError("block_table must be a nonempty rank-two int32 tensor")
     if not all(block_table.shape):
@@ -1797,7 +1950,7 @@ def _validate_qsa_attention_workspace(
 
 __all__ = [
     "PrimsTSQSAPlan",
-    "build_prims_ts_qsa_page4_metadata",
+    "build_prims_ts_qsa_metadata",
     "get_prims_ts_qsa_metadata_output_shapes",
     "get_prims_ts_qsa_metadata_workspace_size",
     "get_prims_ts_qsa_workspace_size",

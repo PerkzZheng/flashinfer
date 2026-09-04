@@ -24,7 +24,7 @@ the backend column indicates which kernel the API wraps.
 | ``single_decode``               | single request    | contiguous                | none                    | decode  | any (no plan)   |
 | ``single_prefill``              | single request    | contiguous                | none                    | prefill | any (no plan)   |
 | ``gqa_paged_decode``            | batched, ragged   | paged tuple (k, v)        | kv_indptr + kv_indices  | decode  | FA2/FA3/cuDNN   |
-| ``prims_ts_batch_decode``       | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
+| ``prims_ts_batch_decode``       | batched, ragged   | paged HND tuple/combined  | block table + seq/qo    | decode  | PrimTS SM100/SM103 |
 | ``gqa_paged_prefill``           | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
 | ``gqa_ragged``                  | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
 | ``prims_ts_block_sparse``       | batched, fixed    | contiguous BSHD           | per-KV-head BSR + bits  | both    | PrimTS SM100a   |
@@ -512,21 +512,81 @@ def _add_fmha_cache_schema(inputs, axes, *, cache_param: str, combined: bool):
                 "num_pages",
                 "kv_planes",
                 "num_kv_heads",
-                "page_size",
+                "storage_page_size",
                 "head_dim",
             ]
         )
         return
     inputs["k_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+        ["num_pages", "num_kv_heads", "storage_page_size", "head_dim"],
         param=cache_param,
         tuple_idx=0,
     )
     inputs["v_cache"] = Tensor(
-        ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+        ["num_pages", "num_kv_heads", "storage_page_size", "head_dim"],
         param=cache_param,
         tuple_idx=1,
     )
+
+
+def _fmha_cache_storage_page_size(cache) -> int | None:
+    """Return the physical token extent of an HND paged-KV cache."""
+
+    if isinstance(cache, torch.Tensor):
+        return int(cache.shape[-2]) if cache.ndim >= 2 else None
+    if isinstance(cache, (tuple, list)) and cache:
+        first_cache = cache[0]
+        if isinstance(first_cache, torch.Tensor) and first_cache.ndim >= 2:
+            return int(first_cache.shape[-2])
+    return None
+
+
+def _fmha_uses_encoded_page_size(kwargs, *, cache_param: str) -> bool:
+    """Whether an explicit semantic page size differs from cache storage."""
+
+    semantic_page_size = kwargs.get("page_size")
+    if semantic_page_size is None:
+        return False
+    if isinstance(semantic_page_size, bool) or not isinstance(semantic_page_size, int):
+        raise TypeError("page_size must be an integer when tracing PrimTS decode")
+    storage_page_size = _fmha_cache_storage_page_size(kwargs.get(cache_param))
+    if storage_page_size is None:
+        raise ValueError(
+            "Tracing an explicit PrimTS page_size requires a paged KV cache "
+            "whose physical storage extent can be inspected."
+        )
+    if semantic_page_size == storage_page_size:
+        return False
+    if semantic_page_size != 4:
+        raise ValueError(
+            "A PrimTS page_size that differs from the physical cache extent "
+            "must be 4 (encoded subpage locators)."
+        )
+    return True
+
+
+def _add_fmha_semantic_page_schema(
+    axes, inputs, *, encoded_page_size: bool, expose_api_input: bool
+) -> str:
+    """Add encoded-page metadata and return the logical page-size axis name."""
+
+    if not encoded_page_size:
+        return "storage_page_size"
+    axes["page_size"] = Const(
+        abbrev="sps",
+        value=4,
+        description="Semantic block-table page size for encoded subpage locators.",
+    )
+    if expose_api_input:
+        inputs["semantic_page_size"] = Scalar(
+            "int32",
+            param="page_size",
+            description=(
+                "Semantic block-table page size passed to the API; fixed to 4 "
+                "when locators address subpages of larger physical cache pages."
+            ),
+        )
+    return "page_size"
 
 
 def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str):
@@ -561,8 +621,17 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str):
     return isinstance(kwargs.get(cache_param), torch.Tensor), fp16_output, q_mode
 
 
-def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: str):
+def _make_attention_ts_decode_trace(
+    *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: bool
+):
     cache_form = "combined" if combined else "tuple"
+    page_suffix = "_encoded_page4" if encoded_page_size else ""
+    page_description = (
+        "Block-table locators address semantic four-token subpages of larger "
+        "physical cache pages. "
+        if encoded_page_size
+        else "The block-table page size equals the physical cache extent. "
+    )
     output_suffix = "_fp16_output" if fp16_output else ""
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
@@ -571,20 +640,23 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
         "num_pages": Var(description="Physical KV-cache page capacity."),
-        "page_size": Const(abbrev="ps"),
-        "len_indptr": Var(description="Length of the native CSR indptr."),
-        "num_kv_indices": Var(description="Number of referenced page IDs."),
+        "storage_page_size": Const(
+            abbrev="ps", description="Physical token extent of each KV-cache page."
+        ),
+        "max_num_pages": Var(description="Block-table column capacity."),
         "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     inputs: dict[str, Tensor | Scalar] = {"q": Tensor(q_shape)}
     _add_fmha_cache_schema(
         inputs, axes, cache_param="paged_kv_cache", combined=combined
     )
+    logical_page_size = _add_fmha_semantic_page_schema(
+        axes, inputs, encoded_page_size=encoded_page_size, expose_api_input=True
+    )
     inputs.update(
         {
-            "paged_kv_indptr": Tensor(["len_indptr"], dtype="int32"),
-            "paged_kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
-            "paged_kv_last_page_len": Tensor(["batch_size"], dtype="int32"),
+            "block_table": Tensor(["batch_size", "max_num_pages"], dtype="int32"),
+            "seq_lens": Tensor(["batch_size"], dtype="int32"),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"], dtype="int32", optional=q_mode != _Q_PACKED
             ),
@@ -600,8 +672,16 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
     )
     constraints = [
         "head_dim in (64, 128, 256)",
-        "page_size in (16, 32, 64, 128)",
-        "len_indptr == batch_size + 1",
+        *(
+            [
+                "storage_page_size > page_size",
+                "storage_page_size % page_size == 0",
+            ]
+            if encoded_page_size
+            else ["storage_page_size in (4, 16, 32, 64, 128)"]
+        ),
+        "min(seq_lens) >= 1",
+        f"max(seq_lens) <= max_num_pages * {logical_page_size}",
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "window_left == -1 or mask_type == 'causal'",
@@ -623,10 +703,13 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
         constraints.append("seq_len_q == 1")
     return TraceTemplate(
         op_type="gqa_paged",
-        name_prefix=f"attention_ts_decode_{cache_form}{output_suffix}{q_suffix}",
+        name_prefix=(
+            f"attention_ts_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}"
+        ),
         description=(
-            "One-shot PrimTS GQA decode over FlashInfer native CSR paged KV "
-            f"metadata using the {cache_form} HND cache form. Fixed multi-Q "
+            "One-shot PrimTS GQA decode over dense block-table metadata with "
+            f"explicit sequence lengths using the {cache_form} HND cache form. "
+            f"{page_description}Fixed multi-Q "
             "uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative "
             "qo_indptr offsets."
         ),
@@ -646,19 +729,31 @@ def _make_attention_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode
 
 
 _ATTENTION_TS_DECODE_TRACES = {
-    (combined, fp16_output, q_mode): _make_attention_ts_decode_trace(
-        combined=combined, fp16_output=fp16_output, q_mode=q_mode
+    (
+        combined,
+        fp16_output,
+        q_mode,
+        encoded_page_size,
+    ): _make_attention_ts_decode_trace(
+        combined=combined,
+        fp16_output=fp16_output,
+        q_mode=q_mode,
+        encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
     for fp16_output in (False, True)
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
+    for encoded_page_size in (False, True)
 }
 
 
 def attention_ts_decode_trace_dispatch(**kwargs):
     """Select one-shot FMHA storage, cache, and output-dtype schema."""
 
-    key = _fmha_trace_variant(kwargs, query_param="q", cache_param="paged_kv_cache")
+    key = (
+        *_fmha_trace_variant(kwargs, query_param="q", cache_param="paged_kv_cache"),
+        _fmha_uses_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
+    )
     return _ATTENTION_TS_DECODE_TRACES[key]
 
 
@@ -667,8 +762,17 @@ attention_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-define
 )
 
 
-def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: str):
+def _make_prims_ts_decode_trace(
+    *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: bool
+):
     cache_form = "combined" if combined else "tuple"
+    page_suffix = "_encoded_page4" if encoded_page_size else ""
+    page_description = (
+        "Block-table locators address semantic four-token subpages of larger "
+        "physical cache pages. "
+        if encoded_page_size
+        else "The block-table page size equals the physical cache extent. "
+    )
     output_suffix = "_fp16_output" if fp16_output else ""
     q_axes, query_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
@@ -677,10 +781,11 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
         "num_pages": Var(description="Physical KV-cache page capacity."),
-        "page_size": Const(abbrev="ps"),
+        "storage_page_size": Const(
+            abbrev="ps", description="Physical token extent of each KV-cache page."
+        ),
         "workspace_size": Var(description="Caller workspace size in bytes."),
-        "len_indptr": Var(description="Length of the native CSR indptr."),
-        "num_kv_indices": Var(description="Number of referenced page IDs."),
+        "max_num_pages": Var(description="Block-table column capacity."),
         "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
         "max_seq_len": Const(
             abbrev="s", description="Exact compiled maximum KV sequence length."
@@ -692,6 +797,13 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         )
     inputs: dict[str, Tensor | Scalar] = {"query": Tensor(query_shape)}
     _add_fmha_cache_schema(inputs, axes, cache_param="kv_cache", combined=combined)
+    logical_page_size = _add_fmha_semantic_page_schema(
+        axes, inputs, encoded_page_size=encoded_page_size, expose_api_input=True
+    )
+    page_capacity_constraint = (
+        f"(max_seq_len + {logical_page_size} - 1) // "
+        f"{logical_page_size} <= max_num_pages"
+    )
     inputs.update(
         {
             "workspace_buffer": Tensor(
@@ -699,8 +811,7 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
                 dtype="uint8",
                 description="Exclusive caller-owned int8/uint8 scratch buffer.",
             ),
-            "paged_kv_indptr": Tensor(["len_indptr"], dtype="int32"),
-            "paged_kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
+            "block_table": Tensor(["batch_size", "max_num_pages"], dtype="int32"),
             "seq_lens": Tensor(["batch_size"], dtype="int32"),
             "max_seq_len": Scalar("int32"),
             "seq_len_q": Scalar("int32", optional=True),
@@ -718,8 +829,17 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
     )
     constraints = [
         "head_dim in (64, 128, 256)",
-        "page_size in (16, 32, 64, 128)",
-        "len_indptr == batch_size + 1",
+        *(
+            [
+                "storage_page_size > page_size",
+                "storage_page_size % page_size == 0",
+            ]
+            if encoded_page_size
+            else ["storage_page_size in (4, 16, 32, 64, 128)"]
+        ),
+        "min(seq_lens) >= 1",
+        "max(seq_lens) <= max_seq_len",
+        page_capacity_constraint,
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "kv_layout == 'HND'",
@@ -741,12 +861,15 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
         constraints.append("seq_len_q == 1")
     return TraceTemplate(
         op_type="gqa_paged",
-        name_prefix=f"prims_ts_batch_decode_{cache_form}{output_suffix}{q_suffix}",
+        name_prefix=(
+            f"prims_ts_batch_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}"
+        ),
         description=(
-            "Standalone PrimTS GQA decode over FlashInfer native CSR page "
-            f"metadata using the {cache_form} HND cache form and caller-owned "
-            "workspace. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses "
-            "[total_q,Hq,D] with cumulative qo_indptr offsets."
+            "Standalone PrimTS GQA decode over dense block-table metadata with "
+            f"explicit sequence lengths using the {cache_form} HND cache form and "
+            f"caller-owned workspace. {page_description}Fixed multi-Q uses "
+            "[B,SQ,Hq,D]; packed Q "
+            "uses [total_q,Hq,D] with cumulative qo_indptr offsets."
         ),
         axes=axes,
         inputs=inputs,
@@ -764,19 +887,31 @@ def _make_prims_ts_decode_trace(*, combined: bool, fp16_output: bool, q_mode: st
 
 
 _PRIMS_TS_DECODE_TRACES = {
-    (combined, fp16_output, q_mode): _make_prims_ts_decode_trace(
-        combined=combined, fp16_output=fp16_output, q_mode=q_mode
+    (
+        combined,
+        fp16_output,
+        q_mode,
+        encoded_page_size,
+    ): _make_prims_ts_decode_trace(
+        combined=combined,
+        fp16_output=fp16_output,
+        q_mode=q_mode,
+        encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
     for fp16_output in (False, True)
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
+    for encoded_page_size in (False, True)
 }
 
 
 def prims_ts_decode_trace_dispatch(**kwargs):
     """Select standalone FMHA storage, cache, and output-dtype schema."""
 
-    key = _fmha_trace_variant(kwargs, query_param="query", cache_param="kv_cache")
+    key = (
+        *_fmha_trace_variant(kwargs, query_param="query", cache_param="kv_cache"),
+        _fmha_uses_encoded_page_size(kwargs, cache_param="kv_cache"),
+    )
     return _PRIMS_TS_DECODE_TRACES[key]
 
 
@@ -786,11 +921,18 @@ prims_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-defined]
 
 
 def _make_prims_ts_decode_wrapper_trace(
-    *, combined: bool, fp16_output: bool, q_mode: str
+    *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: bool
 ):
     """Describe ``BatchDecodePagedTSWrapper.run`` and its plan-owned metadata."""
 
     cache_form = "combined" if combined else "tuple"
+    page_suffix = "_encoded_page4" if encoded_page_size else ""
+    page_description = (
+        "The plan uses encoded semantic page-4 locators over larger physical "
+        "cache pages."
+        if encoded_page_size
+        else "The planned page size equals the physical cache extent."
+    )
     output_suffix = "_fp16_output" if fp16_output else ""
     q_axes, q_shape, output_shape, q_suffix = _fmha_q_schema(q_mode)
     axes: dict[str, Var | Const] = {
@@ -799,12 +941,17 @@ def _make_prims_ts_decode_wrapper_trace(
         "num_kv_heads": Const(abbrev="kv"),
         "head_dim": Const(abbrev="d"),
         "num_pages": Var(description="Physical KV-cache page capacity."),
-        "page_size": Const(abbrev="ps"),
+        "storage_page_size": Const(
+            abbrev="ps", description="Physical token extent of each KV-cache page."
+        ),
         "len_qo_indptr": Var(description="Length of plan-owned cumulative Q offsets."),
     }
     inputs: dict[str, Tensor | Scalar] = {"q": Tensor(q_shape)}
     _add_fmha_cache_schema(
         inputs, axes, cache_param="paged_kv_cache", combined=combined
+    )
+    _add_fmha_semantic_page_schema(
+        axes, inputs, encoded_page_size=encoded_page_size, expose_api_input=False
     )
     inputs.update(
         {
@@ -826,7 +973,14 @@ def _make_prims_ts_decode_wrapper_trace(
     )
     constraints = [
         "head_dim in (64, 128, 256)",
-        "page_size in (16, 32, 64, 128)",
+        *(
+            [
+                "storage_page_size > page_size",
+                "storage_page_size % page_size == 0",
+            ]
+            if encoded_page_size
+            else ["storage_page_size in (4, 16, 32, 64, 128)"]
+        ),
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "window_left == -1 or mask_type == 'causal'",
@@ -842,11 +996,15 @@ def _make_prims_ts_decode_wrapper_trace(
         constraints.append("seq_len_q >= 2")
     return TraceTemplate(
         op_type="gqa_paged",
-        name_prefix=f"prims_ts_decode_wrapper_{cache_form}{output_suffix}{q_suffix}",
+        name_prefix=(
+            f"prims_ts_decode_wrapper_{cache_form}{page_suffix}"
+            f"{output_suffix}{q_suffix}"
+        ),
         description=(
-            "Reusable PrimTS GQA decode wrapper. Native CSR metadata, Q offsets, "
-            "mask, window, and static bounds are retained by plan(); run() receives "
-            "only Q, the HND cache, scales, and an optional output buffer."
+            "Reusable PrimTS GQA decode wrapper. The dense block table, sequence "
+            "lengths, Q offsets, mask, window, and static bounds are retained by "
+            "plan(); run() receives only Q, the HND cache, scales, and an optional "
+            f"output buffer. {page_description}"
         ),
         axes=axes,
         inputs=inputs,
@@ -864,12 +1022,21 @@ def _make_prims_ts_decode_wrapper_trace(
 
 
 _PRIMS_TS_DECODE_WRAPPER_TRACES = {
-    (combined, fp16_output, q_mode): _make_prims_ts_decode_wrapper_trace(
-        combined=combined, fp16_output=fp16_output, q_mode=q_mode
+    (
+        combined,
+        fp16_output,
+        q_mode,
+        encoded_page_size,
+    ): _make_prims_ts_decode_wrapper_trace(
+        combined=combined,
+        fp16_output=fp16_output,
+        q_mode=q_mode,
+        encoded_page_size=encoded_page_size,
     )
     for combined in (False, True)
     for fp16_output in (False, True)
     for q_mode in (_Q_FIXED_ONE, _Q_FIXED_MULTI, _Q_PACKED)
+    for encoded_page_size in (False, True)
 }
 
 
@@ -890,7 +1057,33 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
     )
     if bool(getattr(wrapper, "_use_packed_q", False)):
         q_mode = _Q_PACKED
-    return _PRIMS_TS_DECODE_WRAPPER_TRACES[(combined, fp16_output, q_mode)]
+    page_size = getattr(wrapper, "_page_size", None)
+    storage_page_size = getattr(wrapper, "_storage_page_size", None)
+    if not isinstance(page_size, int) or not isinstance(storage_page_size, int):
+        raise RuntimeError(
+            "Tracing BatchDecodePagedTSWrapper.run requires page-size plan state."
+        )
+    runtime_storage_page_size = _fmha_cache_storage_page_size(
+        kwargs.get("paged_kv_cache")
+    )
+    if runtime_storage_page_size is None:
+        raise ValueError(
+            "Tracing BatchDecodePagedTSWrapper.run requires a paged KV cache "
+            "whose physical storage extent can be inspected."
+        )
+    if runtime_storage_page_size != storage_page_size:
+        raise ValueError(
+            "The runtime KV-cache storage page size does not match the wrapper "
+            f"plan: expected {storage_page_size}, got {runtime_storage_page_size}."
+        )
+    encoded_page_size = page_size != storage_page_size
+    if encoded_page_size and page_size != 4:
+        raise RuntimeError(
+            "Invalid wrapper plan state: encoded subpage locators require page_size=4."
+        )
+    return _PRIMS_TS_DECODE_WRAPPER_TRACES[
+        (combined, fp16_output, q_mode, encoded_page_size)
+    ]
 
 
 prims_ts_decode_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]

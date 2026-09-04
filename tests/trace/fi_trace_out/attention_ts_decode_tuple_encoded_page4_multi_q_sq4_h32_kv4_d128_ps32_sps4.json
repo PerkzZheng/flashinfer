@@ -1,6 +1,6 @@
 {
-  "name": "attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32",
-  "description": "One-shot PrimTS GQA decode over FlashInfer native CSR paged KV metadata using the tuple HND cache form. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
+  "name": "attention_ts_decode_tuple_encoded_page4_multi_q_sq4_h32_kv4_d128_ps32_sps4",
+  "description": "One-shot PrimTS GQA decode over dense block-table metadata with explicit sequence lengths using the tuple HND cache form. Block-table locators address semantic four-token subpages of larger physical cache pages. Fixed multi-Q uses [B,SQ,Hq,D]; packed Q uses [total_q,Hq,D] with cumulative qo_indptr offsets.",
   "op_type": "gqa_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.decode.batch_decode_with_paged_kv_cache",
@@ -34,27 +34,31 @@
       "type": "var",
       "description": "Physical KV-cache page capacity."
     },
-    "page_size": {
+    "storage_page_size": {
       "type": "const",
-      "value": 32
+      "value": 32,
+      "description": "Physical token extent of each KV-cache page."
     },
-    "len_indptr": {
+    "max_num_pages": {
       "type": "var",
-      "description": "Length of the native CSR indptr."
-    },
-    "num_kv_indices": {
-      "type": "var",
-      "description": "Number of referenced page IDs."
+      "description": "Block-table column capacity."
     },
     "len_qo_indptr": {
       "type": "var",
       "description": "Length of cumulative Q offsets."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 4,
+      "description": "Semantic block-table page size for encoded subpage locators."
     }
   },
   "constraints": [
     "head_dim in (64, 128, 256)",
-    "page_size in (16, 32, 64, 128)",
-    "len_indptr == batch_size + 1",
+    "storage_page_size > page_size",
+    "storage_page_size % page_size == 0",
+    "min(seq_lens) >= 1",
+    "max(seq_lens) <= max_num_pages * page_size",
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 32",
     "window_left == -1 or mask_type == 'causal'",
@@ -75,7 +79,7 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
@@ -84,24 +88,24 @@
       "shape": [
         "num_pages",
         "num_kv_heads",
-        "page_size",
+        "storage_page_size",
         "head_dim"
       ],
       "dtype": "bfloat16"
     },
-    "paged_kv_indptr": {
+    "semantic_page_size": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Semantic block-table page size passed to the API; fixed to 4 when locators address subpages of larger physical cache pages."
+    },
+    "block_table": {
       "shape": [
-        "len_indptr"
+        "batch_size",
+        "max_num_pages"
       ],
       "dtype": "int32"
     },
-    "paged_kv_indices": {
-      "shape": [
-        "num_kv_indices"
-      ],
-      "dtype": "int32"
-    },
-    "paged_kv_last_page_len": {
+    "seq_lens": {
       "shape": [
         "batch_size"
       ],

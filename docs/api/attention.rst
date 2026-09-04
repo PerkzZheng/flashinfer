@@ -54,6 +54,29 @@ FMHA Decode
 
     .. automethod:: __init__
 
+QSA Sparse-Block Attention
+--------------------------
+
+QSA accepts packed prefill queries or fixed grouped decode queries over a
+dense paged-cache block table. The production specialization is causal and
+non-windowed. ``sparse_block_size`` is a power-of-two public parameter, with
+block size 4 as the only implementation currently available.
+
+.. autosummary::
+    :toctree: ../generated
+
+    validate_prims_ts_qsa_group_size
+    make_prims_ts_qsa_qo_indptr
+    get_prims_ts_qsa_workspace_size
+    prepare_prims_ts_qsa_attention
+    prims_ts_qsa_attention
+    get_prims_ts_qsa_metadata_output_shapes
+    get_prims_ts_qsa_metadata_workspace_size
+    build_prims_ts_qsa_metadata
+
+.. autoclass:: PrimsTSQSAPlan
+    :members:
+
 Block-Sparse FMHA
 -----------------
 

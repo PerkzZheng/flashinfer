@@ -148,7 +148,7 @@ def _warn_deprecated_plan_positional_args(api_name: str) -> None:
 _PRIMS_TS_QSA_METADATA_LAZY_EXPORTS = frozenset(
     {
         "PrimsTSQSAPlan",
-        "build_prims_ts_qsa_page4_metadata",
+        "build_prims_ts_qsa_metadata",
         "get_prims_ts_qsa_metadata_output_shapes",
         "get_prims_ts_qsa_metadata_workspace_size",
         "get_prims_ts_qsa_workspace_size",

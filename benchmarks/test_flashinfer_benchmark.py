@@ -466,9 +466,9 @@ def test_prims_ts_fmha_decode_sq_gt_one_adapter_contract(
     assert wrapper.constructor_call == (("HND",), {})
     assert len(wrapper.plan_calls) == len(wrapper.run_calls) == 1
     plan_args, plan_kwargs = wrapper.plan_calls[0]
-    assert plan_args[0].tolist() == [0, 1, 2]
-    assert plan_args[2].tolist() == [16, 16]
-    assert plan_args[3:] == (2, 1, 128, 16)
+    assert plan_args[0].tolist() == [[0], [1]]
+    assert plan_args[1].tolist() == [16, 16]
+    assert plan_args[2:] == (2, 1, 128, 16)
     assert plan_kwargs == {
         "seq_len_q": 3,
         "q_data_type": torch.bfloat16,

@@ -131,6 +131,7 @@ def assert_template_axes_covered(
     2. A scalar input whose key matches the axis name (scalar-kwarg fallback), OR
     3. A parameter of *func* matching the axis name (scalar-kwarg fallback for
        integer function arguments like ``top_k``, ``n_group``, ``block_size``).
+    4. A fixed ``Const(value=...)`` that needs no runtime source.
     """
     tensor_dim_names: set = set()
     scalar_keys: set = set()
@@ -150,6 +151,7 @@ def assert_template_axes_covered(
         name
         for name, marker in template.axes.items()
         if isinstance(marker, Const)
+        and marker.value is None
         and name not in tensor_dim_names
         and name not in scalar_keys
         and name not in func_param_names
@@ -162,7 +164,7 @@ def assert_template_axes_covered(
     )
 
 
-_ALLOWED_CONSTRAINT_BUILTINS = {"max"}
+_ALLOWED_CONSTRAINT_BUILTINS = {"max", "min"}
 
 
 def assert_template_constraints_valid(
@@ -369,15 +371,15 @@ _EXPECTED_PRIMTS_TRACE_VARIANTS = {
     (
         "flashinfer.attention.prims_ts.decode",
         "batch_decode_with_paged_kv_cache",
-    ): 12,
+    ): 24,
     (
         "flashinfer.attention.prims_ts.decode",
         "prims_ts_batch_decode_with_kv_cache",
-    ): 12,
+    ): 24,
     (
         "flashinfer.attention.prims_ts.decode",
         "BatchDecodePagedTSWrapper.run",
-    ): 12,
+    ): 24,
     (
         "flashinfer.attention.prims_ts.mla_decode",
         "batch_decode_mla_with_paged_kv_cache",
@@ -419,7 +421,7 @@ def test_attention_ts_trace_registry_coverage():
         if func.__module__.startswith("flashinfer.attention.prims_ts")
     )
     assert discovered == Counter(_EXPECTED_PRIMTS_TRACE_VARIANTS)
-    assert sum(discovered.values()) == 51
+    assert sum(discovered.values()) == 87
 
 
 def test_attention_ts_trace_constraints_match_cache_axes():
@@ -466,6 +468,39 @@ def test_attention_ts_trace_constraints_match_cache_axes():
                 assert "seq_len_q >= 2" in template.constraints
             assert "seq_len_q in (2, 4, 8)" not in template.constraints
             assert "max_seq_len <= 16384" not in template.constraints
+    for dispatch in (
+        attention_ts_decode_trace_dispatch,
+        prims_ts_decode_trace_dispatch,
+    ):
+        for template in dispatch.templates:
+            encoded_page_size = "_encoded_page4" in template.name_prefix
+            assert template.inputs["block_table"].dim_names == [
+                "batch_size",
+                "max_num_pages",
+            ]
+            assert template.inputs["seq_lens"].dim_names == ["batch_size"]
+            assert ("page_size" in template.axes) == encoded_page_size
+            assert ("semantic_page_size" in template.inputs) == encoded_page_size
+            if encoded_page_size:
+                assert template.axes["page_size"].value == 4
+                assert template.inputs["semantic_page_size"].param == "page_size"
+                assert template.inputs["semantic_page_size"].optional is False
+            for cache_name in (
+                "paged_kv_cache",
+                "k_cache",
+                "v_cache",
+            ):
+                if cache_name in template.inputs:
+                    assert "storage_page_size" in template.inputs[cache_name].dim_names
+                    assert "page_size" not in template.inputs[cache_name].dim_names
+            assert (
+                not {
+                    "paged_kv_indptr",
+                    "paged_kv_indices",
+                    "paged_kv_last_page_len",
+                }
+                & template.inputs.keys()
+            )
     for dispatch in mla_dispatches:
         for template in dispatch.templates:
             assert ("kv_pad_dim == 1" in template.constraints) == (
@@ -561,23 +596,17 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         num_pages, num_kv_heads, page_size, head_dim, dtype=torch.bfloat16
     )
     v_cache = torch.empty_like(k_cache)
-    kv_indptr = torch.arange(
-        0,
-        num_pages + 1,
-        pages_per_request,
-        dtype=torch.int32,
+    block_table = torch.arange(num_pages, dtype=torch.int32).reshape(
+        batch_size, pages_per_request
     )
-    kv_indices = torch.arange(num_pages, dtype=torch.int32)
-    last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
     seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32)
     workspace = torch.empty(4096, dtype=torch.uint8)
 
     fmha_kwargs = {
         "q": q,
         "paged_kv_cache": (k_cache, v_cache),
-        "paged_kv_indptr": kv_indptr,
-        "paged_kv_indices": kv_indices,
-        "paged_kv_last_page_len": last_page_len,
+        "block_table": block_table,
+        "seq_lens": seq_lens,
         "seq_len_q": seq_len_q,
         "mask_type": "causal",
     }
@@ -585,8 +614,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         "query": q,
         "kv_cache": (k_cache, v_cache),
         "workspace_buffer": workspace,
-        "paged_kv_indptr": kv_indptr,
-        "paged_kv_indices": kv_indices,
+        "block_table": block_table,
         "seq_lens": seq_lens,
         "max_seq_len": seq_len_k,
         "seq_len_q": seq_len_q,
@@ -598,6 +626,8 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     fmha_wrapper._planned = True
     fmha_wrapper._use_packed_q = False
     fmha_wrapper._output_dtype = torch.bfloat16
+    fmha_wrapper._page_size = page_size
+    fmha_wrapper._storage_page_size = page_size
     fmha_definitions = (
         batch_decode_with_paged_kv_cache.fi_trace(**fmha_kwargs),
         prims_ts_batch_decode_with_kv_cache.fi_trace(**fmha_standalone_kwargs),
@@ -658,6 +688,111 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         assert definition["axes"].get("seq_len_q", {}).get("value") == seq_len_q
         assert definition["inputs"]["mask_type"]["optional"] is True
         assert "unknown" not in str(definition["outputs"])
+
+
+def test_attention_ts_encoded_page4_trace_separates_semantic_and_storage_pages():
+    """Encoded locators retain semantic page four over larger cache pages."""
+    from flashinfer.attention.prims_ts.decode import (
+        BatchDecodePagedTSWrapper,
+        batch_decode_with_paged_kv_cache,
+        prims_ts_batch_decode_with_kv_cache,
+    )
+    from flashinfer.fi_trace import fi_trace
+    from flashinfer.trace.templates.attention import (
+        attention_ts_decode_trace_dispatch,
+        prims_ts_decode_trace_dispatch,
+    )
+
+    batch_size, seq_len_q, max_seq_len = 2, 4, 64
+    semantic_page_size, storage_page_size = 4, 32
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 64
+    num_physical_pages = batch_size * max_seq_len // storage_page_size
+    max_num_semantic_pages = max_seq_len // semantic_page_size
+    q = torch.empty(batch_size, seq_len_q, num_qo_heads, head_dim, dtype=torch.bfloat16)
+    k_cache = torch.empty(
+        num_physical_pages,
+        num_kv_heads,
+        storage_page_size,
+        head_dim,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.empty_like(k_cache)
+    block_table = torch.arange(
+        batch_size * max_num_semantic_pages, dtype=torch.int32
+    ).reshape(batch_size, max_num_semantic_pages)
+    seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32)
+    workspace = torch.empty(4096, dtype=torch.uint8)
+
+    one_shot_kwargs = {
+        "q": q,
+        "paged_kv_cache": (k_cache, v_cache),
+        "block_table": block_table,
+        "seq_lens": seq_lens,
+        "seq_len_q": seq_len_q,
+        "page_size": semantic_page_size,
+    }
+    standalone_kwargs = {
+        "query": q,
+        "kv_cache": (k_cache, v_cache),
+        "workspace_buffer": workspace,
+        "block_table": block_table,
+        "seq_lens": seq_lens,
+        "max_seq_len": max_seq_len,
+        "seq_len_q": seq_len_q,
+        "page_size": semantic_page_size,
+    }
+
+    direct_templates = (
+        attention_ts_decode_trace_dispatch(**one_shot_kwargs),
+        prims_ts_decode_trace_dispatch(**standalone_kwargs),
+    )
+    for template in direct_templates:
+        assert "_encoded_page4" in template.name_prefix
+        assert template.axes["page_size"].value == semantic_page_size
+        assert template.inputs["semantic_page_size"].param == "page_size"
+        assert template.inputs["semantic_page_size"].optional is False
+
+    definitions = (
+        batch_decode_with_paged_kv_cache.fi_trace(**one_shot_kwargs),
+        prims_ts_batch_decode_with_kv_cache.fi_trace(**standalone_kwargs),
+    )
+    for definition in definitions:
+        assert "_encoded_page4" in definition["name"]
+        assert definition["axes"]["storage_page_size"]["value"] == 32
+        assert definition["axes"]["page_size"]["value"] == 4
+        assert "optional" not in definition["inputs"]["semantic_page_size"]
+        assert "storage_page_size > page_size" in definition["constraints"]
+        assert "storage_page_size % page_size == 0" in definition["constraints"]
+        for cache_name in ("k_cache", "v_cache"):
+            assert definition["inputs"][cache_name]["shape"] == [
+                "num_pages",
+                "num_kv_heads",
+                "storage_page_size",
+                "head_dim",
+            ]
+
+    default_template = attention_ts_decode_trace_dispatch(
+        **{**one_shot_kwargs, "page_size": storage_page_size}
+    )
+    assert "_encoded_page4" not in default_template.name_prefix
+    assert "page_size" not in default_template.axes
+    assert "semantic_page_size" not in default_template.inputs
+
+    wrapper = BatchDecodePagedTSWrapper()
+    wrapper._planned = True
+    wrapper._use_packed_q = False
+    wrapper._output_dtype = torch.bfloat16
+    wrapper._page_size = semantic_page_size
+    wrapper._storage_page_size = storage_page_size
+    wrapper_definition = fi_trace(wrapper.run, q=q, paged_kv_cache=(k_cache, v_cache))
+    assert "_encoded_page4" in wrapper_definition["name"]
+    assert wrapper_definition["axes"]["storage_page_size"]["value"] == 32
+    assert wrapper_definition["axes"]["page_size"]["value"] == 4
+    assert "semantic_page_size" not in wrapper_definition["inputs"]
+
+    wrapper._storage_page_size = 16
+    with pytest.raises(ValueError, match="does not match the wrapper plan"):
+        fi_trace(wrapper.run, q=q, paged_kv_cache=(k_cache, v_cache))
 
 
 # ---------------------------------------------------------------------------

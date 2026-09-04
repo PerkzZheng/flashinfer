@@ -323,6 +323,7 @@ def _build_decode_gen_schedule(
     tma_desc_k_atom: cutlass.Pointer | None = None,
     tma_desc_v_atom: cutlass.Pointer | None = None,
     page_idx_kv: cute.Pointer | None = None,
+    page_table_stride: Int32 | None = None,
     h_k_idx: Int32 | None = None,
     b_idx: Int32 | None = None,
     q_group_idx: Int32 | None = None,
@@ -335,8 +336,6 @@ def _build_decode_gen_schedule(
     use_variable_seqlens_kv: bool = False,
     use_native_paged_kv: bool = False,
     use_static_native_seqlens_kv: bool = False,
-    paged_kv_indptr: cute.Pointer | None = None,
-    paged_kv_indices: cute.Pointer | None = None,
     sparse_row_route_offsets: cute.Pointer | None = None,
     sparse_row_route_counts: cute.Pointer | None = None,
     sparse_route_metadata: cute.Pointer | None = None,
@@ -843,9 +842,9 @@ def _build_decode_gen_schedule(
         seq_len_q=seq_len_q,
         name="smemQ",
     )
-    # FlashInfer materializes one canonical sequence-length tensor from its
-    # native CSR metadata, so native mode reuses the existing variable-length
-    # domain, split, sliding-window, and masking paths.
+    # Native dense page tables pair fixed-capacity rows with one canonical
+    # sequence-length tensor, so native mode reuses the existing
+    # variable-length domain, split, sliding-window, and masking paths.
     use_runtime_seqlens_kv = use_variable_seqlens_kv or (
         use_native_paged_kv and not use_static_native_seqlens_kv
     )
@@ -858,10 +857,9 @@ def _build_decode_gen_schedule(
             cfg=cfg,
             stage_page_ids_per_tile=stage_page_ids_per_tile,
             page_idx_kv=page_idx_kv,
+            page_table_stride=page_table_stride,
             seqlens_kv=kv_seqlens,
             use_native_paged_kv=use_native_paged_kv,
-            paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indices=paged_kv_indices,
             max_seq_len_kv=max_seq_len_kv,
             h_k_idx=h_k_idx,
             b_idx=b_idx,
@@ -879,10 +877,9 @@ def _build_decode_gen_schedule(
                 cfg=cfg,
                 stage_page_ids_per_tile=stage_page_ids_per_tile,
                 page_idx_kv=page_idx_kv,
+                page_table_stride=page_table_stride,
                 seqlens_kv=kv_seqlens,
                 use_native_paged_kv=use_native_paged_kv,
-                paged_kv_indptr=paged_kv_indptr,
-                paged_kv_indices=paged_kv_indices,
                 max_seq_len_kv=max_seq_len_kv,
                 h_k_idx=h_k_idx,
                 b_idx=b_idx,
@@ -1335,7 +1332,6 @@ def _build_decode_gen_schedule(
                 domain_bias=0,
                 warp_idx=page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
-                paged_kv_indptr=(paged_kv_indptr if use_native_paged_kv else None),
                 **task_runtime_kwargs,
             )
         else:
@@ -1352,7 +1348,6 @@ def _build_decode_gen_schedule(
                 domain_bias=0,
                 warp_idx=page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
-                paged_kv_indptr=(paged_kv_indptr if use_native_paged_kv else None),
                 **task_runtime_kwargs,
             )
     if use_one_inst_qkv:
@@ -1999,6 +1994,7 @@ def _run_decode_gen_active(
     g_seqlens_kv: cute.Pointer,
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer,
+    g_page_table_stride: Int32,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_split_kv_counter: cute.Pointer,
@@ -2017,8 +2013,6 @@ def _run_decode_gen_active(
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
-    g_paged_kv_indptr: cute.Pointer | None = None,
-    g_paged_kv_indices: cute.Pointer | None = None,
     g_sparse_row_route_offsets: cute.Pointer | None = None,
     g_sparse_row_route_counts: cute.Pointer | None = None,
     g_sparse_route_metadata: cute.Pointer | None = None,
@@ -2124,6 +2118,7 @@ def _run_decode_gen_active(
         tma_desc_k_atom=tma_desc_k_atom.get_ptr(),
         tma_desc_v_atom=tma_desc_v_atom.get_ptr(),
         page_idx_kv=g_page_idx_kv,
+        page_table_stride=g_page_table_stride,
         h_k_idx=h_k_idx,
         b_idx=b_idx,
         q_group_idx=q_group_idx,
@@ -2136,8 +2131,6 @@ def _run_decode_gen_active(
         use_variable_seqlens_kv=use_variable_seqlens_kv,
         use_native_paged_kv=use_native_paged_kv,
         use_static_native_seqlens_kv=use_static_native_seqlens_kv,
-        paged_kv_indptr=g_paged_kv_indptr,
-        paged_kv_indices=g_paged_kv_indices,
         sparse_row_route_offsets=g_sparse_row_route_offsets,
         sparse_row_route_counts=g_sparse_row_route_counts,
         sparse_route_metadata=g_sparse_route_metadata,
@@ -2193,13 +2186,6 @@ def _run_decode_gen_active(
         prims.barrier_cluster_wait()
     task_manager.run()
 
-    if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
-        # Publish the dependent reducer only after this producer CTA has made
-        # its normalized partial O and log2-LSE stores visible.
-        thread_idx, _, _ = cute.arch.thread_idx()
-        if thread_idx == Int32(0):
-            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
-
     # Every peer async-stores into an owner CTA's distributed SMEM and charges
     # the bytes to that owner's transaction mbarrier. Producer-only CTAs are
     # never remote-SMEM targets, so they may retire after their store issues;
@@ -2239,6 +2225,15 @@ def _run_decode_gen_active(
                 tmem_ptr = prims.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
                 prims.tcgen05_dealloc(tmem_ptr, Int32(tmem_alloc_cols))
 
+    if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
+        # Keep the release at the true producer tail. In particular, do not
+        # make reducer CTAs compete for SMs while any producer warp can still
+        # be using or deallocating TMEM.
+        prims.barrier_cta_sync(14)
+        thread_idx, _, _ = cute.arch.thread_idx()
+        if thread_idx == Int32(0):
+            prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
+
 
 @cute.jit
 def _run_decode_gen_inactive_cluster_rank() -> None:
@@ -2263,7 +2258,7 @@ def _run_decode_gen_inactive_cluster_rank() -> None:
 
 @cute.jit
 def _signal_padded_pdl_producer(cfg: cutlass.Constexpr[FmhaDecodeConfig]) -> None:
-    """Release the dependent reducer launch from a zero-work producer CTA."""
+    """Release the dependent reducer from a zero-work producer CTA."""
     if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
         thread_idx, _, _ = cute.arch.thread_idx()
         if thread_idx == Int32(0):
@@ -2285,6 +2280,7 @@ def _run_decode_gen_runtime_prefix(
     g_seqlens_kv: cute.Pointer,
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer,
+    g_page_table_stride: Int32,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_split_kv_counter: cute.Pointer,
@@ -2303,8 +2299,6 @@ def _run_decode_gen_runtime_prefix(
     use_variable_seqlens_kv: cutlass.Constexpr[bool],
     use_native_paged_kv: cutlass.Constexpr[bool],
     use_static_native_seqlens_kv: cutlass.Constexpr[bool],
-    g_paged_kv_indptr: cute.Pointer | None,
-    g_paged_kv_indices: cute.Pointer | None,
     g_sparse_row_route_offsets: cute.Pointer | None,
     g_sparse_row_route_counts: cute.Pointer | None,
     g_sparse_route_metadata: cute.Pointer | None,
@@ -2358,6 +2352,7 @@ def _run_decode_gen_runtime_prefix(
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
+                g_page_table_stride,
                 g_partial_o,
                 g_partial_stats,
                 g_split_kv_counter,
@@ -2376,8 +2371,6 @@ def _run_decode_gen_runtime_prefix(
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
                 use_static_native_seqlens_kv,
-                g_paged_kv_indptr,
-                g_paged_kv_indices,
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
@@ -2400,6 +2393,7 @@ def _run_decode_gen_runtime_prefix(
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
+                g_page_table_stride,
                 g_partial_o,
                 g_partial_stats,
                 g_split_kv_counter,
@@ -2418,8 +2412,6 @@ def _run_decode_gen_runtime_prefix(
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
                 use_static_native_seqlens_kv,
-                g_paged_kv_indptr,
-                g_paged_kv_indices,
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
@@ -2443,6 +2435,7 @@ def decode_gen_kernel(
     g_seqlens_kv: cute.Pointer,
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer,
+    g_page_table_stride: Int32,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_split_kv_counter: cute.Pointer,
@@ -2454,8 +2447,6 @@ def decode_gen_kernel(
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
-    g_paged_kv_indptr: cute.Pointer | None = None,
-    g_paged_kv_indices: cute.Pointer | None = None,
     g_sparse_row_route_offsets: cute.Pointer | None = None,
     g_sparse_row_route_counts: cute.Pointer | None = None,
     g_sparse_route_metadata: cute.Pointer | None = None,
@@ -2497,6 +2488,7 @@ def decode_gen_kernel(
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
+                g_page_table_stride,
                 g_partial_o,
                 g_partial_stats,
                 g_split_kv_counter,
@@ -2515,8 +2507,6 @@ def decode_gen_kernel(
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
                 use_static_native_seqlens_kv,
-                g_paged_kv_indptr,
-                g_paged_kv_indices,
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
@@ -2536,6 +2526,7 @@ def decode_gen_kernel(
                 g_seqlens_kv,
                 g_cu_seqlens_q,
                 g_page_idx_kv,
+                g_page_table_stride,
                 g_partial_o,
                 g_partial_stats,
                 g_split_kv_counter,
@@ -2554,8 +2545,6 @@ def decode_gen_kernel(
                 use_variable_seqlens_kv,
                 use_native_paged_kv,
                 use_static_native_seqlens_kv,
-                g_paged_kv_indptr,
-                g_paged_kv_indices,
                 g_sparse_row_route_offsets,
                 g_sparse_row_route_counts,
                 g_sparse_route_metadata,
@@ -2590,8 +2579,7 @@ def fmha_decode_launch(
     seq_len_kv: cutlass.Constexpr[int] = 2048,
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
-    paged_kv_indptr_iter: cute.Pointer | None = None,
-    paged_kv_indices_iter: cute.Pointer | None = None,
+    page_table_stride: Int32 = 0,
     num_physical_kv_pages: Int64 = 0,
     k_page_stride: Int64 = 0,
     k_head_stride: Int64 = 0,
@@ -2818,6 +2806,7 @@ def fmha_decode_launch(
         seqlens_kv_iter,
         cu_seqlens_q_iter,
         page_idx_kv_iter,
+        page_table_stride,
         partial_o_iter,
         partial_stats_iter,
         split_kv_counter_iter,
@@ -2829,8 +2818,6 @@ def fmha_decode_launch(
         use_variable_seqlens_kv,
         use_native_paged_kv,
         use_static_native_seqlens_kv,
-        paged_kv_indptr_iter,
-        paged_kv_indices_iter,
         null_sparse_route_ptr,
         null_sparse_route_ptr,
         null_sparse_route_ptr,
@@ -2841,7 +2828,10 @@ def fmha_decode_launch(
         cluster=cluster_shape,
         stream=stream,
         min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, effective_seq_len_kv),
-        use_pdl=cfg.use_parallel_separate_reduction_pdl,
+        # This producer reads runtime sequence/query metadata before it can
+        # initialize the full task graph, so it keeps ordinary stream ordering.
+        # Only its separate reducer is a programmatic dependent launch.
+        use_pdl=False,
     )
 
 
@@ -3042,6 +3032,7 @@ def fmha_block_sparse_launch(
         seqlens_kv_iter,
         null_i32_ptr,
         null_i32_ptr,
+        Int32(0),  # g_page_table_stride
         o_iter,
         null_f32_ptr,
         null_i32_ptr,
@@ -3053,8 +3044,6 @@ def fmha_block_sparse_launch(
         use_variable_seqlens_kv,
         False,  # use_native_paged_kv
         False,  # use_static_native_seqlens_kv
-        null_i32_ptr,  # g_paged_kv_indptr
-        null_i32_ptr,  # g_paged_kv_indices
         row_route_offsets_iter,
         row_route_counts_iter,
         route_metadata_iter,
@@ -3067,5 +3056,5 @@ def fmha_block_sparse_launch(
         # Reuse dense decode's entry-occupancy contract, including the long
         # KV256 profiles that execute dynamic register reallocation.
         min_blocks_per_mp=_decode_min_blocks_per_mp(cfg, seq_len_kv),
-        use_pdl=cfg.use_parallel_separate_reduction_pdl,
+        use_pdl=False,
     )

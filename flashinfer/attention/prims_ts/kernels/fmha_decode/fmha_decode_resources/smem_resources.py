@@ -64,7 +64,6 @@ from ...placeholder_helpers import (
 from .helpers_common import (
     _TASK_CACHE_KV_PAGE_IDX_UB,
     _TASK_CACHE_KV_RAW_TILE_BASE,
-    _TASK_CACHE_KV_REQUEST_BEGIN,
     Constexpr,
     DecodeGenResourceBase,
     ResourceVars,
@@ -147,7 +146,7 @@ def _decode_native_page_locator(
     cfg: Constexpr[FmhaDecodeConfig],
     page_locator: Int32,
 ) -> tuple[Int32, Int32]:
-    """Return ``(token_offset, physical_page)`` for one native CSR entry."""
+    """Return ``(token_offset, physical_page)`` for one native table entry."""
     if cutlass.const_expr(cfg.uses_qsa_page_membership):
         page_locator = page_locator >> Int32(QSA_PAGE_MEMBERSHIP_BITS)
     token_offset = Int32(0)
@@ -1299,7 +1298,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     exactly that tile's page IDs. Shared-offset schedules retain a warp-aligned
     32-ID window so one coalesced load can serve adjacent logical tiles. Native
     encoded page-4 schedules instead hold their complete CTA-local locator span
-    once so every K/V load in the work tile can reuse it.
+    once so every K/V load in the work tile can reuse it. Native page rows use
+    a fixed dense stride; sequence lengths delimit the live prefix of each row.
     """
 
     cfg: Constexpr[FmhaDecodeConfig] = None
@@ -1307,8 +1307,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     page_idx_kv: cute.Pointer | None = None
     seqlens_kv: cute.Pointer | None = None
     use_native_paged_kv: Constexpr[bool] = False
-    paged_kv_indptr: cute.Pointer | None = None
-    paged_kv_indices: cute.Pointer | None = None
+    page_table_stride: Int32 = None
     max_seq_len_kv: Int32 = None
     h_k_idx: Int32 = None
     b_idx: Int32 = None
@@ -1342,9 +1341,10 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         """Return the locator capacity published by one pipeline stage.
 
         QSA keeps every page-4 locator owned by the CTA work tile in one held
-        window. K and V use the same native CSR row, so direct, persistent, and
-        split-KV routes can reuse that window across the complete K0/K1/V0/V1
-        cadence instead of reloading each tile once for K and once for V.
+        window. K and V use the same native dense-table row, so direct,
+        persistent, and split-KV routes can reuse that window across the
+        complete K0/K1/V0/V1 cadence instead of reloading each tile once for K
+        and once for V.
         """
         pages_per_tile = self.cfg.tile_size_kv // self.cfg.num_tokens_per_page
         if self.holds_encoded_locator_window:
@@ -1680,26 +1680,9 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         pages_per_tile = Int32(cfg.tile_size_kv // cfg.num_tokens_per_page)
         if cutlass.const_expr(self.use_native_paged_kv):
             task_cache = _decode_gen_task_cache(stage_info)
-            request_begin = Int32(task_cache[_TASK_CACHE_KV_REQUEST_BEGIN])
             page_idx_ub = Int32(task_cache[_TASK_CACHE_KV_PAGE_IDX_UB])
-            if cutlass.const_expr(cfg.uses_qsa_page_membership):
-                # Grouped QSA keeps a CUDA-graph-stable fixed-capacity CSR
-                # stride in indptr, so its generic page bound includes
-                # unwritten padding after the live union.  Bound staging by
-                # the compact sequence length instead; padded slots then use
-                # the encoded -1 / zero-membership sentinel below.
-                seq_len_kv = _load_runtime_seq_len_kv(
-                    self.seqlens_kv,
-                    self.max_seq_len_kv,
-                    stage_info,
-                    self.h_k_idx,
-                    self.b_idx,
-                )
-                page_idx_ub = cute.ceil_div(
-                    seq_len_kv, cfg.num_tokens_per_page
-                ) - Int32(1)
-            page_table_offset = request_begin
-            page_idx_kv = self.paged_kv_indices
+            page_table_offset = logical_b_idx * self.page_table_stride
+            page_idx_kv = self.page_idx_kv
         else:
             if cutlass.const_expr(self.seqlens_kv is None):
                 page_idx_ub = Int32(cfg.max_num_pages_per_seq_kv - 1)
