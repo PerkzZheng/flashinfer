@@ -261,6 +261,7 @@ class TmemSResource(DecodeGenResourceBase):
     h_r: Int32 | None = None
     q_group_idx: Int32 | None = None
     q_ref: Constexpr[MemoryResource | None] = None
+    page_offsets_ref: Constexpr[MemoryResource | None] = None
     _p_local_sum_arr: cutlass.Array | None = None
     _global_sum_arr: cutlass.Array | None = None
     _alloc: Constexpr[TmemAllocation | None] = None
@@ -833,6 +834,10 @@ class TmemSResource(DecodeGenResourceBase):
             q_token_base,
             tile_has_valid_scores,
         )
+        # Flattened SQ=1 QSA routes use their compacted causal length as
+        # seq_len_kv. At or above the 2048-token budget this marks all first
+        # sixteen KV128 tiles unmasked; only the optional 0--3-token tail in a
+        # seventeenth tile reaches the boundary-mask specialization.
         return (
             seq_len_kv,
             logical_q_group_idx,
@@ -941,6 +946,51 @@ class TmemSResource(DecodeGenResourceBase):
                 s_vals[score_idx] = loaded[atom_reg_idx]
 
     @cute.jit
+    def _qsa_keeps_kv128_membership_word(
+        self,
+        stage_info: StageInfo,
+        logical_q_group_idx: Int32,
+        warp_grp_thread_idx: Int32,
+        tile_row_idx: Int32,
+    ) -> Uint32:
+        """Return one lane-local sixteen-page keep word for Q64/KV128."""
+
+        cfg = self.cfg
+        assert cfg.tile_size_q == 64
+        assert cfg.tile_size_kv == 128
+        assert cfg.num_tokens_per_page == 4
+        assert cfg.uses_qsa_page_membership
+        assert self.page_offsets_ref is not None
+        q_token_idx, _ = _q_row_token_and_local_head(
+            cfg,
+            self.h_r,
+            logical_q_group_idx,
+            tile_row_idx,
+        )
+        membership_bit = Uint32(1) << q_token_idx
+        local_tile_idx = _softmax_tile_idx(cfg, stage_info, self.inst_id)
+        lane_idx = warp_grp_thread_idx & Int32(31)
+        col_base = _keeps_col_base(
+            cfg,
+            lane_idx,
+            cfg.softmax_score_fragment_regs,
+        )
+        keep_word = Uint32(0)
+        for page_vector_idx in cutlass.range_constexpr(4):
+            memberships = self.page_offsets_ref.qsa_page_memberships4(
+                stage_info,
+                local_tile_idx,
+                col_base // Int32(cfg.num_tokens_per_page) + Int32(page_vector_idx * 4),
+            )
+            for vector_elem_idx in cutlass.range_constexpr(4):
+                local_page_idx = page_vector_idx * 4 + vector_elem_idx
+                page_is_member = Uint32(
+                    (memberships[vector_elem_idx] & membership_bit) != Uint32(0)
+                )
+                keep_word = keep_word | (page_is_member << Uint32(local_page_idx))
+        return keep_word
+
+    @cute.jit
     def _load_keeps_fragment_impl(
         self,
         stage_info: StageInfo,
@@ -952,8 +1002,10 @@ class TmemSResource(DecodeGenResourceBase):
         logical_q_group_idx: Int32,
         is_valid_effective_tile: cutlass.Boolean,
         is_masked_final_wave: cutlass.Boolean,
+        membership_keep_word: Uint32,
         *,
         apply_boundary_mask: Constexpr[bool],
+        apply_membership_mask: Constexpr[bool],
         fragment_idx: Constexpr[int] = 0,
     ) -> None:
         """Load one Keeps score fragment with a compile-time mask policy.
@@ -1047,18 +1099,77 @@ class TmemSResource(DecodeGenResourceBase):
                     )
                 causal_start_rel = causal_start - tile_offset_k
                 causal_end_rel = causal_end - tile_offset_k
-                for reg_idx in cutlass.range_constexpr(num_s_regs):
-                    score_col = _keeps_score_col(
-                        cfg,
-                        warp_grp_thread_idx,
-                        fragment_reg_base + reg_idx,
-                        col_base,
-                    )
-                    if cutlass.const_expr(cfg.use_sliding_window_causal):
-                        if score_col < causal_start_rel:
+                if cutlass.const_expr(cfg.uses_qsa_page_membership):
+                    assert cfg.tile_size_kv == 128
+                    # The grouped QSA builder sets a row's membership bit only
+                    # on pages at or before that row's causal endpoint.  Page
+                    # membership therefore removes every complete future page;
+                    # causal masking only has to trim the final 1--3 tokens in
+                    # the endpoint page.  This replaces 32 score comparisons
+                    # per K32 fragment with eight page comparisons and at most
+                    # three token predicates on the one matching page.
+                    causal_tail_tokens = causal_end & Int32(cfg.num_tokens_per_page - 1)
+                    causal_tail_page_rel = causal_end_rel - causal_tail_tokens
+                    for local_page_idx in cutlass.range_constexpr(16):
+                        page_score_col = _keeps_score_col(
+                            cfg,
+                            warp_grp_thread_idx,
+                            fragment_reg_base
+                            + local_page_idx * cfg.num_tokens_per_page,
+                            col_base,
+                        )
+                        page_is_causal_tail = (
+                            causal_tail_tokens != Int32(0)
+                            and page_score_col == causal_tail_page_rel
+                        )
+                        for token_in_page in cutlass.range_constexpr(
+                            1, cfg.num_tokens_per_page
+                        ):
+                            token_is_valid = not (
+                                page_is_causal_tail
+                                and Int32(token_in_page) >= causal_tail_tokens
+                            )
+                            tail_reg_idx = (
+                                local_page_idx * cfg.num_tokens_per_page + token_in_page
+                            )
+                            s_vals[tail_reg_idx] = cutlass.select_(
+                                token_is_valid,
+                                s_vals[tail_reg_idx],
+                                _neg_max_f32(),
+                            )
+                else:
+                    for reg_idx in cutlass.range_constexpr(num_s_regs):
+                        score_col = _keeps_score_col(
+                            cfg,
+                            warp_grp_thread_idx,
+                            fragment_reg_base + reg_idx,
+                            col_base,
+                        )
+                        if cutlass.const_expr(cfg.use_sliding_window_causal):
+                            if score_col < causal_start_rel:
+                                s_vals[reg_idx] = _neg_max_f32()
+                        if score_col >= causal_end_rel:
                             s_vals[reg_idx] = _neg_max_f32()
-                    if score_col >= causal_end_rel:
-                        s_vals[reg_idx] = _neg_max_f32()
+
+        if cutlass.const_expr(apply_membership_mask and cfg.uses_qsa_page_membership):
+            # Q64/KV128 splits one logical score row across lanes xor 16.
+            # Each lane owns one contiguous 64-column half. The preloaded
+            # page word avoids carrying SMEM values through this dynamic
+            # masked/unmasked loader specialization.
+            assert cfg.tile_size_kv == 128
+            for local_page_idx in cutlass.range_constexpr(16):
+                page_is_member = (
+                    (membership_keep_word >> Uint32(local_page_idx)) & Uint32(1)
+                ) != Uint32(0)
+                for token_in_page in cutlass.range_constexpr(cfg.num_tokens_per_page):
+                    membership_reg_idx = (
+                        local_page_idx * cfg.num_tokens_per_page + token_in_page
+                    )
+                    s_vals[membership_reg_idx] = cutlass.select_(
+                        page_is_member,
+                        s_vals[membership_reg_idx],
+                        _neg_max_f32(),
+                    )
 
         if cutlass.const_expr(cfg.q_score_rows_need_mask):
             if not _q_row_is_valid_for_seq(
@@ -1068,8 +1179,8 @@ class TmemSResource(DecodeGenResourceBase):
                 tile_row_idx,
                 self.seq_len_q,
             ):
-                for reg_idx in cutlass.range_constexpr(num_s_regs):
-                    s_vals[reg_idx] = _neg_max_f32()
+                for invalid_q_reg_idx in cutlass.range_constexpr(num_s_regs):
+                    s_vals[invalid_q_reg_idx] = _neg_max_f32()
 
     @cute.jit
     def _load_keeps_fragment(
@@ -1085,8 +1196,9 @@ class TmemSResource(DecodeGenResourceBase):
         is_masked_final_wave: cutlass.Boolean,
         tile_is_unmasked: cutlass.Boolean,
         *,
+        apply_membership_mask: Constexpr[bool] = True,
         fragment_idx: Constexpr[int] = 0,
-    ) -> None:
+    ) -> Uint32:
         """Select the masked or unmasked fragment loader before LDTM.
 
         ``tile_is_unmasked`` is runtime state, whereas the implementation's
@@ -1094,6 +1206,17 @@ class TmemSResource(DecodeGenResourceBase):
         lets the unmasked specialization erase boundary-mask instructions and
         avoids carrying the loaded score registers through a post-LDTM branch.
         """
+        membership_keep_word = Uint32(0xFFFFFFFF)
+        if cutlass.const_expr(self.cfg.uses_qsa_page_membership):
+            task_cache = _decode_gen_task_cache(stage_info)
+            warp_grp_thread_idx = task_cache[_TASK_CACHE_WARP_GRP_THREAD_IDX]
+            tile_row_idx = _keeps_row_idx(self.cfg, warp_grp_thread_idx)
+            membership_keep_word = self._qsa_keeps_kv128_membership_word(
+                stage_info,
+                logical_q_group_idx,
+                warp_grp_thread_idx,
+                tile_row_idx,
+            )
         if tile_is_unmasked:
             self._load_keeps_fragment_impl(
                 stage_info,
@@ -1105,7 +1228,9 @@ class TmemSResource(DecodeGenResourceBase):
                 logical_q_group_idx,
                 is_valid_effective_tile,
                 is_masked_final_wave,
+                membership_keep_word,
                 apply_boundary_mask=False,
+                apply_membership_mask=apply_membership_mask,
                 fragment_idx=fragment_idx,
             )
         else:
@@ -1119,9 +1244,12 @@ class TmemSResource(DecodeGenResourceBase):
                 logical_q_group_idx,
                 is_valid_effective_tile,
                 is_masked_final_wave,
+                membership_keep_word,
                 apply_boundary_mask=True,
+                apply_membership_mask=apply_membership_mask,
                 fragment_idx=fragment_idx,
             )
+        return membership_keep_word
 
     @cute.jit
     def _reduce_keeps_fragment_max(self, s_vals: cutlass.Array) -> Float32:
@@ -1456,6 +1584,7 @@ class TmemSResource(DecodeGenResourceBase):
                     is_valid_effective_tile,
                     is_masked_final_wave,
                     tile_is_unmasked,
+                    apply_membership_mask=False,
                     fragment_idx=fragment_idx,
                 )
                 fragment_max = self._reduce_keeps_fragment_max(s_vals)
@@ -2010,6 +2139,56 @@ class TmemSResource(DecodeGenResourceBase):
                             s_vals[s_base + 0] = _neg_max_f32()
                             s_vals[s_base + 1] = _neg_max_f32()
 
+        if cutlass.const_expr(cfg.uses_qsa_page_membership):
+            # Each held page-4 locator carries a low-byte query-membership
+            # mask. One SMEM lookup serves the pair of Q rows represented by a
+            # Swaps score register pair; the ordinary causal pass below still
+            # handles the zero-to-three-token tail within a member page.
+            assert self.page_offsets_ref is not None
+            membership_warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+            membership_lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+            membership_col_group_idx = membership_lane_idx & Int32(0x3)
+            membership_local_idx_k0 = membership_warp_idx * Int32(32) + (
+                membership_lane_idx >> Int32(2)
+            )
+            for membership_scale_idx in cutlass.range_constexpr(num_scale_groups):
+                membership_repeat_idx = membership_scale_idx // 2
+                membership_pair_idx = membership_scale_idx % 2
+                membership_tile_row_idx = (
+                    Int32(membership_repeat_idx * 8)
+                    + membership_col_group_idx * Int32(2)
+                    + Int32(membership_pair_idx)
+                )
+                membership_q_token_idx, _membership_local_head_idx = (
+                    _q_row_token_and_local_head(
+                        cfg,
+                        self.h_r,
+                        logical_q_group_idx,
+                        membership_tile_row_idx,
+                    )
+                )
+                membership_bit = Uint32(1) << membership_q_token_idx
+                for membership_token_group_idx in cutlass.range_constexpr(4):
+                    membership_local_token_idx = membership_local_idx_k0 + Int32(
+                        membership_token_group_idx * 8
+                    )
+                    membership_page_frag = membership_local_token_idx // Int32(
+                        cfg.num_tokens_per_page
+                    )
+                    membership_value = self.page_offsets_ref.qsa_page_membership(
+                        stage_info,
+                        local_tile_idx,
+                        membership_page_frag,
+                    )
+                    membership_s_idx = (
+                        membership_repeat_idx * 4
+                        + membership_pair_idx
+                        + (membership_token_group_idx & 1) * 2
+                        + (membership_token_group_idx >> 1) * q_repeats * 4
+                    )
+                    if (membership_value & membership_bit) == Uint32(0):
+                        s_vals[membership_s_idx] = _neg_max_f32()
+
         if cutlass.const_expr(cfg.uses_per_row_causal_mask):
             apply_per_row_causal_mask = cutlass.Boolean(True)
             if cutlass.const_expr(not use_sparse):
@@ -2032,16 +2211,18 @@ class TmemSResource(DecodeGenResourceBase):
                 # Grouped causal decode has a distinct causal/window bound for
                 # every Q token. Sparse routes always use their logical K;
                 # dense routes retain the boundary-tile fast path above.
-                warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
-                lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
-                col_group_idx = lane_idx & Int32(0x3)
-                local_idx_k0 = warp_idx * Int32(32) + (lane_idx >> Int32(2))
+                causal_warp_idx = task_cache[_TASK_CACHE_WARP_IDX]
+                causal_lane_idx = task_cache[_TASK_CACHE_LANE_IDX]
+                causal_col_group_idx = causal_lane_idx & Int32(0x3)
+                causal_local_idx_k0 = causal_warp_idx * Int32(32) + (
+                    causal_lane_idx >> Int32(2)
+                )
                 for scale_idx in cutlass.range_constexpr(num_scale_groups):
                     repeat_idx = scale_idx // 2
                     pair_idx = scale_idx % 2
                     tile_row_idx = (
                         Int32(repeat_idx * 8)
-                        + col_group_idx * Int32(2)
+                        + causal_col_group_idx * Int32(2)
                         + Int32(pair_idx)
                     )
                     q_token_idx, _ = _q_row_token_and_local_head(
@@ -2058,11 +2239,13 @@ class TmemSResource(DecodeGenResourceBase):
                         )
                     for token_group_idx in cutlass.range_constexpr(4):
                         token_idx = (
-                            tile_offset_k + local_idx_k0 + Int32(token_group_idx * 8)
+                            tile_offset_k
+                            + causal_local_idx_k0
+                            + Int32(token_group_idx * 8)
                         )
                         if cutlass.const_expr(use_sparse):
                             _, token_idx = self._sparse_swaps_logical_k(
-                                lane_idx >> Int32(2),
+                                causal_lane_idx >> Int32(2),
                                 sparse_origin0,
                                 sparse_origin1,
                                 sparse_origin2,

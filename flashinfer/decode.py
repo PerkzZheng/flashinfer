@@ -145,11 +145,29 @@ def _warn_deprecated_plan_positional_args(api_name: str) -> None:
     )
 
 
-_PRIMS_TS_LAZY_EXPORTS = frozenset(
+_PRIMS_TS_QSA_METADATA_LAZY_EXPORTS = frozenset(
     {
-        "get_prims_ts_batch_decode_workspace_size",
-        "prims_ts_batch_decode_with_kv_cache",
+        "PrimsTSQSAPlan",
+        "build_prims_ts_qsa_page4_metadata",
+        "get_prims_ts_qsa_metadata_output_shapes",
+        "get_prims_ts_qsa_metadata_workspace_size",
+        "get_prims_ts_qsa_workspace_size",
+        "prepare_prims_ts_qsa_attention",
+        "prims_ts_qsa_attention",
     }
+)
+_PRIMS_TS_LAZY_EXPORTS = (
+    frozenset(
+        {
+            "PrimsTSBatchDecodePlan",
+            "get_prims_ts_batch_decode_workspace_size",
+            "validate_prims_ts_qsa_group_size",
+            "make_prims_ts_qsa_qo_indptr",
+            "prepare_prims_ts_batch_decode_with_kv_cache",
+            "prims_ts_batch_decode_with_kv_cache",
+        }
+    )
+    | _PRIMS_TS_QSA_METADATA_LAZY_EXPORTS
 )
 
 
@@ -157,9 +175,14 @@ def __getattr__(name: str):
     """Resolve PrimTS decode APIs without loading their runtime at import."""
 
     if name in _PRIMS_TS_LAZY_EXPORTS:
-        from .attention.prims_ts import decode as prims_ts_decode
+        if name in _PRIMS_TS_QSA_METADATA_LAZY_EXPORTS:
+            from .attention.prims_ts import qsa_metadata
 
-        value = getattr(prims_ts_decode, name)
+            value = getattr(qsa_metadata, name)
+        else:
+            from .attention.prims_ts import decode
+
+            value = getattr(decode, name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -73,6 +73,7 @@ def _pack_float4_to_fp8_e4m3_inline(
 
 @cute.jit
 def _compute_fp8_p_regs_and_local_sums(
+    cfg: FmhaDecodeConfig,
     scale_softmax_log2: Float32,
     new_max_0: Float32,
     new_max_1: Float32,
@@ -95,10 +96,13 @@ def _compute_fp8_p_regs_and_local_sums(
         safe_new_max_0 = Float32(0.0)
     if safe_new_max_1 == _neg_max_f32():
         safe_new_max_1 = Float32(0.0)
+    probability_scale_log2 = Float32(0.0)
+    if cutlass.const_expr(cfg.use_fp8_p448):
+        probability_scale_log2 = _fp8_log2_quant_scale()
     neg_scaled_max_pair = ffma2(
         (safe_new_max_0, safe_new_max_1),
         (-scale_softmax_log2, -scale_softmax_log2),
-        (_fp8_log2_quant_scale(), _fp8_log2_quant_scale()),
+        (probability_scale_log2, probability_scale_log2),
     )
 
     # Scale S by log2(e) * softmax_scale and include the FP8 quantization
@@ -143,6 +147,7 @@ def _compute_fp8_p_regs_and_local_sums(
 
 @cute.jit
 def _compute_fp8_p_regs_and_local_sums_dense(
+    cfg: FmhaDecodeConfig,
     scale_softmax_log2: Float32,
     new_max_0: Float32,
     new_max_1: Float32,
@@ -157,10 +162,13 @@ def _compute_fp8_p_regs_and_local_sums_dense(
 ) -> tuple[Int32, Int32, Float32, Float32]:
     """Compute dense FP8 P registers and local softmax sums."""
     # Dense path: all S entries are valid, so no NEG_FLT_MAX guard is needed.
+    probability_scale_log2 = Float32(0.0)
+    if cutlass.const_expr(cfg.use_fp8_p448):
+        probability_scale_log2 = _fp8_log2_quant_scale()
     neg_scaled_max_pair = ffma2(
         (new_max_0, new_max_1),
         (-scale_softmax_log2, -scale_softmax_log2),
-        (_fp8_log2_quant_scale(), _fp8_log2_quant_scale()),
+        (probability_scale_log2, probability_scale_log2),
     )
 
     scaled_pair_01 = ffma2(
@@ -418,7 +426,7 @@ def _attention_sink_for_local_head(
         sink_val * Float32(1.4426950408889634) - max_val * scale_softmax_log2,
         fastmath=True,
     )
-    if cutlass.const_expr(cfg.use_fp8_qkv):
+    if cutlass.const_expr(cfg.use_fp8_p448):
         sink_exp = sink_exp * Float32(448.0)
     return sink_exp
 

@@ -80,8 +80,24 @@ MAX_CLUSTER_DIM_X = 16
 # overhead does not dominate tiny per-split K ranges.
 MIN_LOOP_ITERS_PER_SPLIT = 2
 
-# The maximum number of warp groups per CTA.
-MAX_WARP_GROUPS = 4
+# Grouped QSA may add two producer-only groups to the common four-warpgroup
+# decode topology.
+MAX_WARP_GROUPS = 6
+
+# A fused QSA page entry keeps the ordinary encoded page-4 locator in the high
+# bits and one membership bit for each grouped query token in the low byte.
+# Q1 does not encode membership; Q2/Q4/Q5 use the same int32 CSR tensor for
+# both the TMA address and per-query softmax mask without another model-facing
+# input. A byte keeps Q5 aligned with Q64/Hq12 and leaves room for Q6--Q8.
+QSA_PAGE_MEMBERSHIP_BITS = 8
+QSA_PAGE_MEMBERSHIP_MASK = (1 << QSA_PAGE_MEMBERSHIP_BITS) - 1
+QSA_PAGE_MEMBERSHIPS_PER_WORD = 32 // QSA_PAGE_MEMBERSHIP_BITS
+# Holding a complete encoded-locator window removes duplicate K/V metadata
+# traffic, but a graph-safe Q2/Q4 worst-case bound can otherwise reserve 8 KiB
+# or more of SMEM for rows that commonly use only three KV tiles.  Beyond this
+# crossover, stage one tile at a time and reload the compact membership byte
+# in Softmax instead.
+QSA_HELD_LOCATOR_MAX_TILES = 8
 
 # Default used only when the launch helper has no resolved decode config.
 # Config-aware FMHA and block-sparse callers pass their selected KV tile.

@@ -432,7 +432,7 @@ class SmemPResource(DecodeGenResourceBase):
         if safe_new_max == _neg_max_f32():
             safe_new_max = Float32(0.0)
         neg_scaled_max = -self.scale_softmax_log2 * safe_new_max
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_p448):
             neg_scaled_max += _fp8_log2_quant_scale()
 
         # Preserve four independent modulo-4 sum chains as two packed pairs,
@@ -641,6 +641,7 @@ class SmemPResource(DecodeGenResourceBase):
                     q32_s_base = scale_pair_idx * 4
                     p_lo, p_hi, sum_lo, sum_hi = (
                         _compute_fp8_p_regs_and_local_sums_dense(
+                            cfg,
                             self.scale_softmax_log2,
                             new_max_arr[scale_base],
                             new_max_arr[scale_base + 1],
@@ -665,6 +666,7 @@ class SmemPResource(DecodeGenResourceBase):
                     scale_base = scale_pair_idx * 2
                     q32_s_base = scale_pair_idx * 4
                     p_lo, p_hi, sum_lo, sum_hi = _compute_fp8_p_regs_and_local_sums(
+                        cfg,
                         self.scale_softmax_log2,
                         new_max_arr[scale_base],
                         new_max_arr[scale_base + 1],
@@ -739,6 +741,7 @@ class SmemPResource(DecodeGenResourceBase):
                 ):
                     p_lo, p_hi, sum_lo, sum_hi = (
                         _compute_fp8_p_regs_and_local_sums_dense(
+                            cfg,
                             self.scale_softmax_log2,
                             new_max_arr[scale_base],
                             new_max_arr[scale_base + 1],
@@ -754,6 +757,7 @@ class SmemPResource(DecodeGenResourceBase):
                     )
                 else:
                     p_lo, p_hi, sum_lo, sum_hi = _compute_fp8_p_regs_and_local_sums(
+                        cfg,
                         self.scale_softmax_log2,
                         new_max_arr[scale_base],
                         new_max_arr[scale_base + 1],
@@ -809,7 +813,7 @@ class SmemPResource(DecodeGenResourceBase):
                 if safe_new_max == _neg_max_f32():
                     safe_new_max = Float32(0.0)
                 neg_scaled_max = -self.scale_softmax_log2 * safe_new_max
-                if cutlass.const_expr(cfg.use_fp8_qkv):
+                if cutlass.const_expr(cfg.use_fp8_p448):
                     neg_scaled_max += _fp8_log2_quant_scale()
                 if new_max != _neg_max_f32():
                     repeat_idx = scale_idx // 2
@@ -925,6 +929,7 @@ class SmemPResource(DecodeGenResourceBase):
                 else:
                     packed_p[0], packed_p[1], local_sum[0], local_sum[1] = (
                         _compute_fp8_p_regs_and_local_sums(
+                            cfg,
                             self.scale_softmax_log2,
                             new_max_arr[0],
                             new_max_arr[1],
@@ -947,6 +952,7 @@ class SmemPResource(DecodeGenResourceBase):
                 # straight-line helper because no S entry is masked.
                 packed_p[0], packed_p[1], local_sum[0], local_sum[1] = (
                     _compute_fp8_p_regs_and_local_sums_dense(
+                        cfg,
                         self.scale_softmax_log2,
                         new_max_arr[0],
                         new_max_arr[1],
@@ -965,6 +971,7 @@ class SmemPResource(DecodeGenResourceBase):
                 # helper suppress entries whose S value is -inf.
                 packed_p[0], packed_p[1], local_sum[0], local_sum[1] = (
                     _compute_fp8_p_regs_and_local_sums(
+                        cfg,
                         self.scale_softmax_log2,
                         new_max_arr[0],
                         new_max_arr[1],

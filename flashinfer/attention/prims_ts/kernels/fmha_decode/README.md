@@ -26,6 +26,7 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | `BatchDecodePagedTSWrapper` | Reusable `plan()`/`run()` interface; owns compiled callables and scratch. |
 | `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
+| `prepare_prims_ts_batch_decode_with_kv_cache` | Validate and compile a standalone launch once for a lightweight graph-safe `run()`. |
 | `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
@@ -54,7 +55,7 @@ graph. This is not a public knob.
 | Q/K/V dtype | Q and K/V must match: `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND paged cache, combined or separate K/V tensors |
-| Page size | 16, 32, 64, or 128 tokens |
+| Page size | 4, 16, 32, 64, or 128 tokens |
 | Maximum K/V length | `2,147,483,392` (`INT32_MAX - 255`), reserving the padded endpoint of a 256-token K/V tile |
 | Mask | Dense or bottom-right causal |
 | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |

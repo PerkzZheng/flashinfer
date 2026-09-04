@@ -370,6 +370,37 @@ def _transposed_smem128x16b_stsm_offset_bytes(
 
 
 @cute.jit
+def _transposed_smem64x16b_m64_stsm_offset_bytes(
+    num_rows: Constexpr[int],
+    local_warp_idx: Int32,
+    lane_idx: Int32,
+    chunk_idx: int,
+    q_store_group_idx: int = 0,
+) -> Int32:
+    """Place one M64 PV fragment into a QxD64 row-major SMEM band.
+
+    An M64 tcgen05 accumulator distributes 16 semantic head-dimension rows
+    to each of the four warpgroup partitions.  Each warp therefore contributes
+    two transposed 8x8 matrices.  The historical x4 store assumes an M128
+    accumulator, where two D64 halves are interleaved across the four
+    partitions; applying it to two independent M64 MMAs interleaves their
+    16-element fragments.  This x2 address map keeps each D64 stage contiguous.
+    """
+    thr_row_idx = lane_idx & Int32(0x7)
+    mtx_idx = lane_idx >> Int32(3)
+    # Each warp owns 16 contiguous M rows, or two 8-wide matrix columns.
+    # An x2 Q8 store uses address groups 0..1.  Q16 uses all four groups;
+    # Q32 repeats the x4 store with the next two matrix-row bands.
+    mtx_row_idx = Int32(q_store_group_idx * 2) + (mtx_idx >> Int32(1))
+    mtx_col_idx = local_warp_idx * Int32(2) + (mtx_idx & Int32(0x1))
+    return (
+        Int32(chunk_idx * num_rows * 128)
+        + (mtx_row_idx * Int32(8) + thr_row_idx) * Int32(128)
+        + ((mtx_col_idx ^ thr_row_idx) * Int32(16))
+    )
+
+
+@cute.jit
 def _fp16_o_reorg_offsets(
     cfg: FmhaDecodeConfig,
     warp_grp_thread_idx: Int32,

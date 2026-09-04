@@ -22,8 +22,12 @@ from .block_sparse import (
 )
 from .decode import (
     BatchDecodePagedTSWrapper,
+    PrimsTSBatchDecodePlan,
     batch_decode_with_paged_kv_cache,
     get_prims_ts_batch_decode_workspace_size,
+    validate_prims_ts_qsa_group_size,
+    make_prims_ts_qsa_qo_indptr,
+    prepare_prims_ts_batch_decode_with_kv_cache,
     prims_ts_batch_decode_with_kv_cache,
 )
 from .context import (
@@ -38,6 +42,15 @@ from .mla_decode import (
     get_prims_ts_batch_decode_mla_workspace_size,
     prims_ts_batch_decode_with_kv_cache_mla,
 )
+from .qsa_metadata import (
+    PrimsTSQSAPlan,
+    build_prims_ts_qsa_page4_metadata,
+    get_prims_ts_qsa_metadata_output_shapes,
+    get_prims_ts_qsa_metadata_workspace_size,
+    get_prims_ts_qsa_workspace_size,
+    prepare_prims_ts_qsa_attention,
+    prims_ts_qsa_attention,
+)
 
 __all__ = [
     "BlockSparseTSWrapper",
@@ -49,9 +62,20 @@ __all__ = [
     "batch_prefill",
     "batch_prefill_with_paged_kv_cache",
     "BatchDecodePagedTSWrapper",
+    "PrimsTSBatchDecodePlan",
     "batch_decode_with_paged_kv_cache",
     "get_prims_ts_batch_decode_workspace_size",
+    "validate_prims_ts_qsa_group_size",
+    "make_prims_ts_qsa_qo_indptr",
+    "prepare_prims_ts_batch_decode_with_kv_cache",
     "prims_ts_batch_decode_with_kv_cache",
+    "PrimsTSQSAPlan",
+    "build_prims_ts_qsa_page4_metadata",
+    "get_prims_ts_qsa_metadata_output_shapes",
+    "get_prims_ts_qsa_metadata_workspace_size",
+    "get_prims_ts_qsa_workspace_size",
+    "prepare_prims_ts_qsa_attention",
+    "prims_ts_qsa_attention",
     "BatchMLADecodePagedTSWrapper",
     "batch_decode_mla_with_paged_kv_cache",
     "get_prims_ts_batch_decode_mla_workspace_size",

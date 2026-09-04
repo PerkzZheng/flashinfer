@@ -39,7 +39,7 @@ import cutlass.utils as utils
 from cuda.bindings import driver as cuda_drv
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
-from cutlass.experimental.task_scheduling.enums import PipelineType
+from cutlass.experimental.task_scheduling.enums import PipelineType, SignalingThreads
 from cutlass.experimental.task_scheduling.memory import (
     ResourceContext,
     SmemAllocation,
@@ -376,6 +376,8 @@ def _build_decode_gen_schedule(
         )
     if use_native_paged_kv and not cfg.use_paged_kv:
         raise ValueError("native paged-KV ABI requires cfg.use_paged_kv=True")
+    if cfg.uses_encoded_subpage_locators and not use_native_paged_kv:
+        raise ValueError("encoded subpage locators require the native paged-KV ABI")
     if cfg.use_paged_kv:
         cfg.validate_paged_kv_staging_config()
     if cfg.use_block_sparse:
@@ -448,6 +450,17 @@ def _build_decode_gen_schedule(
     scheduler_grp = pipeline.CooperativeGroup(
         Agent.Thread, cfg.scheduler_num_warps * WARP_SIZE
     )
+    tma_producer_signaling = (
+        SignalingThreads.TaskWarpLeader
+        if cfg.load_num_warps > 1
+        else SignalingThreads.All
+    )
+    q_bytes_per_load_warp = (
+        cfg.smem_q_tile_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
+    )
+    kv_bytes_per_load_warp = (
+        cfg.smem_kv_tile_bytes // cfg.load_num_warps if cfg.load_num_warps > 1 else None
+    )
 
     # ------------------------------------------------------------------
     # Pipeline configs
@@ -518,10 +531,14 @@ def _build_decode_gen_schedule(
     # With cfg.keeps_stats_via_smem the stats-alias justification no longer
     # applies, but the shared FIFO still causes a material Q128 regression, so
     # the instruction-local FIFO gate remains part of that kernel policy.
-    use_per_inst_kv_resources = (cfg.use_block_sparse and cfg.tile_size_kv != 256) or (
-        cfg.use_keeps_mma_ab
-        and cfg.tile_size_kv != 256
-        and (not cfg.keeps_separates_tmem_s_and_stats or cfg.uses_two_inst_tmem_p)
+    use_per_inst_kv_resources = (
+        use_one_inst_qkv
+        or (cfg.use_block_sparse and cfg.tile_size_kv != 256)
+        or (
+            cfg.use_keeps_mma_ab
+            and cfg.tile_size_kv != 256
+            and (not cfg.keeps_separates_tmem_s_and_stats or cfg.uses_two_inst_tmem_p)
+        )
     )
     # B8/B16 issue enough fine-grained TMA copies to benefit from reusing a
     # padding warp as a second issuer. The host policy applies one KV-side
@@ -549,6 +566,8 @@ def _build_decode_gen_schedule(
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
+        producer_signaling_threads=tma_producer_signaling,
+        num_bytes_per_warp_per_cta=q_bytes_per_load_warp,
         advance_on_wait=True,
     )
     smem_kv_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -557,6 +576,8 @@ def _build_decode_gen_schedule(
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
+        producer_signaling_threads=tma_producer_signaling,
+        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
         advance_on_wait=True,
     )
     smem_k0_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -565,6 +586,8 @@ def _build_decode_gen_schedule(
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
+        producer_signaling_threads=tma_producer_signaling,
+        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
         advance_on_wait=True,
     )
     smem_k1_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -573,6 +596,8 @@ def _build_decode_gen_schedule(
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
+        producer_signaling_threads=tma_producer_signaling,
+        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
         advance_on_wait=True,
     )
     smem_v0_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -581,6 +606,8 @@ def _build_decode_gen_schedule(
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
+        producer_signaling_threads=tma_producer_signaling,
+        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
         advance_on_wait=True,
     )
     smem_v1_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
@@ -589,6 +616,8 @@ def _build_decode_gen_schedule(
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
+        producer_signaling_threads=tma_producer_signaling,
+        num_bytes_per_warp_per_cta=kv_bytes_per_load_warp,
         advance_on_wait=True,
     )
 
@@ -612,6 +641,11 @@ def _build_decode_gen_schedule(
         page_offsets_stages = (
             3 if use_separate_kv_page_offset_resources else cfg.page_offsets_stages
         )
+        if use_native_paged_kv and cfg.uses_held_encoded_locator_window:
+            # QSA publishes its complete CTA-local locator span once per work
+            # tile and holds it through the K/V tail. Only one stage is live
+            # for direct, persistent, and split-KV routes alike.
+            page_offsets_stages = 1
         smem_page_offsets_cfg = _make_page_offsets_cfg(page_offsets_stages)
         if use_separate_kv_page_offset_resources:
             smem_page_offsets_v_cfg = _make_page_offsets_cfg(page_offsets_stages)
@@ -733,10 +767,6 @@ def _build_decode_gen_schedule(
     work_queue = None
     schedule_token_throttle = None
     smem_kv_reuse_credit = None
-    # CLC remains the single persistent policy for every supported topology.
-    # The stock static WorkQueue advances and decodes coordinates separately
-    # in every task, which regresses multi-wave decode workloads. CLC computes
-    # each schedule token once on the scheduler warp and broadcasts it to the workers.
     use_clc_dynamic = cfg.use_persistent_scheduler
     per_inst_block_sparse_load_topology = None
     if supports_per_inst_block_sparse_load_tasks:
@@ -753,7 +783,7 @@ def _build_decode_gen_schedule(
         per_inst_block_sparse_load_topology is not None
     )
     if use_clc_dynamic:
-        num_consumer_threads = 16 * WARP_SIZE
+        num_consumer_threads = cfg.threads_per_cta
         wq_pipeline_config = PipelineConfig.create_clc_fetch_async_pipeline_cfg(
             num_stages=_PERSISTENT_SCHEDULE_TOKEN_STAGES,
             num_bytes=16,
@@ -781,6 +811,7 @@ def _build_decode_gen_schedule(
             )
         else:
             work_queue = WorkQueue(**work_queue_kwargs)
+
         schedule_token_throttle = ScheduleTokenThrottleResource(
             pipeline_config=PipelineConfig.create_async_async_pipeline_cfg(
                 num_stages=_PERSISTENT_SCHEDULE_TOKEN_STAGES,
@@ -1040,6 +1071,10 @@ def _build_decode_gen_schedule(
     # explicit descriptor route.
     tmem_s0.q_ref = smem_q
     tmem_s1.q_ref = smem_q
+    if cfg.uses_qsa_page_membership:
+        assert smem_page_offsets is not None
+        tmem_s0.page_offsets_ref = smem_page_offsets
+        tmem_s1.page_offsets_ref = smem_page_offsets
 
     smem_p0 = SmemPResource(
         inst_id=0,
@@ -1438,6 +1473,8 @@ def _build_decode_gen_schedule(
             (cfg.wg1_padding_warp_idx, cfg.wg1_padding_num_warps),
             (cfg.wg2_padding_warp_idx, cfg.wg2_padding_num_warps),
             (cfg.wg3_padding_warp_idx, cfg.wg3_padding_num_warps),
+            (cfg.wg4_padding_warp_idx, cfg.wg4_padding_num_warps),
+            (cfg.wg5_padding_warp_idx, cfg.wg5_padding_num_warps),
         )
     padding_tasks = [
         create_padding_task(
@@ -1603,12 +1640,22 @@ def _build_decode_gen_schedule(
     ] = {}
     if smem_page_offsets is not None:
         if use_one_inst_qkv:
-            dma_consumer_release_labels.update(
-                {
-                    (smem_page_offsets, smem_k0): {"read_offsets_k0"},
-                    (smem_page_offsets, smem_v0): {"read_offsets_v0"},
-                }
-            )
+            if smem_page_offsets.holds_encoded_locator_window:
+                # One consumer stage remains live across the complete K/V
+                # cadence, so both DMA edges share its final release label.
+                dma_consumer_release_labels.update(
+                    {
+                        (smem_page_offsets, smem_k0): {"read_offsets"},
+                        (smem_page_offsets, smem_v0): {"read_offsets"},
+                    }
+                )
+            else:
+                dma_consumer_release_labels.update(
+                    {
+                        (smem_page_offsets, smem_k0): {"read_offsets_k0"},
+                        (smem_page_offsets, smem_v0): {"read_offsets_v0"},
+                    }
+                )
         elif use_per_inst_kv_resources:
             if smem_page_offsets_v is not None:
                 dma_consumer_release_labels.update(
@@ -1630,7 +1677,12 @@ def _build_decode_gen_schedule(
                 )
         else:
             dma_consumer_release_labels[(smem_page_offsets, smem_kv)] = {
-                "cache_page_ids" if cfg.num_head_dim_stages_kv > 1 else "read_offsets"
+                (
+                    "cache_page_ids"
+                    if cfg.num_head_dim_stages_kv > 1
+                    and not cfg.uses_encoded_subpage_locators
+                    else "read_offsets"
+                )
             }
     if smem_kv is not None:
         dma_consumer_release_labels.update(
@@ -1729,9 +1781,11 @@ def _build_decode_gen_schedule(
             tmem_allocator.add_resource(tmem_softmax_local1)
     else:
         tmem_allocator.add_resource(tmem_s0)
-        tmem_allocator.add_resource(tmem_s1)
+        if not use_one_inst_qkv:
+            tmem_allocator.add_resource(tmem_s1)
         tmem_allocator.add_resource(tmem_softmax_local0)
-        tmem_allocator.add_resource(tmem_softmax_local1)
+        if not use_one_inst_qkv:
+            tmem_allocator.add_resource(tmem_softmax_local1)
     tmem_allocator.add_resource(tmem_o)
     tmem_allocator.compute_layout()
     if cfg.use_keeps_mma_ab and not use_one_inst_qkv and not cfg.uses_tmem_p:
@@ -2107,7 +2161,13 @@ def _run_decode_gen_active(
         dma_consumer_release_labels=dma_consumer_release_labels,
         skip_validation=True,
         verbose=False,
-        exhaustive_deadlock_race_check=not _has_unmodeled_tmem_p_alias_protocol(cfg),
+        # Kernel construction is a latency-sensitive JIT path and may run once
+        # per CUDA-graph bucket on every TP rank.  Keep the cheap structural
+        # checks here, but leave the exhaustive interleaving proof to
+        # build_decode_task_manager() and its offline tests.  `skip_validation`
+        # only changes failures into warnings; it does not skip the expensive
+        # state-space search.
+        exhaustive_deadlock_race_check=False,
         smem_allocator=smem_allocator,
         tmem_allocator=tmem_allocator,
     )
@@ -2269,6 +2329,16 @@ def _run_decode_gen_runtime_prefix(
         if cutlass.const_expr(not cfg.use_separate_reduction_kernel):
             # Preserve one neutral producer for fused empty-K semantics.
             active_splits_kv = cute.math.max(active_splits_kv, Int32(1))
+            if cutlass.const_expr(
+                cfg.uses_qsa_encoded_page4_route
+                and not cfg.supports_cluster_smem_reduction
+            ):
+                # When only the final configured split is empty, retaining its
+                # neutral producer lets the fused GMEM reducer use the fully
+                # unrolled prefix instead of its dynamically guarded fallback.
+                # This also avoids changing the grid or adding a reducer launch.
+                if active_splits_kv == Int32(cfg.splits_kv - 1):
+                    active_splits_kv = Int32(cfg.splits_kv)
         split_idx = q_group_cta_idx % Int32(cfg.splits_kv)
         split_is_active = split_idx < active_splits_kv
 
@@ -2524,7 +2594,11 @@ def fmha_decode_launch(
     paged_kv_indices_iter: cute.Pointer | None = None,
     num_physical_kv_pages: Int64 = 0,
     k_page_stride: Int64 = 0,
+    k_head_stride: Int64 = 0,
+    k_token_stride: Int64 = 0,
     v_page_stride: Int64 = 0,
+    v_head_stride: Int64 = 0,
+    v_token_stride: Int64 = 0,
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     use_static_native_seqlens_kv: cutlass.Constexpr[bool] = False,
 ) -> None:
@@ -2546,9 +2620,10 @@ def fmha_decode_launch(
     q_seq = Int32(cfg.max_seq_len_q)
     if cutlass.const_expr(cfg.use_paged_kv):
         if cutlass.const_expr(use_native_paged_kv):
+            storage_tokens_per_page = Int32(cfg.effective_storage_tokens_per_page)
             kv_shape = (
                 d,
-                Int32(cfg.num_tokens_per_page),
+                storage_tokens_per_page,
                 h_k,
                 num_physical_kv_pages,
             )
@@ -2556,8 +2631,8 @@ def fmha_decode_launch(
                 kv_shape,
                 stride=(
                     1,
-                    d,
-                    d * Int32(cfg.num_tokens_per_page),
+                    k_token_stride,
+                    k_head_stride,
                     k_page_stride,
                 ),
             )
@@ -2565,8 +2640,8 @@ def fmha_decode_launch(
                 kv_shape,
                 stride=(
                     1,
-                    d,
-                    d * Int32(cfg.num_tokens_per_page),
+                    v_token_stride,
+                    v_head_stride,
                     v_page_stride,
                 ),
             )
