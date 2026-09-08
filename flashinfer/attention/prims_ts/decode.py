@@ -62,6 +62,9 @@ _WORKSPACE_DTYPES = (torch.int8, torch.uint8)
 _MAX_HEAD_RATIO = 128
 _QSA_GROUPING_MAX_TILE_SIZE_Q = 64
 _QSA_SUPPORTED_GROUP_SIZES = (1, 2, 4, 5)
+_QSA_SUPPORTED_TILE_SIZES_Q = (8, 16, 32, 64)
+_QSA_TILE_SIZE_KV = 128
+_QSA_GROUPED_MIN_LOOP_ITERS_PER_SPLIT = 2
 # The shared standalone reducer supports up to 128 splits. Fixed decode selects
 # the largest useful fanout that stays within the first service wave; grouped
 # routes retain at least two K/V iterations per CTA and packed prefill remains
@@ -1513,14 +1516,14 @@ def _resolve_qsa_decode_config(
             "and a causal non-windowed mask"
         )
 
-    group_rows = heads_q_per_kv * seq_len_q
-    qsa_tile_size_q = next(
-        tile_size_q for tile_size_q in (8, 16, 32, 64) if group_rows <= tile_size_q
+    qsa_tile_size_q, qsa_num_insts_kv = _prims_ts_qsa_group_launch_profile(
+        seq_len_q,
+        heads_q_per_kv,
     )
     if seq_len_q == 1 and q_dtype_key == "float8_e4m3fn":
         qsa_tile_size_q = 64
     qsa_use_keeps = qsa_tile_size_q == 64
-    qsa_num_insts_kv = 1 if qsa_use_keeps else 2
+    qsa_num_insts_kv = 1 if qsa_use_keeps else qsa_num_insts_kv
 
     # Packed prefill keeps its caller-provided routes nonsplit. Fixed decode
     # fills, but never crosses, the first service wave; the fanout is
@@ -1532,7 +1535,7 @@ def _resolve_qsa_decode_config(
             seq_len_kv=max_kv_len,
             batch_size=batch_size,
             num_heads_kv=num_kv_heads,
-            tile_size_kv=128,
+            tile_size_kv=_QSA_TILE_SIZE_KV,
             num_insts_kv=qsa_num_insts_kv,
             num_q_tiles=1,
             service_capacity=max_active_clusters,
@@ -1561,7 +1564,7 @@ def _resolve_qsa_decode_config(
         "use_keeps_mma_ab": qsa_use_keeps,
         "groups_tokens_heads_q": True,
         "tile_size_q": qsa_tile_size_q,
-        "tile_size_kv": 128,
+        "tile_size_kv": _QSA_TILE_SIZE_KV,
         "head_dim_per_stage_kv": 128,
         "num_insts_kv": qsa_num_insts_kv,
         "use_persistent_scheduler": False,
@@ -2236,6 +2239,128 @@ def _validate_prims_ts_qsa_group_capacity(
         )
 
     return group_size
+
+
+def _prims_ts_qsa_group_launch_profile(
+    group_size: int,
+    heads_q_per_kv: int,
+) -> tuple[int, int]:
+    """Return the qualified TileQ and K/V instructions for one QSA group."""
+
+    group_rows = group_size * heads_q_per_kv
+    tile_size_q = next(
+        tile_size_q
+        for tile_size_q in _QSA_SUPPORTED_TILE_SIZES_Q
+        if group_rows <= tile_size_q
+    )
+    num_insts_kv = 1 if tile_size_q == _QSA_GROUPING_MAX_TILE_SIZE_Q else 2
+    return tile_size_q, num_insts_kv
+
+
+@flashinfer_api
+def suggest_prims_ts_qsa_group_size(
+    batch_size: int,
+    seq_len_q: int,
+    selected_seq_len_kv: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    multi_processor_count: int,
+) -> int:
+    """Suggest an occupancy-aware Q1/Q2/Q4/Q5 group size.
+
+    This pure host-side policy uses the caller-provided SM count; it never
+    queries device properties or reads tensors. It prefers the largest legal
+    group whose independent routes and useful split-KV fanout can fill one SM
+    wave. If no group can fill a wave, it returns the smallest legal group to
+    expose the most independent query routes.
+
+    Query lengths need not be divisible by the result. Packed prefill may end
+    each request with a shorter route. Fixed-shape decode may pad its final
+    ``[B, num_query_groups, G, Hq, D]`` route with consecutive semantic dummy
+    rows and discard their outputs.
+
+    ``selected_seq_len_kv`` is the maximum candidate K/V-token count for one
+    query, including its causal tail. For grouped routes, the policy uses the
+    conservative pre-union bound ``G * selected_seq_len_kv``; overlap between
+    queries may make the runtime compact union shorter.
+
+    Parameters
+    ----------
+    batch_size : int
+        Number of requests in the launch.
+    seq_len_q : int
+        Maximum number of live query tokens per request.
+    selected_seq_len_kv : int
+        Maximum selected candidate K/V tokens per query, including the causal
+        tail. This is not the original context length or global cache capacity.
+    num_qo_heads : int
+        Number of query/output heads.
+    num_kv_heads : int
+        Number of key/value heads.
+    multi_processor_count : int
+        Number of SMs available to the launch. Frameworks should query it once
+        and pass the cached value; this function performs no device query.
+
+    Returns
+    -------
+    int
+        One of Q1, Q2, Q4, or Q5, subject to the TileQ64 head-capacity bound.
+    """
+
+    batch_size = _validate_positive_int(batch_size, "batch_size")
+    seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
+    selected_seq_len_kv = _validate_positive_int(
+        selected_seq_len_kv, "selected_seq_len_kv"
+    )
+    multi_processor_count = _validate_positive_int(
+        multi_processor_count, "multi_processor_count"
+    )
+    _validate_head_geometry(num_qo_heads, num_kv_heads)
+    heads_q_per_kv = num_qo_heads // num_kv_heads
+
+    legal_group_sizes = tuple(
+        group_size
+        for group_size in _QSA_SUPPORTED_GROUP_SIZES
+        if group_size <= seq_len_q
+        and group_size * heads_q_per_kv <= _QSA_GROUPING_MAX_TILE_SIZE_Q
+    )
+    if not legal_group_sizes:
+        raise ValueError(
+            "QSA requires at least one supported group size that fits "
+            "TileQ64/head capacity"
+        )
+
+    for group_size in reversed(legal_group_sizes):
+        _, num_insts_kv = _prims_ts_qsa_group_launch_profile(
+            group_size,
+            heads_q_per_kv,
+        )
+        groups_per_request = (seq_len_q + group_size - 1) // group_size
+        base_ctas = batch_size * num_kv_heads * groups_per_request
+        if base_ctas >= multi_processor_count:
+            return group_size
+
+        # Mirror the current QSA split work bound. Q1 has no union-membership
+        # work and permits one K/V pipeline iteration; grouped routes retain
+        # two iterations per split to amortize standalone reduction.
+        min_loop_iters = (
+            1 if group_size == 1 else _QSA_GROUPED_MIN_LOOP_ITERS_PER_SPLIT
+        )
+        route_candidate_kv = group_size * selected_seq_len_kv
+        tokens_per_split = _QSA_TILE_SIZE_KV * num_insts_kv * min_loop_iters
+        max_useful_splits = max(
+            1,
+            (route_candidate_kv + tokens_per_split - 1) // tokens_per_split,
+        )
+        max_useful_splits = min(
+            max_useful_splits,
+            _QSA_Q1_MAX_SPLITS_KV if group_size == 1 else _QSA_MAX_SPLITS_KV,
+        )
+        one_wave_splits = max(multi_processor_count // base_ctas, 1)
+        if max_useful_splits >= one_wave_splits:
+            return group_size
+
+    return legal_group_sizes[0]
 
 
 def _validate_prims_ts_qsa_group_layout(
@@ -3809,6 +3934,7 @@ __all__ = [
     "batch_decode_with_paged_kv_cache",
     "get_prims_ts_batch_decode_workspace_size",
     "make_prims_ts_qsa_qo_indptr",
+    "suggest_prims_ts_qsa_group_size",
     "validate_prims_ts_qsa_group_size",
     "prepare_prims_ts_batch_decode_with_kv_cache",
     "prims_ts_batch_decode_with_kv_cache",

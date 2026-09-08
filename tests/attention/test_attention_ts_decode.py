@@ -83,6 +83,7 @@ from flashinfer.decode import (
     make_prims_ts_qsa_qo_indptr,
     prepare_prims_ts_batch_decode_with_kv_cache,
     prims_ts_batch_decode_with_kv_cache,
+    suggest_prims_ts_qsa_group_size,
     validate_prims_ts_qsa_group_size,
 )
 from flashinfer.utils import is_sm100a_supported
@@ -174,6 +175,80 @@ def test_prims_ts_qsa_fixed_group_validation_is_public() -> None:
             1,
             group_size=4,
         )
+
+
+@pytest.mark.parametrize(
+    (
+        "batch_size",
+        "seq_len_q",
+        "selected_seq_len_kv",
+        "num_qo_heads",
+        "num_kv_heads",
+        "multi_processor_count",
+        "expected_group_size",
+    ),
+    (
+        # One MTP3 request cannot fill a wave even after useful split-KV, so
+        # expose four independent Q1 routes instead of building one Q4 union.
+        (1, 4, 2051, 12, 1, 152, 1),
+        # Eight MTP3 requests have enough K/V work to fill a wave as Q4.
+        (8, 4, 2051, 12, 1, 152, 4),
+        # Q5 fits TileQ64 for Qwen's twelve query heads per K/V head.
+        (16, 5, 2051, 12, 1, 152, 5),
+        # Divisibility is not required: two Q2 routes cover three live rows.
+        (64, 3, 2051, 12, 1, 152, 2),
+        # A long packed-prefill request supplies independent routes directly.
+        (1, 8192, 2051, 12, 1, 152, 5),
+        # Head capacity, rather than SQ, caps the largest legal group.
+        (8, 5, 2051, 16, 1, 152, 4),
+    ),
+)
+def test_suggest_prims_ts_qsa_group_size(
+    batch_size: int,
+    seq_len_q: int,
+    selected_seq_len_kv: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    multi_processor_count: int,
+    expected_group_size: int,
+) -> None:
+    assert (
+        suggest_prims_ts_qsa_group_size(
+            batch_size,
+            seq_len_q,
+            selected_seq_len_kv,
+            num_qo_heads,
+            num_kv_heads,
+            multi_processor_count,
+        )
+        == expected_group_size
+    )
+
+
+@pytest.mark.parametrize(
+    ("argument", "value"),
+    (
+        ("batch_size", 0),
+        ("seq_len_q", True),
+        ("selected_seq_len_kv", -1),
+        ("multi_processor_count", 0),
+    ),
+)
+def test_suggest_prims_ts_qsa_group_size_rejects_invalid_extent(
+    argument: str,
+    value: object,
+) -> None:
+    arguments: dict[str, object] = {
+        "batch_size": 8,
+        "seq_len_q": 4,
+        "selected_seq_len_kv": 2051,
+        "num_qo_heads": 12,
+        "num_kv_heads": 1,
+        "multi_processor_count": 152,
+    }
+    arguments[argument] = value
+    with pytest.raises((TypeError, ValueError)):
+        suggest_prims_ts_qsa_group_size(**arguments)
 
 
 @pytest.mark.parametrize(

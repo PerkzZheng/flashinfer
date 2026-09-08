@@ -161,10 +161,11 @@ _PRIMS_TS_LAZY_EXPORTS = (
         {
             "PrimsTSBatchDecodePlan",
             "get_prims_ts_batch_decode_workspace_size",
-            "validate_prims_ts_qsa_group_size",
             "make_prims_ts_qsa_qo_indptr",
             "prepare_prims_ts_batch_decode_with_kv_cache",
             "prims_ts_batch_decode_with_kv_cache",
+            "suggest_prims_ts_qsa_group_size",
+            "validate_prims_ts_qsa_group_size",
         }
     )
     | _PRIMS_TS_QSA_METADATA_LAZY_EXPORTS

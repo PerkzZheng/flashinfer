@@ -27,7 +27,9 @@ route's live locator prefix, and no value is promised for the unused locator
 suffix or membership padding. The combined calls below keep this metadata
 hidden and do not add it to the public attention signature.
 
-The caller fixes ``G``. QSA normally chooses the smallest qualified TileQ in
+The caller fixes ``G`` for a prepared plan. The optional pure-host group-size
+suggestion helper uses a caller-cached SM count and never queries the device or
+reads a tensor. QSA normally chooses the smallest qualified TileQ in
 8/16/32/64 that can hold ``G * (Hq / Hkv)`` rows and always uses a 128-token
 K/V tile. FP8 Q1 uses its qualified Q64/Keeps profile. Packed prefill is
 nonsplit; fixed decode fills, but does not cross, the first active-CTA service
@@ -55,6 +57,7 @@ from flashinfer.attention.prims_ts import (
     get_prims_ts_qsa_workspace_size,
     make_prims_ts_qsa_qo_indptr,
     prepare_prims_ts_qsa_attention,
+    suggest_prims_ts_qsa_group_size,
     validate_prims_ts_qsa_group_size,
 )
 
@@ -194,12 +197,27 @@ def run_packed_prefill(device: torch.device) -> None:
 
 
 def run_fixed_mtp_decode(device: torch.device) -> None:
-    """Run causal MTP decode with one caller-fixed group per route."""
+    """Run causal MTP decode with one suggested, then caller-fixed, group."""
 
     batch_size = 8
     num_query_groups = 1
     mtp_num_speculative_tokens = 3
-    group_size = mtp_num_speculative_tokens + 1
+    seq_len_q = mtp_num_speculative_tokens + 1
+    multi_processor_count = torch.cuda.get_device_properties(
+        device
+    ).multi_processor_count
+    group_size = suggest_prims_ts_qsa_group_size(
+        batch_size,
+        seq_len_q,
+        _BLOCK_TOPK * _SPARSE_BLOCK_SIZE + (_SPARSE_BLOCK_SIZE - 1),
+        _NUM_QO_HEADS,
+        _NUM_KV_HEADS,
+        multi_processor_count,
+    )
+    # This BS8/MTP3 example has enough useful split-K/V work to retain Q4 on
+    # current SM100/SM103 GPUs. Frameworks keep the returned G static for the
+    # lifetime of the prepared plan.
+    assert group_size == seq_len_q
     num_query_tokens = batch_size * num_query_groups * group_size
 
     # vLLM owns flat token storage and exposes this zero-copy fixed decode view.

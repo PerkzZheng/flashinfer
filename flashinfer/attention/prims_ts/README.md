@@ -16,7 +16,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | --- | --- | --- |
 | FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache`, `prims_ts_batch_decode_with_kv_cache` |
-| QSA sparse-block | [Packed-prefill and fixed-decode example](../../../examples/prims_ts/qsa_page4_attention.py) | `PrimsTSQSAPlan`, `validate_prims_ts_qsa_group_size`, `make_prims_ts_qsa_qo_indptr`, `get_prims_ts_qsa_workspace_size`, `prepare_prims_ts_qsa_attention`, `prims_ts_qsa_attention`; advanced metadata: `get_prims_ts_qsa_metadata_output_shapes`, `build_prims_ts_qsa_metadata` |
+| QSA sparse-block | [Packed-prefill and fixed-decode example](../../../examples/prims_ts/qsa_page4_attention.py) | `PrimsTSQSAPlan`, `suggest_prims_ts_qsa_group_size`, `validate_prims_ts_qsa_group_size`, `make_prims_ts_qsa_qo_indptr`, `get_prims_ts_qsa_workspace_size`, `prepare_prims_ts_qsa_attention`, `prims_ts_qsa_attention`; advanced metadata: `get_prims_ts_qsa_metadata_output_shapes`, `build_prims_ts_qsa_metadata` |
 | Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_decode_mla_with_paged_kv_cache`, `get_prims_ts_batch_decode_mla_workspace_size`, `prims_ts_batch_decode_with_kv_cache_mla` |
 
@@ -74,18 +74,29 @@ For one route, the scheduler computes
 TileQ in 8, 16, 32, or 64 that contains those rows. TileQ8 supports both direct
 and split routes because the standalone reducer consumes actual logical rows.
 Thus the caller fixes the semantic query group while the kernel caps padding
-deterministically; it does not rewrite `group_size` from workload thresholds.
+deterministically; attention does not rewrite `group_size` at launch time.
 
-The framework chooses `group_size` explicitly from 1, 2, 4, or 5.
+The framework chooses `group_size` explicitly from 1, 2, 4, or 5. The optional
+pure-host `suggest_prims_ts_qsa_group_size` policy prefers the largest legal
+group whose request routes and useful split-KV fanout can fill one SM wave,
+then falls back toward Q1 to expose more independent routes. The caller passes
+a cached `multi_processor_count`; the helper performs no device query or tensor
+read and is safe to use while building a CUDA-graph plan. Its
+`selected_seq_len_kv` argument is the per-query candidate-token bound,
+including the causal tail, rather than the original context length or global
+cache capacity.
 `validate_prims_ts_qsa_group_size` verifies that
 `group_size * (Hq / Hkv) <= 64`; the combined workspace and launch APIs enforce
 the same invariant even when the helper is not called. Packed prefill uses
 `[total_q, Hq, D]` with request-safe `qo_indptr` routes whose maximum length is
-the selected group size and always runs without split-KV. Uniform MTP decode
-uses `[B, num_query_groups, group_size, Hq, D]` without query offsets. Fixed
-decode may split K/V to fill otherwise idle capacity, but its fanout never
-crosses the first active-CTA service wave, is bounded by available K/V work,
-and is capped at 8.
+the selected group size and always runs without split-KV. Query lengths need
+not be divisible by the selected group: packed routes may be short, while a
+fixed route may use consecutive semantic dummy rows for its suffix and discard
+their outputs. Uniform MTP decode uses
+`[B, num_query_groups, group_size, Hq, D]` without query offsets. Fixed decode
+may split K/V to fill otherwise idle capacity, but its fanout never crosses the
+first active-CTA service wave, is bounded by available K/V work, and uses the
+qualified Q1 or grouped reducer fanout cap.
 
 Prefer `prepare_prims_ts_qsa_attention` for serving and CUDA graphs. Allocate
 a byte-addressed workspace of the size returned by

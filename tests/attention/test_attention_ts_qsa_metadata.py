@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 
 import pytest
 import torch
@@ -28,7 +29,10 @@ from flashinfer.attention.prims_ts.qsa_metadata import (
     prepare_prims_ts_qsa_attention,
     prims_ts_qsa_attention,
 )
-from flashinfer.decode import make_prims_ts_qsa_qo_indptr
+from flashinfer.decode import (
+    make_prims_ts_qsa_qo_indptr,
+    suggest_prims_ts_qsa_group_size,
+)
 
 
 def test_qsa_apis_are_available_from_flashinfer_decode() -> None:
@@ -42,6 +46,7 @@ def test_qsa_apis_are_available_from_flashinfer_decode() -> None:
         "make_prims_ts_qsa_qo_indptr",
         "prepare_prims_ts_qsa_attention",
         "prims_ts_qsa_attention",
+        "suggest_prims_ts_qsa_group_size",
         "validate_prims_ts_qsa_group_size",
     )
 
@@ -109,6 +114,25 @@ def test_qsa_packed_route_count_respects_requests_and_query_group_size(
         device="cpu",
     )
     assert tuple(actual.tolist()) == expected
+
+
+def test_qsa_suggested_group_supports_partial_packed_routes() -> None:
+    group_size = suggest_prims_ts_qsa_group_size(
+        batch_size=2,
+        seq_len_q=5,
+        selected_seq_len_kv=2051,
+        num_qo_heads=12,
+        num_kv_heads=1,
+        multi_processor_count=1,
+    )
+    assert group_size == 5
+    actual = make_prims_ts_qsa_qo_indptr(
+        torch.tensor((0, 5, 8), dtype=torch.int32),
+        8,
+        group_size=group_size,
+        device="cpu",
+    )
+    assert tuple(actual.tolist()) == (0, 5, 8)
 
 
 def test_qsa_sparse_block_size_default_matches_explicit_four() -> None:
@@ -1952,6 +1976,111 @@ def test_qsa_fixed_decode_matches_packed_prefill_layout(group_size: int) -> None
     fixed_output = run(fixed_query)
     packed_output = run(packed_query, packed_qo_indptr=qo_indptr)
     torch.testing.assert_close(fixed_output.reshape_as(packed_output), packed_output)
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_qsa_fixed_decode_supports_suggested_padded_final_route() -> None:
+    """Automatic Q2 may pad SQ3 with one disposable semantic row."""
+
+    seq_len_q = 3
+    group_size = suggest_prims_ts_qsa_group_size(
+        batch_size=1,
+        seq_len_q=seq_len_q,
+        selected_seq_len_kv=2051,
+        num_qo_heads=12,
+        num_kv_heads=1,
+        multi_processor_count=1,
+    )
+    assert group_size == 2
+    live_rows = seq_len_q
+    blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
+    rows = math.ceil(seq_len_q / group_size) * group_size
+    blocks = blocks[:rows].clone()
+    table = table[:1].clone()
+    requests = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    positions = torch.arange(
+        int(positions[0].item()),
+        int(positions[0].item()) + rows,
+        dtype=torch.int64,
+        device="cuda",
+    )
+    torch.manual_seed(2026)
+    fixed_query = torch.randn(
+        1,
+        rows // group_size,
+        group_size,
+        12,
+        256,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    packed_query = fixed_query.reshape(rows, 12, 256)[:live_rows].contiguous()
+    qo_indptr = torch.tensor(
+        (0, group_size, live_rows), dtype=torch.int32, device="cuda"
+    )
+    k_cache = torch.randn(
+        int(table.max().item()) + 1,
+        1,
+        storage_page_size,
+        256,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    v_cache = torch.randn_like(k_cache)
+
+    def run(
+        query: torch.Tensor,
+        actual_blocks: torch.Tensor,
+        actual_requests: torch.Tensor,
+        actual_positions: torch.Tensor,
+        *,
+        packed_qo_indptr: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        output = torch.empty_like(query)
+        workspace = torch.empty(
+            get_prims_ts_qsa_workspace_size(
+                query,
+                k_cache,
+                table,
+                block_topk=blocks.shape[1],
+                max_seq_len_kv=table.shape[1] * storage_page_size,
+                out_dtype=output.dtype,
+                qo_indptr=packed_qo_indptr,
+                max_seq_len_q=(group_size if packed_qo_indptr is not None else None),
+            ),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        return prims_ts_qsa_attention(
+            query,
+            (k_cache, v_cache),
+            actual_blocks,
+            table,
+            actual_requests,
+            actual_positions,
+            workspace,
+            out=output,
+            max_seq_len_kv=table.shape[1] * storage_page_size,
+            qo_indptr=packed_qo_indptr,
+            max_seq_len_q=(group_size if packed_qo_indptr is not None else None),
+        )
+
+    fixed_output = run(fixed_query, blocks, requests, positions)
+    packed_output = run(
+        packed_query,
+        blocks[:live_rows],
+        requests[:live_rows],
+        positions[:live_rows],
+        packed_qo_indptr=qo_indptr,
+    )
+    assert torch.isfinite(fixed_output).all()
+    torch.testing.assert_close(
+        fixed_output.reshape(rows, 12, 256)[:live_rows],
+        packed_output,
+        rtol=1e-2,
+        atol=1e-2,
+    )
 
 
 @pytest.mark.arch_blackwell

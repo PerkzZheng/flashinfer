@@ -83,6 +83,7 @@ public call signature.
     :toctree: ../generated
 
     validate_prims_ts_qsa_group_size
+    suggest_prims_ts_qsa_group_size
     make_prims_ts_qsa_qo_indptr
     get_prims_ts_qsa_workspace_size
     prepare_prims_ts_qsa_attention
