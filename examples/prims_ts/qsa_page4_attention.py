@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""PrimTS QSA examples for packed prefill and fixed-shape MTP decode.
+"""QToken-KvBlock-Sparse-Attention packed-prefill and MTP-decode examples.
 
 These are the two layouts used by serving-framework integrations. Prefill keeps
 queries packed as ``[total_q, Hq, D]`` and supplies request-safe route offsets.
@@ -36,7 +36,7 @@ nonsplit; fixed decode fills, but does not cross, the first active-CTA service
 wave while retaining useful K/V work per split. Q1 is capped at split eight;
 grouped routes use the shared reducer's supported fanout. The current
 production route is causal and non-windowed.
-``sparse_block_size`` is an explicit power-of-two API parameter
+``kv_block_size`` is an explicit power-of-two API parameter
 so integrations do not bake the current specialization into their interface,
 although only block size four is implemented today.
 ``max_seq_len_kv`` is the plan-time upper bound on the logical context length,
@@ -54,11 +54,11 @@ from __future__ import annotations
 import torch
 
 from flashinfer.attention.prims_ts import (
-    get_prims_ts_qsa_workspace_size,
-    make_prims_ts_qsa_qo_indptr,
-    prepare_prims_ts_qsa_attention,
-    suggest_prims_ts_qsa_group_size,
-    validate_prims_ts_qsa_group_size,
+    QTokenKvBlockSparsePagedTSWrapper,
+    get_q_token_kv_block_sparse_workspace_size,
+    make_q_token_kv_block_sparse_qo_indptr,
+    suggest_q_token_kv_block_sparse_group_size,
+    validate_q_token_kv_block_sparse_group_size,
 )
 
 
@@ -66,7 +66,7 @@ _NUM_QO_HEADS = 12
 _NUM_KV_HEADS = 1
 _HEAD_DIM = 256
 _BLOCK_TOPK = 512
-_SPARSE_BLOCK_SIZE = 4
+_KV_BLOCK_SIZE = 4
 _STORAGE_PAGE_SIZE = 16
 _CONTEXT_LENGTH = 8192
 
@@ -95,7 +95,7 @@ def _make_cache_and_block_table(
     return k_cache, v_cache, block_table
 
 
-def _make_block_indices(
+def _make_indexer_block_ids(
     num_query_tokens: int,
     device: torch.device,
 ) -> torch.Tensor:
@@ -119,7 +119,7 @@ def run_packed_prefill(device: torch.device) -> None:
         device=device,
     )
     k_cache, v_cache, block_table = _make_cache_and_block_table(num_requests, device)
-    block_indices = _make_block_indices(num_query_tokens, device)
+    indexer_block_ids = _make_indexer_block_ids(num_query_tokens, device)
     token_to_request = torch.tensor(
         [0] * request_q_lengths[0] + [1] * request_q_lengths[1],
         dtype=torch.int32,
@@ -139,53 +139,59 @@ def run_packed_prefill(device: torch.device) -> None:
         device="cpu",
     )
 
-    group_size = validate_prims_ts_qsa_group_size(
+    group_size = validate_q_token_kv_block_sparse_group_size(
         query_start_loc_cpu,
         num_query_tokens,
         _NUM_QO_HEADS,
         _NUM_KV_HEADS,
         group_size=4,
     )
-    qo_indptr = make_prims_ts_qsa_qo_indptr(
+    qo_indptr = make_q_token_kv_block_sparse_qo_indptr(
         query_start_loc_cpu,
         num_query_tokens,
         group_size=group_size,
         device=device,
     )
     output = torch.empty_like(query)
-    workspace_bytes = get_prims_ts_qsa_workspace_size(
+    workspace_bytes = get_q_token_kv_block_sparse_workspace_size(
         query,
         k_cache,
         block_table,
         block_topk=_BLOCK_TOPK,
         max_seq_len_kv=_CONTEXT_LENGTH,
-        sparse_block_size=_SPARSE_BLOCK_SIZE,
-        out_dtype=output.dtype,
+        kv_block_size=_KV_BLOCK_SIZE,
+        o_data_type=output.dtype,
         qo_indptr=qo_indptr,
-        max_seq_len_q=group_size,
+        seq_len_q=group_size,
     )
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
 
-    plan = prepare_prims_ts_qsa_attention(
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        qo_indptr.numel() - 1,
+        group_size,
+        _NUM_QO_HEADS,
+        _NUM_KV_HEADS,
+        _HEAD_DIM,
+        _KV_BLOCK_SIZE,
+        _STORAGE_PAGE_SIZE,
+        _BLOCK_TOPK,
+        _CONTEXT_LENGTH,
+        device=device,
+        workspace_buffer=workspace,
+        use_packed_q=True,
+        q_data_type=query.dtype,
+        kv_data_type=k_cache.dtype,
+        o_data_type=output.dtype,
+    )
+    wrapper.run(
         query,
         (k_cache, v_cache),
-        block_indices,
         block_table,
+        indexer_block_ids,
         token_to_request,
         query_positions,
-        workspace,
-        max_seq_len_kv=_CONTEXT_LENGTH,
-        sparse_block_size=_SPARSE_BLOCK_SIZE,
-        out=output,
         qo_indptr=qo_indptr,
-        max_seq_len_q=group_size,
-    )
-    plan.run(
-        query,
-        block_indices,
-        block_table,
-        token_to_request,
-        query_positions,
         out=output,
     )
     torch.cuda.synchronize()
@@ -206,10 +212,10 @@ def run_fixed_mtp_decode(device: torch.device) -> None:
     multi_processor_count = torch.cuda.get_device_properties(
         device
     ).multi_processor_count
-    group_size = suggest_prims_ts_qsa_group_size(
+    group_size = suggest_q_token_kv_block_sparse_group_size(
         batch_size,
         seq_len_q,
-        _BLOCK_TOPK * _SPARSE_BLOCK_SIZE + (_SPARSE_BLOCK_SIZE - 1),
+        _BLOCK_TOPK * _KV_BLOCK_SIZE + (_KV_BLOCK_SIZE - 1),
         _NUM_QO_HEADS,
         _NUM_KV_HEADS,
         multi_processor_count,
@@ -238,7 +244,7 @@ def run_fixed_mtp_decode(device: torch.device) -> None:
     flat_output = torch.empty_like(flat_query)
     output = flat_output.view_as(query)
     k_cache, v_cache, block_table = _make_cache_and_block_table(batch_size, device)
-    block_indices = _make_block_indices(num_query_tokens, device)
+    indexer_block_ids = _make_indexer_block_ids(num_query_tokens, device)
     token_to_request = torch.arange(
         batch_size,
         dtype=torch.int32,
@@ -251,34 +257,40 @@ def run_fixed_mtp_decode(device: torch.device) -> None:
         device=device,
     ).repeat(batch_size * num_query_groups)
 
-    workspace_bytes = get_prims_ts_qsa_workspace_size(
+    workspace_bytes = get_q_token_kv_block_sparse_workspace_size(
         query,
         k_cache,
         block_table,
         block_topk=_BLOCK_TOPK,
         max_seq_len_kv=_CONTEXT_LENGTH,
-        sparse_block_size=_SPARSE_BLOCK_SIZE,
-        out_dtype=output.dtype,
+        kv_block_size=_KV_BLOCK_SIZE,
+        o_data_type=output.dtype,
     )
     workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
-    plan = prepare_prims_ts_qsa_attention(
-        query,
-        (k_cache, v_cache),
-        block_indices,
-        block_table,
-        token_to_request,
-        query_positions,
-        workspace,
-        max_seq_len_kv=_CONTEXT_LENGTH,
-        sparse_block_size=_SPARSE_BLOCK_SIZE,
-        out=output,
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        batch_size * num_query_groups,
+        group_size,
+        _NUM_QO_HEADS,
+        _NUM_KV_HEADS,
+        _HEAD_DIM,
+        _KV_BLOCK_SIZE,
+        _STORAGE_PAGE_SIZE,
+        _BLOCK_TOPK,
+        _CONTEXT_LENGTH,
+        device=device,
+        workspace_buffer=workspace,
+        q_data_type=query.dtype,
+        kv_data_type=k_cache.dtype,
+        o_data_type=output.dtype,
     )
 
     # Compile and initialize outside capture, then replay only the hot path.
-    plan.run(
+    wrapper.run(
         query,
-        block_indices,
+        (k_cache, v_cache),
         block_table,
+        indexer_block_ids,
         token_to_request,
         query_positions,
         out=output,
@@ -287,10 +299,11 @@ def run_fixed_mtp_decode(device: torch.device) -> None:
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        plan.run(
+        wrapper.run(
             query,
-            block_indices,
+            (k_cache, v_cache),
             block_table,
+            indexer_block_ids,
             token_to_request,
             query_positions,
             out=output,
@@ -301,7 +314,7 @@ def run_fixed_mtp_decode(device: torch.device) -> None:
     print(
         "fixed MTP decode: "
         f"query={tuple(query.shape)}, group_size={group_size}, "
-        f"sparse_block_size={_SPARSE_BLOCK_SIZE}, "
+        f"kv_block_size={_KV_BLOCK_SIZE}, "
         f"workspace_bytes={workspace_bytes}"
     )
 

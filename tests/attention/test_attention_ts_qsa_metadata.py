@@ -21,53 +21,159 @@ import pytest
 import torch
 
 from flashinfer.attention.prims_ts.qsa_metadata import (
+    QTokenKvBlockSparsePagedTSWrapper,
+    _build_q_token_kv_block_sparse_metadata as build_prims_ts_qsa_metadata,
+    _get_q_token_kv_block_sparse_metadata_output_shapes as get_prims_ts_qsa_metadata_output_shapes,
     _get_prims_ts_qsa_workspace_layout,
+    _prepare_q_token_kv_block_sparse_attention as prepare_prims_ts_qsa_attention,
     _validate_qsa_workspace_aliasing,
-    build_prims_ts_qsa_metadata,
-    get_prims_ts_qsa_metadata_output_shapes,
-    get_prims_ts_qsa_workspace_size,
-    prepare_prims_ts_qsa_attention,
-    prims_ts_qsa_attention,
+    get_q_token_kv_block_sparse_workspace_size,
+    q_token_kv_block_sparse_attention_with_paged_kv_cache,
 )
 from flashinfer.decode import (
-    make_prims_ts_qsa_qo_indptr,
-    suggest_prims_ts_qsa_group_size,
+    make_q_token_kv_block_sparse_qo_indptr as make_prims_ts_qsa_qo_indptr,
+    suggest_q_token_kv_block_sparse_group_size as suggest_prims_ts_qsa_group_size,
 )
+
+
+def get_prims_ts_qsa_workspace_size(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    block_topk: int,
+    max_seq_len_kv: int,
+    out_dtype: torch.dtype | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    max_seq_len_q: int | None = None,
+    sparse_block_size: int = 4,
+) -> int:
+    """Adapt internal accuracy cases to the renamed public workspace API."""
+
+    return get_q_token_kv_block_sparse_workspace_size(
+        query,
+        k_cache,
+        block_table,
+        block_topk=block_topk,
+        max_seq_len_kv=max_seq_len_kv,
+        o_data_type=out_dtype,
+        qo_indptr=qo_indptr,
+        seq_len_q=max_seq_len_q,
+        kv_block_size=sparse_block_size,
+    )
+
+
+def prims_ts_qsa_attention(
+    query: torch.Tensor,
+    paged_kv_cache: tuple[torch.Tensor, torch.Tensor],
+    block_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_request: torch.Tensor,
+    query_positions: torch.Tensor,
+    workspace_buffer: torch.Tensor,
+    *,
+    max_seq_len_kv: int,
+    bmm1_scale: float | None = None,
+    bmm2_scale: float = 1.0,
+    out: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    qo_indptr: torch.Tensor | None = None,
+    max_seq_len_q: int | None = None,
+    sparse_block_size: int = 4,
+) -> torch.Tensor:
+    """Adapt internal accuracy cases to the renamed public eager API."""
+
+    if bmm2_scale != 1.0:
+        raise ValueError("the public QToken API keeps output scaling internal")
+    return q_token_kv_block_sparse_attention_with_paged_kv_cache(
+        query,
+        paged_kv_cache,
+        block_table,
+        block_indices,
+        token_to_request,
+        query_positions,
+        workspace_buffer,
+        max_seq_len_kv=max_seq_len_kv,
+        seq_len_q=max_seq_len_q,
+        kv_block_size=sparse_block_size,
+        sm_scale=bmm1_scale,
+        out=out,
+        o_data_type=out_dtype,
+        qo_indptr=qo_indptr,
+    )
 
 
 def test_qsa_apis_are_available_from_flashinfer_decode() -> None:
     import flashinfer.decode as public_decode
 
     public_names = (
-        "PrimsTSQSAPlan",
-        "build_prims_ts_qsa_metadata",
-        "get_prims_ts_qsa_metadata_output_shapes",
-        "get_prims_ts_qsa_workspace_size",
-        "make_prims_ts_qsa_qo_indptr",
-        "prepare_prims_ts_qsa_attention",
-        "prims_ts_qsa_attention",
-        "suggest_prims_ts_qsa_group_size",
-        "validate_prims_ts_qsa_group_size",
+        "QTokenKvBlockSparsePagedTSWrapper",
+        "get_q_token_kv_block_sparse_workspace_size",
+        "make_q_token_kv_block_sparse_qo_indptr",
+        "q_token_kv_block_sparse_attention_with_paged_kv_cache",
+        "suggest_q_token_kv_block_sparse_group_size",
+        "validate_q_token_kv_block_sparse_group_size",
     )
 
     for name in public_names:
         assert getattr(public_decode, name) is not None
 
-    assert not hasattr(public_decode, "build_prims_ts_qsa_page4_metadata")
+    for legacy_name in (
+        "PrimsTSQSAPlan",
+        "get_prims_ts_qsa_workspace_size",
+        "prepare_prims_ts_qsa_attention",
+        "prims_ts_qsa_attention",
+    ):
+        assert not hasattr(public_decode, legacy_name)
+
+
+def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
+    plan_parameters = inspect.signature(
+        QTokenKvBlockSparsePagedTSWrapper.plan
+    ).parameters
+    assert tuple(plan_parameters) == (
+        "self",
+        "batch_size",
+        "seq_len_q",
+        "num_qo_heads",
+        "num_kv_heads",
+        "head_dim",
+        "kv_block_size",
+        "page_size",
+        "block_topk",
+        "max_seq_len_kv",
+        "device",
+        "workspace_buffer",
+        "use_packed_q",
+        "mask_type",
+        "q_data_type",
+        "kv_data_type",
+        "o_data_type",
+    )
+    run_parameters = inspect.signature(QTokenKvBlockSparsePagedTSWrapper.run).parameters
+    assert tuple(run_parameters) == (
+        "self",
+        "q",
+        "paged_kv_cache",
+        "block_table",
+        "indexer_block_ids",
+        "token_to_request",
+        "query_positions",
+        "qo_indptr",
+        "sm_scale",
+        "out",
+    )
 
 
 @pytest.mark.parametrize(
     "api",
     (
-        build_prims_ts_qsa_metadata,
-        get_prims_ts_qsa_metadata_output_shapes,
-        get_prims_ts_qsa_workspace_size,
-        prepare_prims_ts_qsa_attention,
-        prims_ts_qsa_attention,
+        get_q_token_kv_block_sparse_workspace_size,
+        q_token_kv_block_sparse_attention_with_paged_kv_cache,
     ),
 )
-def test_qsa_public_apis_expose_sparse_block_size(api: object) -> None:
-    parameter = inspect.signature(api).parameters["sparse_block_size"]
+def test_qsa_public_apis_expose_kv_block_size(api: object) -> None:
+    parameter = inspect.signature(api).parameters["kv_block_size"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default == 4
 
@@ -75,10 +181,8 @@ def test_qsa_public_apis_expose_sparse_block_size(api: object) -> None:
 @pytest.mark.parametrize(
     "api",
     (
-        build_prims_ts_qsa_metadata,
-        get_prims_ts_qsa_workspace_size,
-        prepare_prims_ts_qsa_attention,
-        prims_ts_qsa_attention,
+        get_q_token_kv_block_sparse_workspace_size,
+        q_token_kv_block_sparse_attention_with_paged_kv_cache,
     ),
 )
 def test_qsa_apis_require_static_max_seq_len_kv(api: object) -> None:
@@ -1612,13 +1716,12 @@ def test_qsa_attention_hides_workspace_metadata(
     calls: dict[str, object] = {}
 
     class FakeAttentionPlan:
-        def run(
+        def _run_unchecked(
             self,
             actual_query: torch.Tensor,
-            *,
             out: torch.Tensor,
-            bmm1_scale: float | None,
-            bmm2_scale: float,
+            scale_qk: float,
+            scale_v: float,
         ) -> torch.Tensor:
             expected_query = _as_lower_level_decode_view(query)
             expected_output = _as_lower_level_decode_view(output)
@@ -1626,8 +1729,8 @@ def test_qsa_attention_hides_workspace_metadata(
             assert actual_query.data_ptr() == expected_query.data_ptr()
             assert out.shape == expected_output.shape
             assert out.data_ptr() == expected_output.data_ptr()
-            assert bmm1_scale is None
-            assert bmm2_scale == 1.0
+            assert scale_qk == pytest.approx(head_dim**-0.5)
+            assert scale_v == 1.0
             return out
 
     def fake_prepare(
@@ -1747,13 +1850,12 @@ def test_qsa_fixed_5d_layout_flattens_route_axes_without_copy(
     calls: dict[str, torch.Tensor] = {}
 
     class FakeAttentionPlan:
-        def run(
+        def _run_unchecked(
             self,
             actual_query: torch.Tensor,
-            *,
             out: torch.Tensor,
-            bmm1_scale: float | None,
-            bmm2_scale: float,
+            scale_qk: float,
+            scale_v: float,
         ) -> torch.Tensor:
             expected_shape = (
                 (batch_size, 12, 256)
@@ -1764,8 +1866,8 @@ def test_qsa_fixed_5d_layout_flattens_route_axes_without_copy(
             assert out.shape == actual_query.shape
             assert actual_query.data_ptr() == query.data_ptr()
             assert out.data_ptr() == output.data_ptr()
-            assert bmm1_scale is None
-            assert bmm2_scale == 1.0
+            assert scale_qk == pytest.approx(256**-0.5)
+            assert scale_v == 1.0
             out.fill_(3)
             calls["query"] = actual_query
             return out
@@ -3191,18 +3293,42 @@ def test_qsa_attention_unified_workspace_matches_two_step_cuda_graph() -> None:
     )
 
     graph_output = torch.empty_like(query)
+    graph_wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    graph_wrapper.plan(
+        num_routes,
+        group_size,
+        num_qo_heads,
+        1,
+        head_dim,
+        4,
+        storage_page_size,
+        block_topk,
+        table.shape[1] * storage_page_size,
+        device=query.device,
+        workspace_buffer=unified_workspace,
+        q_data_type=query.dtype,
+        kv_data_type=k_cache.dtype,
+        o_data_type=graph_output.dtype,
+    )
+    graph_wrapper.run(
+        query,
+        (k_cache, v_cache),
+        table,
+        blocks,
+        requests,
+        positions,
+        out=graph_output,
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        prims_ts_qsa_attention(
+        graph_wrapper.run(
             query,
             (k_cache, v_cache),
-            blocks,
             table,
+            blocks,
             requests,
             positions,
-            unified_workspace,
             out=graph_output,
-            max_seq_len_kv=table.shape[1] * storage_page_size,
         )
     graph.replay()
     torch.cuda.synchronize()

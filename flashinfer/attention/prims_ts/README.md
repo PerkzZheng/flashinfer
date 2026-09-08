@@ -16,109 +16,78 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 | --- | --- | --- |
 | FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache`, `prims_ts_batch_decode_with_kv_cache` |
-| QSA sparse-block | [Packed-prefill and fixed-decode example](../../../examples/prims_ts/qsa_page4_attention.py) | `PrimsTSQSAPlan`, `suggest_prims_ts_qsa_group_size`, `validate_prims_ts_qsa_group_size`, `make_prims_ts_qsa_qo_indptr`, `get_prims_ts_qsa_workspace_size`, `prepare_prims_ts_qsa_attention`, `prims_ts_qsa_attention`; advanced metadata: `get_prims_ts_qsa_metadata_output_shapes`, `build_prims_ts_qsa_metadata` |
+| QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](../../../examples/prims_ts/qsa_page4_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | — | `BlockSparseTSWrapper`, `block_sparse_attention`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
 | MLA decode | [Task-Scheduled MLA Decode](kernels/mla_decode/README.md) | `BatchMLADecodePagedTSWrapper`, `batch_decode_mla_with_paged_kv_cache`, `get_prims_ts_batch_decode_mla_workspace_size`, `prims_ts_batch_decode_with_kv_cache_mla` |
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
 
-## QSA sparse-block interface
+## QToken-KvBlock-Sparse-Attention interface
 
-QSA consumes selected logical sparse-block IDs without expanding them to token
-indices. `block_indices` has one row per flattened query token, and
-`block_table` maps each request's logical storage pages to physical cache
-pages. K and V are separate tensors shaped
-`[num_pages, Hkv, storage_page_size, D]`; the physical storage page size must
-be a multiple of `sparse_block_size`. Every QSA sizing, metadata, prepare, and
-eager API accepts `sparse_block_size=4`. The argument is a positive power of
-two; only four is implemented today, and other power-of-two values raise
-`NotImplementedError`. The metadata builder adds the final causal tail of up
-to `sparse_block_size - 1` tokens and converts selected blocks into the compact
-metadata triple consumed by attention:
-`(qsa_page_indices, qsa_page_memberships, seq_lens)`.
+QToken-KvBlock-Sparse-Attention consumes per-query indexer output directly.
+`indexer_block_ids[total_q, block_topk]` contains logical K/V-block IDs;
+it is deliberately not named `block_indices`, which belongs to BSR.
+`block_table[num_requests, max_storage_pages]` maps each request's logical
+storage pages to separate HND K/V caches shaped
+`[num_pages, Hkv, page_size, D]`. `kv_block_size` is the semantic indexer
+atom and currently supports only four tokens; `page_size` is the independent
+physical cache-page extent.
 
-QSA sizing, metadata, prepare, and eager attention calls take an explicit
-`max_seq_len_kv`: the model's static per-request logical context bound and an
-upper bound on every live `query_position + 1`, including current/MTP tokens.
-It is not the number of tokens or physical pages allocated in the global KV
-cache across all requests. Each dense block-table row must merely have enough
-columns to address this logical bound. Q1 directly maps its selected and tail
-blocks. Grouped metadata sorts at most `group_size * (block_topk + 1)`
-candidates inside one CTA, unique-reduces equal logical block IDs while ORing
-their query-membership bits, then translates only the compact union through
-the dense block table. Its work and temporary storage are independent of the
-configured model length and reserved KV-cache capacity.
-The bound must remain static across prepared-plan and CUDA-graph reuse. A
-framework should therefore pass its configured model length for eager and
-captured execution alike rather than derive the value from a live batch or
-from total KV-cache capacity.
+The public lifecycle matches paged block-sparse attention:
 
-For `groups` query groups and
-`page_capacity = group_size * (block_topk + 1)`, `qsa_page_indices` is a
-contiguous Int32 table shaped `[groups, page_capacity]`. Its live entries are
-plain cache locators; query-membership bits are not fused into them.
-`qsa_page_memberships` is a contiguous Int32 table shaped
-`[groups, ceil(page_capacity / 4)]`. Each word packs four consecutive 8-bit
-membership masks, and bit `i` in a byte marks visibility for query `i` in the
-group. Q1 does not consume membership metadata, so its shape is `[groups, 0]`.
-`seq_lens[g]` is the live compact K/V length in tokens; only the first
-`ceil(seq_lens[g] / sparse_block_size)` locator slots and corresponding
-membership bytes are valid. The remaining locator suffix and membership
-padding are unspecified.
+```python
+wrapper = QTokenKvBlockSparsePagedTSWrapper()
+wrapper.plan(...)  # geometry, capacity, dtypes, workspace; outside capture
+wrapper.run(...)   # live indexer IDs and request metadata; graph hot path
+```
 
-The production QSA specialization supports bottom-right causal, non-windowed
-attention only. It uses a 128-token K/V tile for every supported query group.
-For one route, the scheduler computes
-`group_rows = group_size * (Hq / Hkv)` and chooses the smallest qualified
-TileQ in 8, 16, 32, or 64 that contains those rows. TileQ8 supports both direct
-and split routes because the standalone reducer consumes actual logical rows.
-Thus the caller fixes the semantic query group while the kernel caps padding
-deterministically; attention does not rewrite `group_size` at launch time.
+`plan` binds the single caller-owned byte workspace and fixes
+`batch_size`, `seq_len_q`, head geometry, `block_topk`,
+`max_seq_len_kv`, dtypes, and packed-versus-fixed Q layout. The first eager
+`run` binds the live tensor ABI, compiles the selected kernels, and
+initializes split-KV state. Capture only later `run` calls. One wrapper
+revision owns mutable route and split-KV scratch, so unordered concurrent runs
+need distinct wrappers.
 
-The framework chooses `group_size` explicitly from 1, 2, 4, or 5. The optional
-pure-host `suggest_prims_ts_qsa_group_size` policy prefers the largest legal
-group whose request routes and useful split-KV fanout can fill one SM wave,
-then falls back toward Q1 to expose more independent routes. The caller passes
-a cached `multi_processor_count`; the helper performs no device query or tensor
-read and is safe to use while building a CUDA-graph plan. Its
-`selected_seq_len_kv` argument is the per-query candidate-token bound,
-including the causal tail, rather than the original context length or global
-cache capacity.
-`validate_prims_ts_qsa_group_size` verifies that
-`group_size * (Hq / Hkv) <= 64`; the combined workspace and launch APIs enforce
-the same invariant even when the helper is not called. Packed prefill uses
-`[total_q, Hq, D]` with request-safe `qo_indptr` routes whose maximum length is
-the selected group size and always runs without split-KV. Query lengths need
-not be divisible by the selected group: packed routes may be short, while a
-fixed route may use consecutive semantic dummy rows for its suffix and discard
-their outputs. Uniform MTP decode uses
-`[B, num_query_groups, group_size, Hq, D]` without query offsets. Fixed decode
-may split K/V to fill otherwise idle capacity, but its fanout never crosses the
-first active-CTA service wave, is bounded by available K/V work, and uses the
-qualified Q1 or grouped reducer fanout cap.
+Packed prefill uses `q[total_q, Hq, D]`, `qo_indptr`, and
+`use_packed_q=True`; planned `seq_len_q` is the maximum request-safe route
+length. Fixed MTP decode uses `q[B, Nq, G, Hq, D]` without `qo_indptr`,
+where planned `batch_size = B * Nq` and `seq_len_q = G`. Q lengths need not
+be divisible by a suggested group: packed mode permits a shorter final route,
+while fixed mode may append consecutive semantic dummy rows and discard their
+outputs.
 
-Prefer `prepare_prims_ts_qsa_attention` for serving and CUDA graphs. Allocate
-a byte-addressed workspace of the size returned by
-`get_prims_ts_qsa_workspace_size`, prepare once, run once outside capture to
-compile and initialize the plan, then capture `run` with stable input, output,
-and workspace addresses. `prims_ts_qsa_attention` is an eager one-shot
-convenience. The lower-level metadata shape and
-`build_prims_ts_qsa_metadata` functions are an advanced two-step interface for
-frameworks that manage the resulting metadata triple themselves. The combined
-attention interface hides all three tensors in its caller-owned byte workspace;
-its required ``max_seq_len_kv`` argument validates the per-request logical
-model bound and dense block-table coverage.
+`get_q_token_kv_block_sparse_workspace_size` sizes persistent compact route
+metadata plus disjoint attention scratch. The model's per-request
+`max_seq_len_kv`, rather than the global physical page-pool capacity, bounds
+the plan. The private route builder forms at most
+`G * (block_topk + 1)` selected/tail candidates, sorts and unique-reduces
+them in one CTA, and ORs per-query membership bits. Its work is independent of
+model context length. Q1 maps selected and tail blocks directly without a
+membership table.
 
-On SM90 and newer, the combined API uses a PDL handoff from the single metadata
-grid to attention. The attention consumer initializes its independent state
-before waiting immediately ahead of the first metadata-dependent read. Older
-devices retain ordinary stream ordering. A
-fixed-decode split-KV path uses the same rule for attention-to-reducer PDL:
-attention signals only after completion and TMEM teardown, and the reducer
-waits before reading partial outputs, statistics, or metadata-produced QSA
-sequence lengths. Packed prefill has no split-KV reducer. Standalone attention
-over already-built QSA metadata remains stream ordered.
+The production specialization is causal and non-windowed, uses KV128 for
+Q1/Q2/Q4/Q5, and requires
+`seq_len_q * (Hq / Hkv) <= TileQ64`. The pure-host
+`suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM
+count and prefers the largest legal group that can fill one service wave using
+independent routes plus useful split-KV work. It falls back toward Q1 when a
+large union would leave SMs idle. The helper never queries device properties
+or reads tensors.
+
+`q_token_kv_block_sparse_attention_with_paged_kv_cache` is the eager
+plan-plus-run convenience API and is not graph-capturable. Shared argument
+spellings intentionally match paged block-sparse attention: `q`,
+`paged_kv_cache`, `page_size`, `kv_block_size`, `mask_type`,
+`sm_scale`, `seq_len_q`, and `max_seq_len_kv`.
+
+On SM90 and newer, the combined route-builder and attention launch use PDL.
+Attention initializes its independent resources before acquiring immediately
+ahead of the first metadata-dependent read. Split-KV attention releases its
+reducer only after producer completion and TMEM teardown; the reducer
+initializes local resources before all threads acquire. Older architectures
+retain stream ordering.
 
 For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
 geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no

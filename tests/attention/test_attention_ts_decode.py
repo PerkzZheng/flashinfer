@@ -80,11 +80,11 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.hel
 )
 from flashinfer.decode import (
     get_prims_ts_batch_decode_workspace_size,
-    make_prims_ts_qsa_qo_indptr,
+    make_q_token_kv_block_sparse_qo_indptr as make_prims_ts_qsa_qo_indptr,
     prepare_prims_ts_batch_decode_with_kv_cache,
     prims_ts_batch_decode_with_kv_cache,
-    suggest_prims_ts_qsa_group_size,
-    validate_prims_ts_qsa_group_size,
+    suggest_q_token_kv_block_sparse_group_size as suggest_prims_ts_qsa_group_size,
+    validate_q_token_kv_block_sparse_group_size as validate_prims_ts_qsa_group_size,
 )
 from flashinfer.utils import is_sm100a_supported
 
@@ -4565,7 +4565,7 @@ def _resolve_qsa_policy_for_test(
             False,
             8,
             False,
-            5,
+            8,
             id="fixed-bf16-q1-split-tile8",
         ),
         pytest.param(
@@ -4579,7 +4579,7 @@ def _resolve_qsa_policy_for_test(
             False,
             16,
             False,
-            5,
+            8,
             id="fixed-bf16-q1-tile16",
         ),
         pytest.param(
@@ -4621,7 +4621,7 @@ def _resolve_qsa_policy_for_test(
             False,
             64,
             True,
-            8,
+            9,
             id="fixed-bf16-q4-tile64",
         ),
         pytest.param(
@@ -4740,8 +4740,10 @@ def test_attention_ts_decode_qsa_policy_is_structural(
         assert expected_splits == 1
     else:
         base_grid = batch_size * num_kv_heads
-        work_bound = math.ceil(max_kv_len / (128 * cfg.num_insts_kv * 2))
-        assert expected_splits <= min(8, work_bound)
+        min_loop_iters = 1 if group_size == 1 else 2
+        work_bound = math.ceil(max_kv_len / (128 * cfg.num_insts_kv * min_loop_iters))
+        max_policy_splits = 8 if group_size == 1 else 16
+        assert expected_splits <= min(max_policy_splits, work_bound)
         assert expected_splits == 1 or base_grid * expected_splits <= 148
 
     expected_partial_o_shape = (

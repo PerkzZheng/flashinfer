@@ -2258,7 +2258,7 @@ def _prims_ts_qsa_group_launch_profile(
 
 
 @flashinfer_api
-def suggest_prims_ts_qsa_group_size(
+def suggest_q_token_kv_block_sparse_group_size(
     batch_size: int,
     seq_len_q: int,
     selected_seq_len_kv: int,
@@ -2266,7 +2266,7 @@ def suggest_prims_ts_qsa_group_size(
     num_kv_heads: int,
     multi_processor_count: int,
 ) -> int:
-    """Suggest an occupancy-aware Q1/Q2/Q4/Q5 group size.
+    """Suggest a Q1/Q2/Q4/Q5 QToken-KvBlock-Sparse-Attention group.
 
     This pure host-side policy uses the caller-provided SM count; it never
     queries device properties or reads tensors. It prefers the largest legal
@@ -2343,9 +2343,7 @@ def suggest_prims_ts_qsa_group_size(
         # Mirror the current QSA split work bound. Q1 has no union-membership
         # work and permits one K/V pipeline iteration; grouped routes retain
         # two iterations per split to amortize standalone reduction.
-        min_loop_iters = (
-            1 if group_size == 1 else _QSA_GROUPED_MIN_LOOP_ITERS_PER_SPLIT
-        )
+        min_loop_iters = 1 if group_size == 1 else _QSA_GROUPED_MIN_LOOP_ITERS_PER_SPLIT
         route_candidate_kv = group_size * selected_seq_len_kv
         tokens_per_split = _QSA_TILE_SIZE_KV * num_insts_kv * min_loop_iters
         max_useful_splits = max(
@@ -2414,7 +2412,7 @@ def _validate_prims_ts_qsa_group_layout(
 
 
 @flashinfer_api
-def validate_prims_ts_qsa_group_size(
+def validate_q_token_kv_block_sparse_group_size(
     query_start_loc_cpu: Optional[torch.Tensor],
     num_query_tokens: int,
     num_qo_heads: int,
@@ -2422,7 +2420,7 @@ def validate_prims_ts_qsa_group_size(
     *,
     group_size: int,
 ) -> int:
-    """Validate a caller-selected Q1/Q2/Q4/Q5 metadata group size.
+    """Validate a QToken-KvBlock-Sparse-Attention Q1/Q2/Q4/Q5 group.
 
     ``query_start_loc_cpu`` contains cumulative flattened-query offsets for
     real requests. ``num_query_tokens`` includes any inert CUDA-graph padding
@@ -2469,20 +2467,20 @@ def validate_prims_ts_qsa_group_size(
 
 
 @flashinfer_api
-def make_prims_ts_qsa_qo_indptr(
+def make_q_token_kv_block_sparse_qo_indptr(
     query_start_loc_cpu: torch.Tensor,
     num_query_tokens: int,
     *,
     group_size: int,
     device: Optional[Union[int, str, torch.device]] = None,
 ) -> torch.Tensor:
-    """Partition flattened Q rows into request-safe routes of size at most G.
+    """Build request-safe QToken-KvBlock-Sparse-Attention route offsets.
 
     ``query_start_loc_cpu`` contains cumulative offsets for real requests.
     Every request is chunked independently, so its final route may contain
     fewer than ``group_size`` rows. Any inert CUDA-graph padding suffix is
     partitioned separately. The returned Int32 ``qo_indptr`` can be passed to
-    the packed-Q QSA APIs together with ``max_seq_len_q=group_size``.
+    the packed-Q wrapper together with planned ``seq_len_q=group_size``.
 
     Parameters
     ----------
@@ -3933,9 +3931,9 @@ __all__ = [
     "PrimsTSBatchDecodePlan",
     "batch_decode_with_paged_kv_cache",
     "get_prims_ts_batch_decode_workspace_size",
-    "make_prims_ts_qsa_qo_indptr",
-    "suggest_prims_ts_qsa_group_size",
-    "validate_prims_ts_qsa_group_size",
+    "make_q_token_kv_block_sparse_qo_indptr",
+    "suggest_q_token_kv_block_sparse_group_size",
+    "validate_q_token_kv_block_sparse_group_size",
     "prepare_prims_ts_batch_decode_with_kv_cache",
     "prims_ts_batch_decode_with_kv_cache",
 ]

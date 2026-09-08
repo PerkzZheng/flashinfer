@@ -146,14 +146,11 @@ def _warn_deprecated_plan_positional_args(api_name: str) -> None:
     )
 
 
-_PRIMS_TS_QSA_METADATA_LAZY_EXPORTS = frozenset(
+_PRIMS_TS_Q_TOKEN_KV_BLOCK_SPARSE_LAZY_EXPORTS = frozenset(
     {
-        "PrimsTSQSAPlan",
-        "build_prims_ts_qsa_metadata",
-        "get_prims_ts_qsa_metadata_output_shapes",
-        "get_prims_ts_qsa_workspace_size",
-        "prepare_prims_ts_qsa_attention",
-        "prims_ts_qsa_attention",
+        "QTokenKvBlockSparsePagedTSWrapper",
+        "get_q_token_kv_block_sparse_workspace_size",
+        "q_token_kv_block_sparse_attention_with_paged_kv_cache",
     }
 )
 _PRIMS_TS_LAZY_EXPORTS = (
@@ -161,14 +158,14 @@ _PRIMS_TS_LAZY_EXPORTS = (
         {
             "PrimsTSBatchDecodePlan",
             "get_prims_ts_batch_decode_workspace_size",
-            "make_prims_ts_qsa_qo_indptr",
+            "make_q_token_kv_block_sparse_qo_indptr",
             "prepare_prims_ts_batch_decode_with_kv_cache",
             "prims_ts_batch_decode_with_kv_cache",
-            "suggest_prims_ts_qsa_group_size",
-            "validate_prims_ts_qsa_group_size",
+            "suggest_q_token_kv_block_sparse_group_size",
+            "validate_q_token_kv_block_sparse_group_size",
         }
     )
-    | _PRIMS_TS_QSA_METADATA_LAZY_EXPORTS
+    | _PRIMS_TS_Q_TOKEN_KV_BLOCK_SPARSE_LAZY_EXPORTS
 )
 
 
@@ -176,7 +173,7 @@ def __getattr__(name: str):
     """Resolve PrimTS decode APIs without loading their runtime at import."""
 
     if name in _PRIMS_TS_LAZY_EXPORTS:
-        if name in _PRIMS_TS_QSA_METADATA_LAZY_EXPORTS:
+        if name in _PRIMS_TS_Q_TOKEN_KV_BLOCK_SPARSE_LAZY_EXPORTS:
             from .attention.prims_ts import qsa_metadata
 
             value = getattr(qsa_metadata, name)
