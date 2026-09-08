@@ -146,11 +146,28 @@ def _warn_deprecated_plan_positional_args(api_name: str) -> None:
     )
 
 
-_PRIMS_TS_LAZY_EXPORTS = frozenset(
+_PRIMS_TS_QSA_METADATA_LAZY_EXPORTS = frozenset(
     {
-        "get_prims_ts_batch_decode_workspace_size",
-        "prims_ts_batch_decode_with_kv_cache",
+        "PrimsTSQSAPlan",
+        "build_prims_ts_qsa_metadata",
+        "get_prims_ts_qsa_metadata_output_shapes",
+        "get_prims_ts_qsa_workspace_size",
+        "prepare_prims_ts_qsa_attention",
+        "prims_ts_qsa_attention",
     }
+)
+_PRIMS_TS_LAZY_EXPORTS = (
+    frozenset(
+        {
+            "PrimsTSBatchDecodePlan",
+            "get_prims_ts_batch_decode_workspace_size",
+            "validate_prims_ts_qsa_group_size",
+            "make_prims_ts_qsa_qo_indptr",
+            "prepare_prims_ts_batch_decode_with_kv_cache",
+            "prims_ts_batch_decode_with_kv_cache",
+        }
+    )
+    | _PRIMS_TS_QSA_METADATA_LAZY_EXPORTS
 )
 
 
@@ -158,9 +175,14 @@ def __getattr__(name: str):
     """Resolve PrimTS decode APIs without loading their runtime at import."""
 
     if name in _PRIMS_TS_LAZY_EXPORTS:
-        from .attention.prims_ts import decode as prims_ts_decode
+        if name in _PRIMS_TS_QSA_METADATA_LAZY_EXPORTS:
+            from .attention.prims_ts import qsa_metadata
 
-        value = getattr(prims_ts_decode, name)
+            value = getattr(qsa_metadata, name)
+        else:
+            from .attention.prims_ts import decode
+
+            value = getattr(decode, name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -868,27 +890,31 @@ class BatchDecodeWithPagedKVCacheWrapper:
 
         backend : str
             The implementation backend, could be ``auto``/``fa2``/``fa3``/``trtllm-gen``/
-            ``cute-dsl`` or ``prims-ts``. Defaults to ``auto``.
+            ``cute-dsl``. Defaults to ``auto``.
             If set to ``auto``, the wrapper will automatically choose the backend based on the
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL GQA decode kernel for Blackwell
             (SM100+) and only supports a subset of features (equal head_dim_qk/vo,
             no RoPE/ALiBi/soft-cap).
-            The ``prims-ts`` backend uses the task-scheduled decode kernel on SM100a/SM103a.
-            It is the only backend that accepts ``is_causal=False`` with
-            ``q_len_per_req > 1``. It requires ``kv_layout="HND"`` and does not
-            support ``use_cuda_graph=True``.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
         """
+        if backend == "prims-ts":
+            raise NotImplementedError(
+                "BatchDecodeWithPagedKVCacheWrapper uses CSR page metadata and "
+                "does not support backend='prims-ts'; use "
+                "flashinfer.attention.prims_ts.BatchDecodePagedTSWrapper with "
+                "a dense int32 [batch_size, max_pages] block_table and int32 "
+                "[batch_size] seq_lens"
+            )
         _check_workspace_buffer_alignment(
             float_workspace_buffer, "float_workspace_buffer"
         )
         _check_kv_layout(kv_layout)
 
-        if backend in ("cute-dsl", "prims-ts") and jit_args is not None:
+        if backend == "cute-dsl" and jit_args is not None:
             raise NotImplementedError(
                 f"{backend} backend does not support jit_args customization"
             )
@@ -957,7 +983,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._use_tensor_cores = use_tensor_cores or backend in (
             "trtllm-gen",
             "cute-dsl",
-            "prims-ts",
         )
         self._use_cuda_graph = use_cuda_graph
 
@@ -979,22 +1004,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._cute_dsl_wrapper = BatchDecodePagedCuteDSLWrapper(
                 float_workspace_buffer, use_cuda_graph=use_cuda_graph
             )
-
-        self._prims_ts_wrapper = None
-        if backend == "prims-ts":
-            if kv_layout != "HND":
-                raise NotImplementedError(
-                    "prims-ts decode backend requires kv_layout='HND'"
-                )
-            # The delegate snapshots seq_lens, scratch, and the compiled kernel
-            # at plan time, so a captured run() does not follow a later plan().
-            if use_cuda_graph:
-                raise NotImplementedError(
-                    "prims-ts decode backend does not support use_cuda_graph=True"
-                )
-            from .attention.prims_ts import BatchDecodePagedTSWrapper
-
-            self._prims_ts_wrapper = BatchDecodePagedTSWrapper()
 
     @property
     def use_tensor_cores(self) -> bool:
@@ -1140,10 +1149,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
         )
         del block_tables, rope_scale, rope_theta, sm_scale
         backend = self._backend
-        if backend == "prims-ts":
-            raise NotImplementedError(
-                f"workspace_size is not available for decode backend {backend!r}"
-            )
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1395,8 +1400,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             planned, re-planning with a different value raises.
         is_causal : Optional[bool]
             Whether the mask is causal within each request block. Defaults to ``None``,
-            which derives it from ``q_len_per_req > 1``. Only the ``prims-ts`` backend
-            honors a value that differs from that default; the other backends raise.
+            which derives it from ``q_len_per_req > 1``. Values that differ from
+            that default are not supported by this wrapper.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -1498,11 +1503,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
         if is_causal is None:
             is_causal = q_len_per_req > 1
-        elif self._backend != "prims-ts" and is_causal != (q_len_per_req > 1):
+        elif is_causal != (q_len_per_req > 1):
             raise NotImplementedError(
                 f"backend={self._backend!r} derives the decode mask from "
-                "q_len_per_req; an explicit is_causal is only honored by "
-                "backend='prims-ts'"
+                "q_len_per_req; an explicit is_causal override is not supported"
             )
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
@@ -1712,53 +1716,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 window_right=(None if window_right < 0 else window_right),
                 max_kv_len=self._max_kv_len,
                 non_blocking=non_blocking,
-            )
-        elif self._backend == "prims-ts":
-            if logits_soft_cap > 0:
-                raise NotImplementedError(
-                    "prims-ts decode backend does not support logits_soft_cap"
-                )
-            if pos_encoding_mode != "NONE":
-                raise NotImplementedError(
-                    f"prims-ts decode backend does not support "
-                    f"pos_encoding_mode={pos_encoding_mode!r}"
-                )
-            if fixed_split_size > 0 or disable_split_kv:
-                raise NotImplementedError(
-                    "prims-ts decode backend selects the split-kv policy internally"
-                )
-            if q_data_type != kv_data_type:
-                raise NotImplementedError(
-                    "prims-ts decode backend requires q_data_type == kv_data_type, "
-                    f"got {q_data_type} and {kv_data_type}"
-                )
-            # The delegate derives kv lengths from the page table and has no
-            # seq_lens input, so a divergent seq_lens would be silently ignored.
-            if seq_lens is not None:
-                derived_kv_lens = get_seq_lens(
-                    indptr_host, last_page_len_host, page_size
-                ).to(torch.int64)
-                if not torch.equal(kv_lens_arr_host.to(torch.int64), derived_kv_lens):
-                    raise ValueError(
-                        "prims-ts decode backend derives kv lengths from "
-                        "(indptr, last_page_len, page_size); seq_lens must match them"
-                    )
-            self._max_kv_len = int(max(kv_lens_arr_host).item())
-            self._prims_ts_wrapper.plan(
-                self._paged_kv_indptr_buf,
-                self._paged_kv_indices_buf,
-                self._paged_kv_last_page_len_buf,
-                num_qo_heads=num_qo_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                page_size=page_size,
-                seq_len_q=q_len_per_req,
-                q_data_type=q_data_type,
-                kv_data_type=kv_data_type,
-                o_data_type=o_data_type,
-                mask_type="causal" if is_causal else "dense",
-                window_left=window_left,
-                max_kv_len=self._max_kv_len,
             )
         elif self._backend == "trtllm-gen":
             assert logits_soft_cap == 0.0
@@ -2327,43 +2284,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 enable_pdl=enable_pdl,
             )
             return (out, lse) if return_lse else out
-
-        if self._backend == "prims-ts":
-            if kv_cache_sf is not None:
-                raise NotImplementedError(
-                    "prims-ts decode backend does not support NVFP4 KV cache"
-                )
-            if sinks is not None:
-                raise NotImplementedError(
-                    "prims-ts decode backend does not support attention sinks"
-                )
-            if return_lse:
-                raise NotImplementedError("prims-ts decode backend does not return LSE")
-            if skip_softmax_threshold_scale_factor is not None:
-                raise NotImplementedError(
-                    "prims-ts decode backend does not support "
-                    "skip_softmax_threshold_scale_factor"
-                )
-            # The kernel takes token-major [B, SQ, Hq, D], or [B, Hq, D] at SQ=1.
-            if q_len_per_req > 1:
-                if not q.is_contiguous() or not out.is_contiguous():
-                    raise ValueError(
-                        "prims-ts decode backend requires contiguous q and out "
-                        "when q_len_per_req > 1"
-                    )
-                packed_shape = (actual_batch_size, q_len_per_req, q.size(1), q.size(2))
-                q = q.view(packed_shape)
-                out = out.view(packed_shape[:-1] + (out.size(-1),))
-            out = self._prims_ts_wrapper.run(
-                q,
-                (k_cache, v_cache),
-                bmm1_scale=sm_scale,
-                bmm2_scale=1.0 if v_scale is None else float(v_scale),
-                out=out,
-            )
-            return (
-                out.view(-1, out.size(-2), out.size(-1)) if q_len_per_req > 1 else out
-            )
 
         if self._backend == "trtllm-gen":
             q = q.view(q.size(0) // q_len_per_req, q_len_per_req, q.size(1), q.size(2))
@@ -4247,10 +4167,6 @@ def fast_decode_plan(
     - Remove unnecessary host-to-device copy for the metadata buffers.
     """
     batch_size = len(last_page_len)
-    if getattr(self, "_backend", None) == "prims-ts":
-        raise NotImplementedError(
-            "fast_decode_plan is not supported by the prims-ts decode backend"
-        )
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
     if q_len_per_req > 1 and not self.use_tensor_cores:

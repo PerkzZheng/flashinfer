@@ -71,6 +71,7 @@ from .fmha_decode_resources.helpers_common import (
     _warp_broadcast_i32,
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import (
+    _runtime_last_valid_page_idx,
     _runtime_total_kv_tiles,
     _sliding_window_start_idx,
 )
@@ -313,7 +314,7 @@ def _page_offsets_produce(
     smem_page_offsets.commit()
 
 
-def _can_hold_native_split_page_window(
+def _can_hold_native_page_window(
     cfg: FmhaDecodeConfig,
     smem_page_offsets: MemoryResource | None,
 ) -> bool:
@@ -321,11 +322,19 @@ def _can_hold_native_split_page_window(
     if (
         smem_page_offsets is None
         or not smem_page_offsets.use_native_paged_kv
-        or not cfg.use_split_kv
         or cfg.use_sliding_window_causal
     ):
         return False
     pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
+    if cfg.uses_scattered_page_route:
+        # The page-offset resource gives every QSA route one stage sized for
+        # its complete instruction-aligned local span. Holding that stage lets
+        # K and V reuse the same dense-row locators, including -1 padding for
+        # a short or odd tail. This applies to direct and persistent kernels as
+        # well as split-KV: each work tile stages its own slice of that row.
+        return smem_page_offsets.holds_encoded_locator_window
+    if not cfg.use_split_kv:
+        return False
     # Runtime ragged lengths can reduce the split-local span in
     # ``num_insts_kv`` increments and therefore change every split rank's
     # aligned starting page. Hold one stage only when every possible span
@@ -359,7 +368,11 @@ def _staged_kv_load(
     same token tile and therefore the same page IDs. Keep one page-offset
     consumer stage live across the complete logical K/V load.
     """
-    reuse_page_ids = smem_page_offsets is not None and cfg.num_head_dim_stages_kv > 1
+    reuse_page_ids = (
+        smem_page_offsets is not None
+        and cfg.num_head_dim_stages_kv > 1
+        and not cfg.uses_scattered_page_route
+    )
     # Optional ConsWait/ConsWork: fetch page IDs for this logical K/V tile.
     # The cached D256 path performs its ConsumerWork below while materializing
     # the register array; single-stage kernels keep the original no-cache path.
@@ -664,7 +677,6 @@ class DecodeGenTask(Task):
         """Capture decode-specific task config and initialize cache slots."""
         self.cfg = kwargs.pop("cfg", None)
         self.seqlens_kv = kwargs.pop("seqlens_kv", None)
-        self.paged_kv_indptr = kwargs.pop("paged_kv_indptr", None)
         self.sparse_row_route_offsets = kwargs.pop("sparse_row_route_offsets", None)
         self.sparse_row_route_counts = kwargs.pop("sparse_row_route_counts", None)
         self.num_heads_kv = kwargs.pop("num_heads_kv", None)
@@ -961,18 +973,22 @@ class DecodeGenTask(Task):
         # can use the configured max length; variable-seqlen kernels read the
         # batch-specific length from GMEM.
         b_idx = cutlass.Int32(tile_coord[2])
-        if cutlass.const_expr(self.paged_kv_indptr is not None):
-            request_begin = cutlass.Int32(self.paged_kv_indptr[b_idx])
-            request_end = cutlass.Int32(self.paged_kv_indptr[b_idx + cutlass.Int32(1)])
-            self._kv_request_begin = request_begin
-            self._kv_page_idx_ub = request_end - request_begin - cutlass.Int32(1)
         if self.seqlens_kv is None:
-            if not self.cfg.use_split_kv and not self.cfg.uses_runtime_q_kv_union:
-                return self.domain
             seq_len_kv = cutlass.Int32(self.max_seq_len_kv)
         else:
             seq_len_kv = cutlass.Int32(self.seqlens_kv[b_idx])
         self._seq_len_kv = seq_len_kv
+        if cutlass.const_expr(self.cfg.use_paged_kv):
+            # Native paged KV uses a fixed-stride dense page table. The row's
+            # live extent therefore comes from seq_lens; padded entries beyond
+            # this bound must never be staged.
+            self._kv_page_idx_ub = _runtime_last_valid_page_idx(self.cfg, seq_len_kv)
+        if (
+            self.seqlens_kv is None
+            and not self.cfg.use_split_kv
+            and not self.cfg.uses_runtime_q_kv_union
+        ):
+            return self.domain
         tile_size_kv = cutlass.Int32(self.cfg.tile_size_kv)
 
         # Q-independent full-K nonsplit decode has no leading window skip.
@@ -1143,7 +1159,7 @@ def create_load_task(
     **kw: TaskKwarg,
 ) -> Task:
     """Create the shared-KV load task and optional page-offset dependency."""
-    hold_page_window = _can_hold_native_split_page_window(cfg, smem_page_offsets)
+    hold_page_window = _can_hold_native_page_window(cfg, smem_page_offsets)
 
     def load_schedule_body(
         smem_q: MemoryResource,
@@ -1169,7 +1185,7 @@ def create_load_task(
                 sparse_resource.init_load_state()
         cached_page_ids = None
         if smem_page_offsets is not None:
-            if cfg.num_head_dim_stages_kv > 1:
+            if cfg.num_head_dim_stages_kv > 1 and not cfg.uses_scattered_page_route:
                 cached_page_ids = smem_page_offsets.init_cached_read_state()
             else:
                 smem_page_offsets.init_read_state()
@@ -1193,10 +1209,10 @@ def create_load_task(
         smem_q.commit()
         if hold_page_window:
             # The native K/V caches share one page table. Keep its single
-            # 32-ID consumer stage live across every K/V and head-dimension
-            # load owned by this split CTA, matching the reference page-window
-            # lifetime and avoiding redundant pipeline handoffs.
-            if cfg.num_head_dim_stages_kv > 1:
+            # consumer stage live across every K/V and head-dimension load
+            # owned by this CTA work tile. QSA sizes it for the full local
+            # span; other native split routes retain the aligned 32-ID window.
+            if cfg.num_head_dim_stages_kv > 1 and not cfg.uses_scattered_page_route:
                 smem_page_offsets.wait()
             else:
                 _page_offsets_consume(smem_page_offsets)
@@ -1375,7 +1391,7 @@ def create_page_offsets_task(
     The schedule matches LoadTask's K/V cadence exactly so the page-offsets
     ring and the SmemKv ring stay aligned.
     """
-    hold_page_window = _can_hold_native_split_page_window(cfg, smem_page_offsets)
+    hold_page_window = _can_hold_native_page_window(cfg, smem_page_offsets)
 
     def page_offsets_schedule_body(
         smem_page_offsets: MemoryResource,
@@ -1383,8 +1399,8 @@ def create_page_offsets_task(
         """Schedule page-offset prefetches for the shared-KV load cadence."""
         smem_page_offsets.init_load_state()
         if hold_page_window:
-            # K0's aligned 32-ID window covers every contiguous tile assigned
-            # to this split CTA, and native CSR uses those same IDs for V.
+            # K0's held window covers every tile assigned to this CTA work
+            # item, and native paged KV uses those same locators for V.
             _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
             # Preserve the runtime domain contract even though this fast path
             # needs no per-iteration page-window work.
@@ -1537,12 +1553,23 @@ def create_page_offsets_task_one_inst_qkv(
     **kw: TaskKwarg,
 ) -> Task:
     """Prefetch page-table entries for the one-inst keepsMmaAb QKV path."""
+    hold_page_window = _can_hold_native_page_window(cfg, smem_page_offsets)
 
     def page_offsets_schedule_body(
         smem_page_offsets: MemoryResource,
     ) -> None:
         """Schedule page-offset prefetches for the one-inst QKV load cadence."""
         smem_page_offsets.init_load_state()
+
+        if hold_page_window:
+            # Publish the complete CTA-local physical-KV128 locator span once.
+            # The load task retains this stage from its K head through V tail.
+            _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
+            # Keep the task domain identical to the ordinary cadence even
+            # though the held stage needs no per-iteration producer work.
+            with domain_loop(0, domain, 1, unroll=1):
+                pass
+            return
 
         _page_offsets_produce(smem_page_offsets, "load_k0", FmhaStage.Head)
         with domain_loop(0, domain, 1, unroll=1):
@@ -1954,6 +1981,7 @@ def create_load_task_one_inst_qkv(
     **kw: TaskKwarg,
 ) -> Task:
     """Load schedule for the one-inst keepsMmaAb QKV path."""
+    hold_page_window = _can_hold_native_page_window(cfg, smem_page_offsets)
 
     def load_schedule_body(
         smem_q: MemoryResource,
@@ -1970,21 +1998,25 @@ def create_load_task_one_inst_qkv(
             smem_page_offsets.init_read_state()
 
         def load_tile(resource: MemoryResource, label: str, section: FmhaStage) -> None:
-            """Acquire, load all head-dim stages, and release one page window."""
-            _page_offsets_consume(
-                smem_page_offsets, label.replace("load", "read_offsets")
-            )
+            """Load every head-dim stage from the active page window."""
+            if not hold_page_window:
+                _page_offsets_consume(
+                    smem_page_offsets, label.replace("load", "read_offsets")
+                )
             for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
                 resource.acquire()
                 getattr(resource, label)(
                     section=section, head_dim_stage_idx=head_dim_stage_idx
                 )
                 resource.commit()
-            _page_offsets_release(smem_page_offsets)
+            if not hold_page_window:
+                _page_offsets_release(smem_page_offsets)
 
         smem_q.acquire()
         smem_q.tma_load()
         smem_q.commit()
+        if hold_page_window:
+            _page_offsets_consume(smem_page_offsets)
         load_tile(smem_k, "load_k0", FmhaStage.Head)
 
         with domain_loop(0, domain, 1, unroll=1):
@@ -1992,6 +2024,8 @@ def create_load_task_one_inst_qkv(
             load_tile(smem_v, "load_v0", FmhaStage.Loop)
 
         load_tile(smem_v, "load_v0", FmhaStage.Tail)
+        if hold_page_window:
+            _page_offsets_release(smem_page_offsets)
 
     @schedule
     def load_schedule(

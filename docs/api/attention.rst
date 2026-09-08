@@ -47,12 +47,51 @@ FMHA Decode
 
     batch_decode_with_paged_kv_cache
     get_prims_ts_batch_decode_workspace_size
+    prepare_prims_ts_batch_decode_with_kv_cache
     prims_ts_batch_decode_with_kv_cache
+
+.. autoclass:: PrimsTSBatchDecodePlan
+    :members:
 
 .. autoclass:: BatchDecodePagedTSWrapper
     :members:
 
     .. automethod:: __init__
+
+QSA Sparse-Block Attention
+--------------------------
+
+QSA accepts packed prefill queries or fixed grouped decode queries over a
+dense paged-cache block table. The production specialization is causal and
+non-windowed. ``sparse_block_size`` is a power-of-two public parameter, with
+block size 4 as the only implementation currently available.
+
+The advanced metadata builder returns
+``(qsa_page_indices, qsa_page_memberships, seq_lens)``. For
+``page_capacity = group_size * (block_topk + 1)``, page indices are plain
+contiguous Int32 cache locators shaped ``[groups, page_capacity]``; membership
+bits are not fused into them. Memberships are Int32
+``[groups, ceil(page_capacity / 4)]``, with four consecutive 8-bit query masks
+packed into each word. Q1 uses ``[groups, 0]`` memberships. Only the locator
+prefix selected by ``ceil(seq_lens[g] / sparse_block_size)`` and its
+corresponding membership bytes are live; unused suffix and padding values are
+unspecified. The combined
+attention APIs retain this triple in their workspace without changing their
+public call signature.
+
+.. autosummary::
+    :toctree: ../generated
+
+    validate_prims_ts_qsa_group_size
+    make_prims_ts_qsa_qo_indptr
+    get_prims_ts_qsa_workspace_size
+    prepare_prims_ts_qsa_attention
+    prims_ts_qsa_attention
+    get_prims_ts_qsa_metadata_output_shapes
+    build_prims_ts_qsa_metadata
+
+.. autoclass:: PrimsTSQSAPlan
+    :members:
 
 Block-Sparse FMHA
 -----------------
