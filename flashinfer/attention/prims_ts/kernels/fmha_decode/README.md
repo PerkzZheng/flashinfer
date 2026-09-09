@@ -17,6 +17,40 @@ control (CLC) assigns work to resident CTAs. Underfilled fixed-Q grids may
 instead split the K/V sequence and reduce partial outputs; other grids use the
 direct static launch.
 
+QToken-KvBlock-Sparse-Attention metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
+blocks and causal tail directly through the dense page table. Q2/Q4/Q5 sort at
+most ``group_size * (block_topk + 1)`` tagged selected/tail candidates in
+shared memory, unique equal logical IDs while OR-reducing query-membership
+bits, and map only the compact union. Work and temporary storage therefore do
+not scale with the configured model length or global cache capacity. Plain
+Int32 locators and packed membership words remain separate outputs; membership
+bits are never fused into a locator.
+
+The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
+(PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
+release only after their page indices, membership words, and sequence lengths
+are published. Every active attention CTA allocates and initializes its task
+barriers, SMEM, and TMEM first, then waits immediately before TaskManager can
+read either output. Split-KV QToken-KvBlock-Sparse-Attention sends every configured split CTA through that
+initialization and acquire, then contracts the useful runtime prefix. Pruned
+split CTAs use the same TMEM teardown and dependent-release helpers before a
+CTA-uniform PTX exit. Padded packed-Q CTAs have no task resources; they still
+acquire through their explicit zero-work path and signal a following reducer
+when one exists. A final nonsplit attention grid has no dependent to release.
+Standalone attention over an already-built QToken-KvBlock-Sparse-Attention metadata triple remains stream
+ordered and does not enter this PDL chain.
+
+When split-KV uses a separate reduction kernel, each active attention CTA
+signals at its true tail after task completion and TMEM teardown. Deferred QToken-KvBlock-Sparse-Attention
+split padding retires as described above, while other runtime-inactive CTAs use
+their terminal zero-work branch. The reducer initializes its register state
+and any required shared-memory storage, then waits before reading any
+producer-written partial output or statistics.
+Independent query-offset metadata may be read before that wait. QToken-KvBlock-Sparse-Attention sequence
+lengths remain behind it because they originate in the metadata producer two
+PDL stages upstream. This preserves producer-to-reducer overlap while gating
+every producer-dependent global-memory read.
+
 ## Public APIs
 
 Import these entry points from `flashinfer.attention.prims_ts`:
@@ -26,6 +60,7 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | `BatchDecodePagedTSWrapper` | Reusable `plan()`/`run()` interface; owns compiled callables and scratch. |
 | `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
+| `prepare_prims_ts_batch_decode_with_kv_cache` | Validate and compile a standalone launch once for a lightweight graph-safe `run()`. |
 | `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
@@ -33,7 +68,7 @@ The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
 carry the wrapper's plan-owned query mode and output dtype.
 
 Prefer the reusable wrapper when a cache geometry is used repeatedly. Planning
-always snapshots and host-validates the derived K/V lengths once; `run()`
+always snapshots and host-validates the supplied K/V lengths once; `run()`
 performs no device-to-host metadata read. An explicit `max_kv_len` is a bound
 that must cover every planned row. Fixed-length scheduling is selected
 automatically only when every row equals that bound and the resolved K-tile
@@ -54,7 +89,7 @@ graph. This is not a public knob.
 | Q/K/V dtype | Q and K/V must match: `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND paged cache, combined or separate K/V tensors |
-| Page size | 16, 32, 64, or 128 tokens |
+| Page size | 4, 16, 32, 64, or 128 tokens |
 | Maximum K/V length | `2,147,483,392` (`INT32_MAX - 255`), reserving the padded endpoint of a 256-token K/V tile |
 | Mask | Dense or bottom-right causal |
 | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |
@@ -86,18 +121,30 @@ and split-KV statistics are internal scratch.
 - Combined K/V cache: `[num_pages, 2, Hkv, page_size, D]`.
 - Separate K/V cache: a `(K, V)` tuple whose members are
   `[num_pages, Hkv, page_size, D]`.
-- Wrapper/one-shot page metadata uses FlashInfer CSR:
-  `paged_kv_indptr[B + 1]`, `paged_kv_indices[num_used_pages]`, and
-  `paged_kv_last_page_len[B]`, all contiguous CUDA `int32` tensors.
-- The standalone launch uses the same indptr/indices plus explicit
-  `seq_lens[B]` and a static `max_seq_len` upper bound.
+- Page metadata is a contiguous CUDA `int32` dense table
+  `block_table[B, max_pages]` plus explicit `seq_lens[B]`.
+- `max_pages` must cover `ceil(max_kv_len / page_size)`. Request `b` reads only
+  the first `ceil(seq_lens[b] / page_size)` entries; later columns are padding.
 
-Valid CSR metadata starts `paged_kv_indptr` at zero, increases it strictly,
-and ends it at the number of used page-index entries. Every request owns at
-least one page, every page ID indexes the physical cache, and wrapper last-page
-lengths are in `[1, page_size]`. For every standalone request `b`, the live
-metadata must also satisfy
-`ceil(seq_lens[b] / page_size) <= paged_kv_indptr[b + 1] - paged_kv_indptr[b]`.
+The advanced QToken-KvBlock-Sparse-Attention metadata builder returns
+`(q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens)`. For `groups` routes and
+`page_capacity = group_size * (block_topk + 1)`, the first tensor is a
+contiguous Int32 table `[groups, page_capacity]` of plain cache locators. The
+second is `[groups, ceil(page_capacity / 4)]`; each Int32 word packs four
+consecutive 8-bit masks whose bit `i` records whether query `i` in the group
+uses that page. Q1 returns a `[groups, 0]` membership tensor. The final tensor
+is Int32 `[groups]` and stores compact K/V lengths in tokens. For route `g`,
+only
+`q_token_kv_block_sparse_page_indices[g, :ceil(seq_lens[g] / sparse_block_size)]` and the
+corresponding membership bytes are live. The unused locator suffix, unused
+membership words, and padding bytes in the final membership word have
+unspecified values.
+
+Every live page ID must index the physical cache. Sequence lengths are in
+`[1, max_kv_len]` and the dense table must have enough columns for the static
+bound. The standalone prepared plan permits lengths and live page IDs to change
+between completed launches; the reusable wrapper may specialize from planned
+lengths, so its `seq_lens` values remain fixed until the next `plan()`.
 Query offsets start at zero, increase strictly, end at the packed Q extent,
 and have every delta no larger than the planned `max_seq_len_q`. Causal
 attention additionally requires each fixed or packed per-request Q length to
@@ -125,9 +172,9 @@ the worker tasks. Underfilled fixed-Q grids may instead split the K/V sequence
 and reduce partial outputs. Packed-Q and sliding-window work remains nonsplit:
 it uses CLC above one resident wave and the direct static path otherwise.
 
-Page IDs are loaded from the live CSR metadata on every run and graph replay.
-The `paged_kv_indices` storage and entry count are part of the plan, but valid
-IDs may be remapped in-place without recompiling.
+Page IDs are loaded from the live dense table on every run and graph replay.
+The table storage and shape are part of the plan, but valid live IDs may be
+remapped in-place without recompiling.
 
 | Source | Responsibility |
 | --- | --- |
@@ -155,23 +202,24 @@ num_pages = B * pages_per_request
 
 q = torch.randn(B, Hq, D, device=device, dtype=torch.float16)
 kv = torch.randn(
-    num_pages, 2, Hkv, page_size, D,
+    num_pages,
+    2,
+    Hkv,
+    page_size,
+    D,
     device=device,
     dtype=torch.float16,
 )
-paged_kv_indptr = torch.arange(
-    0, num_pages + 1, pages_per_request, device=device, dtype=torch.int32
-)
 paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
-last_page_len = torch.full(
-    (B,), page_size, device=device, dtype=torch.int32
+block_table = paged_kv_indices.reshape(B, pages_per_request)
+seq_lens = torch.full(
+    (B,), pages_per_request * page_size, device=device, dtype=torch.int32
 )
 
 wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
 wrapper.plan(
-    paged_kv_indptr,
-    paged_kv_indices,
-    last_page_len,
+    block_table,
+    seq_lens,
     Hq,
     Hkv,
     D,
@@ -197,13 +245,11 @@ workspace_bytes = get_prims_ts_batch_decode_workspace_size(
     device=q.device,
 )
 workspace = torch.zeros(workspace_bytes, device=device, dtype=torch.int8)
-seq_lens = torch.full((B,), max_seq_len, device=device, dtype=torch.int32)
 standalone_out = prims_ts_batch_decode_with_kv_cache(
     q,
     kv,
     workspace,
-    paged_kv_indptr,
-    paged_kv_indices,
+    block_table,
     seq_lens,
     max_seq_len,
     mask_type="causal",
@@ -211,11 +257,10 @@ standalone_out = prims_ts_batch_decode_with_kv_cache(
 assert standalone_out.shape == q.shape
 ```
 
-The wrapper snapshots K/V lengths derived from `paged_kv_indptr` and
-`paged_kv_last_page_len`. Both tensors' values must remain unchanged until the
-next successful plan. The `paged_kv_indices` storage and entry count must stay
-fixed, but valid page IDs may be remapped in-place between completed runs or
-graph replays because each execution reloads them. Packed `qo_indptr` storage
+The wrapper snapshots `seq_lens`; their values must remain unchanged until the
+next successful plan. The `block_table` storage and shape must stay fixed, but
+valid live page IDs may be remapped in-place between completed runs or graph
+replays because each execution reloads them. Packed `qo_indptr` storage
 also stays fixed; interior offsets may change between completed executions only
 while preserving positive deltas within the planned bound and the same final
 packed extent. Do not mutate any retained metadata concurrently with a run or
@@ -234,11 +279,10 @@ tensor. Zero it before first use and re-zero it whenever any workspace-layout
 input, including batch size, changes because the internal workspace section
 offsets can move even when the compiled callable is reused. Do not share it
 between concurrent launches or captured graphs. It must not overlap Q, K/V
-cache, metadata, or output storage. The standalone hot path trusts CSR,
-`seq_lens`, and packed-Q values: keep lengths positive and within their static
-bounds, keep enough page entries in every CSR row for its live length, and keep
-all page IDs valid. CSR
-offsets, sequence lengths, page IDs, and packed-Q offsets may change between
+cache, metadata, or output storage. The standalone hot path trusts
+`block_table`, `seq_lens`, and packed-Q values: keep lengths positive and within
+their static bounds, keep enough table columns for the compiled bound, and keep
+all live page IDs valid. Sequence lengths, page IDs, and packed-Q offsets may change between
 completed launches or graph replays while preserving those contracts and
 stable captured storage. Do not mutate them concurrently with an execution
 that reads them. These live values are not host-synchronized or fully
