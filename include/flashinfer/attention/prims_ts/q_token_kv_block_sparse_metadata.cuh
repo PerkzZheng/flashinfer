@@ -503,10 +503,16 @@ __global__ __launch_bounds__(
           tail_tokens == 0 ? 0 : kQTokenKvBlockSparseSparseBlockSize - tail_tokens;
       params.seq_lens[blockIdx.x] =
           shared.union_pages * kQTokenKvBlockSparseSparseBlockSize - tail_padding;
+      // Attention reads packed Uint32 words. Initialize only the last word's
+      // padding bytes so that its masked load never reads unwritten memory.
+      for (int byte = shared.union_pages; byte % kQTokenKvBlockSparseMembershipsPerWord != 0;
+           ++byte) {
+        group_memberships[byte] = 0;
+      }
     } else {
       // Attention requires one addressable sentinel entry for an inert route.
       group_indices[0] = -1;
-      group_memberships[0] = 0;
+      reinterpret_cast<uint32_t*>(group_memberships)[0] = 0;
       params.seq_lens[blockIdx.x] = 1;
     }
   }

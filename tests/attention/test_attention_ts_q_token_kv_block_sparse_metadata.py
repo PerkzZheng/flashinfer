@@ -751,8 +751,6 @@ def _assert_metadata_matches(
     assert actual_indices.shape == expected_indices.shape
     assert actual_memberships.shape == expected_memberships.shape
     torch.testing.assert_close(actual_seq_lens, expected_seq_lens)
-    actual_memberships_u8 = actual_memberships.view(torch.uint8)
-    expected_memberships_u8 = expected_memberships.view(torch.uint8)
     for group in range(expected_seq_lens.numel()):
         live_pages = (int(expected_seq_lens[group].item()) + 3) // 4
         torch.testing.assert_close(
@@ -760,9 +758,11 @@ def _assert_metadata_matches(
             expected_indices[group, :live_pages],
         )
         if expected_memberships.shape[1] > 0:
+            # Attention loads whole words, including the last word's padding.
+            live_words = (live_pages + 3) // 4
             torch.testing.assert_close(
-                actual_memberships_u8[group, :live_pages],
-                expected_memberships_u8[group, :live_pages],
+                actual_memberships[group, :live_words],
+                expected_memberships[group, :live_words],
             )
 
 
@@ -1404,6 +1404,7 @@ def test_q_token_kv_block_sparse_sort_union_cuda_graph_reloads_and_invalidates()
     outputs = tuple(
         torch.empty(shape, dtype=torch.int32, device="cuda") for shape in output_shapes
     )
+    outputs[1].fill_(0x5A5A5A5A)
 
     def run() -> None:
         build_prims_ts_q_token_kv_block_sparse_metadata(
@@ -1435,8 +1436,8 @@ def test_q_token_kv_block_sparse_sort_union_cuda_graph_reloads_and_invalidates()
     assert outputs[0][0, 0].item() == -1
 
     # Restore a valid group and grow its live union. Every newly observable
-    # page index and membership byte must be produced by this replay; dead
-    # suffix bytes remain intentionally unspecified.
+    # page index and membership word must be produced by this replay; bytes
+    # beyond the rounded live word prefix remain intentionally unspecified.
     positions[2].sub_(1)
     blocks[2].add_(16)
     graph.replay()
