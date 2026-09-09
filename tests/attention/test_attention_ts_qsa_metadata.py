@@ -83,8 +83,6 @@ def prims_ts_qsa_attention(
 ) -> torch.Tensor:
     """Adapt internal accuracy cases to the renamed public eager API."""
 
-    if bmm2_scale != 1.0:
-        raise ValueError("the public QToken API keeps output scaling internal")
     return q_token_kv_block_sparse_attention_with_paged_kv_cache(
         query,
         paged_kv_cache,
@@ -97,6 +95,7 @@ def prims_ts_qsa_attention(
         seq_len_q=max_seq_len_q,
         kv_block_size=sparse_block_size,
         sm_scale=bmm1_scale,
+        v_scale=bmm2_scale,
         out=out,
         o_data_type=out_dtype,
         qo_indptr=qo_indptr,
@@ -161,6 +160,7 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "query_positions",
         "qo_indptr",
         "sm_scale",
+        "v_scale",
         "out",
     )
 
@@ -1867,7 +1867,7 @@ def test_qsa_fixed_5d_layout_flattens_route_axes_without_copy(
             assert actual_query.data_ptr() == query.data_ptr()
             assert out.data_ptr() == output.data_ptr()
             assert scale_qk == pytest.approx(256**-0.5)
-            assert scale_v == 1.0
+            assert scale_v == pytest.approx(0.25)
             out.fill_(3)
             calls["query"] = actual_query
             return out
@@ -1905,6 +1905,7 @@ def test_qsa_fixed_5d_layout_flattens_route_axes_without_copy(
         requests,
         positions,
         workspace,
+        bmm2_scale=0.25,
         out=output,
         max_seq_len_kv=table.shape[1] * storage_page_size,
     )

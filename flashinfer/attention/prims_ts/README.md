@@ -80,7 +80,8 @@ or reads tensors.
 plan-plus-run convenience API and is not graph-capturable. Shared argument
 spellings intentionally match paged block-sparse attention: `q`,
 `paged_kv_cache`, `page_size`, `kv_block_size`, `mask_type`,
-`sm_scale`, `seq_len_q`, and `max_seq_len_kv`.
+`sm_scale`, `seq_len_q`, and `max_seq_len_kv`. The optional runtime
+`v_scale` applies the value-cache dequantization scale and defaults to one.
 
 On SM90 and newer, the combined route-builder and attention launch use PDL.
 Attention initializes its independent resources before acquiring immediately

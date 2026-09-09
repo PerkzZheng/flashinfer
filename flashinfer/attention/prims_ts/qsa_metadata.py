@@ -347,6 +347,7 @@ class _PrimsTSQSAPlan:
         *,
         out: torch.Tensor,
         sm_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
     ) -> torch.Tensor:
         """Launch prepared QSA metadata and attention on the current stream."""
 
@@ -384,11 +385,15 @@ class _PrimsTSQSAPlan:
             self._bmm1_scale if sm_scale is None else sm_scale,
             "sm_scale",
         )
+        scale_v = _validate_scale(
+            self._bmm2_scale if v_scale is None else v_scale,
+            "v_scale",
+        )
         self._attention_plan._run_unchecked(
             attention_query,
             attention_out,
             scale_qk,
-            self._bmm2_scale,
+            scale_v,
         )
         return out
 
@@ -589,6 +594,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         *,
         qo_indptr: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
+        v_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Build live routes and launch the current QToken attention plan.
@@ -601,7 +607,9 @@ class QTokenKvBlockSparsePagedTSWrapper:
 
         Run once eagerly after :meth:`plan`; capture only subsequent calls with
         stable tensor storage. A changed packed extent or retained K/V/offset
-        storage triggers a new preparation outside capture.
+        storage triggers a new preparation outside capture. ``sm_scale`` and
+        ``v_scale`` are live launch scalars, so frameworks may update Q/K and V
+        dequantization scales without rebuilding the capacity plan.
         """
 
         config = self._require_config()
@@ -747,6 +755,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             query_positions,
             out=out,
             sm_scale=sm_scale,
+            v_scale=v_scale,
         )
 
 
@@ -1622,6 +1631,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     kv_block_size: int = 4,
     mask_type: Literal["causal"] = "causal",
     sm_scale: Optional[float] = None,
+    v_scale: Optional[float] = None,
     out: Optional[torch.Tensor] = None,
     o_data_type: Optional[torch.dtype] = None,
     qo_indptr: Optional[torch.Tensor] = None,
@@ -1672,6 +1682,10 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         QToken-KvBlock-Sparse-Attention currently supports causal masking only.
     sm_scale : float, optional
         Softmax scale, defaulting to ``head_dim**-0.5``.
+    v_scale : float, optional
+        Value-cache dequantization scale applied to the attention output,
+        defaulting to one. Frameworks using an FP8 K/V cache should pass the
+        cache's live V scale.
     out : torch.Tensor, optional
         Caller-owned output with the same logical shape as ``q``.
     o_data_type : torch.dtype, optional
@@ -1753,6 +1767,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         query_positions,
         qo_indptr=qo_indptr,
         sm_scale=sm_scale,
+        v_scale=v_scale,
         out=out,
     )
 
