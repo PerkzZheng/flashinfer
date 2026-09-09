@@ -23,9 +23,16 @@ The workspace-owned intermediate metadata is the triple
 ``(q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens)``. Page indices are plain
 Int32 cache locators. Grouped routes store four 8-bit query-membership masks per
 Int32 word; Q1 has a zero-width membership table. ``seq_lens`` selects each
-route's live locator prefix, and no value is promised for the unused locator
-suffix or membership padding. The combined calls below keep this metadata
+route's live locator prefix. Spare bytes in the last live membership word
+are zero; unused locator entries and whole membership words beyond the live
+prefix are unspecified. The combined calls below keep this metadata
 hidden and do not add it to the public attention signature.
+
+For each valid query at zero-based position ``p``, the indexer supplies
+``min(block_topk, (p + 1) // kv_block_size)`` distinct completed-block IDs
+as a valid prefix, in any order. Q1 does not compact arbitrary missing entries
+inside that prefix. Later columns are ignored; metadata derives the incomplete
+causal tail directly from the query position.
 
 The caller fixes ``G`` for a prepared plan. The optional pure-host group-size
 suggestion helper uses a caller-cached SM count and never queries the device or

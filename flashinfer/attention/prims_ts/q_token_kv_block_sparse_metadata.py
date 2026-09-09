@@ -623,6 +623,14 @@ class QTokenKvBlockSparsePagedTSWrapper:
         ``block_indices``. The paged K/V tensors are separate HND caches shaped
         ``[num_pages, Hkv, page_size, D]``.
 
+        For every valid query at zero-based position ``p``, the first
+        ``min(block_topk, (p + 1) // kv_block_size)`` indexer entries must be
+        distinct completed-block IDs in ``[0, (p + 1) // kv_block_size)``.
+        Their order is unrestricted; later entries are ignored. In particular,
+        Q1 does not compact missing entries or arbitrary ``-1`` holes inside
+        this required prefix. The incomplete causal tail is derived from
+        ``query_positions`` and must not be inserted into the selected prefix.
+
         Run once eagerly after :meth:`plan`; capture only subsequent calls with
         stable tensor storage. A changed packed extent or retained K/V/offset
         storage triggers a new preparation outside capture. ``sm_scale`` and
@@ -1717,7 +1725,10 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         ``[num_requests, max_storage_pages]``.
     indexer_block_ids : torch.Tensor
         CUDA Int32 indexer-selected logical K/V blocks
-        ``[num_query_tokens, block_topk]``.
+        ``[num_query_tokens, block_topk]``. Each valid row must provide the
+        distinct completed-block prefix described by
+        :meth:`QTokenKvBlockSparsePagedTSWrapper.run`; Q1 does not compact
+        missing entries inside that prefix. Tail tokens are derived separately.
     token_to_request : torch.Tensor
         CUDA Int32 request ID for each flattened query token.
     query_positions : torch.Tensor
