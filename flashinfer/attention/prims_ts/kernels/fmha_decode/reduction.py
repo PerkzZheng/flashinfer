@@ -212,7 +212,7 @@ def _reduce_exact_splits_body(
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
     if cutlass.const_expr(not static_full_split_prefix):
-        # QSA seq_lens may originate two PDL stages upstream. Keep this read
+        # Sparse-route seq_lens may originate two PDL stages upstream. Keep this read
         # behind the attention-producer acquire together with partial O/stats;
         # ordinary reducers preserve the same instruction ordering harmlessly.
         active_splits_kv = _reduction_active_splits_kv(

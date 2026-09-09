@@ -21,30 +21,31 @@ from . import env as jit_env
 from .core import JitSpec, gen_jit_spec
 
 
-def _qsa_source_paths() -> tuple[list[Path], list[Path]]:
-    """Resolve checkout-local QSA sources, with installed-package fallback."""
+def _q_token_kv_block_sparse_source_paths() -> tuple[list[Path], list[Path]]:
+    """Resolve checkout-local QToken-KvBlock-Sparse-Attention sources, with installed-package fallback."""
 
     checkout = Path(__file__).resolve().parents[2]
     checkout_sources = [
-        checkout / "csrc" / "prims_ts_qsa_metadata.cu",
-        checkout / "csrc" / "prims_ts_qsa_metadata_jit_binding.cu",
+        checkout / "csrc" / "prims_ts_q_token_kv_block_sparse_metadata.cu",
+        checkout / "csrc" / "prims_ts_q_token_kv_block_sparse_metadata_jit_binding.cu",
     ]
     checkout_include = checkout / "include"
     if all(path.is_file() for path in checkout_sources) and checkout_include.is_dir():
         return checkout_sources, [checkout_include]
     return [
-        jit_env.FLASHINFER_CSRC_DIR / "prims_ts_qsa_metadata.cu",
-        jit_env.FLASHINFER_CSRC_DIR / "prims_ts_qsa_metadata_jit_binding.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "prims_ts_q_token_kv_block_sparse_metadata.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "prims_ts_q_token_kv_block_sparse_metadata_jit_binding.cu",
     ], []
 
 
 @functools.cache
-def gen_prims_ts_qsa_metadata_module() -> JitSpec:
+def gen_prims_ts_q_token_kv_block_sparse_metadata_module() -> JitSpec:
     """Build the JIT spec for direct Q1 and grouped sort-union metadata."""
 
-    sources, include_paths = _qsa_source_paths()
+    sources, include_paths = _q_token_kv_block_sparse_source_paths()
     return gen_jit_spec(
-        "prims_ts_qsa_metadata",
+        "prims_ts_q_token_kv_block_sparse_metadata",
         sources,
         extra_include_paths=include_paths,
         extra_cuda_cflags=["-lineinfo"],

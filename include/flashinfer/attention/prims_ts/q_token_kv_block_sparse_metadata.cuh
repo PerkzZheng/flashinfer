@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#ifndef FLASHINFER_ATTENTION_PRIMS_TS_QSA_METADATA_CUH_
-#define FLASHINFER_ATTENTION_PRIMS_TS_QSA_METADATA_CUH_
+#ifndef FLASHINFER_ATTENTION_PRIMS_TS_Q_TOKEN_KV_BLOCK_SPARSE_METADATA_CUH_
+#define FLASHINFER_ATTENTION_PRIMS_TS_Q_TOKEN_KV_BLOCK_SPARSE_METADATA_CUH_
 
 #include <cuda_runtime.h>
 
@@ -29,38 +29,38 @@ namespace flashinfer {
 namespace attention {
 namespace prims_ts {
 
-constexpr int kQSASparseBlockSize = 4;
-constexpr int kQSAMaxBlockTopK = 512;
-constexpr int kQSAMembershipsPerWord = 4;
-constexpr int kQSAQ1BlockThreads = 256;
+constexpr int kQTokenKvBlockSparseSparseBlockSize = 4;
+constexpr int kQTokenKvBlockSparseMaxBlockTopK = 512;
+constexpr int kQTokenKvBlockSparseMembershipsPerWord = 4;
+constexpr int kQTokenKvBlockSparseQ1BlockThreads = 256;
 
 template <int GroupSize>
-struct QSATouchedMetadataKernelTraits;
+struct QTokenKvBlockSparseTouchedMetadataKernelTraits;
 
 // Keep enough independent warps to fill a Blackwell wave when decode exposes
 // only a few query groups.  The per-group traits keep schedule tuning separate
 // from metadata semantics while covering G * (512 selected blocks + one
 // causal-tail block).
 template <>
-struct QSATouchedMetadataKernelTraits<2> {
+struct QTokenKvBlockSparseTouchedMetadataKernelTraits<2> {
   static constexpr int kBlockThreads = 384;
   static constexpr int kItemsPerThread = 3;
 };
 
 template <>
-struct QSATouchedMetadataKernelTraits<4> {
+struct QTokenKvBlockSparseTouchedMetadataKernelTraits<4> {
   static constexpr int kBlockThreads = 544;
   static constexpr int kItemsPerThread = 4;
 };
 
 template <>
-struct QSATouchedMetadataKernelTraits<5> {
+struct QTokenKvBlockSparseTouchedMetadataKernelTraits<5> {
   static constexpr int kBlockThreads = 672;
   static constexpr int kItemsPerThread = 4;
 };
 
 template <typename PositionType>
-struct QSATouchedMetadataParams {
+struct QTokenKvBlockSparseTouchedMetadataParams {
   const int32_t* block_indices;
   const int32_t* block_table;
   const int32_t* token_to_request;
@@ -68,9 +68,9 @@ struct QSATouchedMetadataParams {
   // Null for the fixed layout.  Packed routes use [groups + 1] row offsets.
   const int32_t* qo_indptr;
 
-  int32_t* qsa_page_indices;
+  int32_t* q_token_kv_block_sparse_page_indices;
   // Four uint8 query-membership masks are packed in each int32 word.
-  int32_t* qsa_page_memberships;
+  int32_t* q_token_kv_block_sparse_page_memberships;
   int32_t* seq_lens;
 
   int64_t block_indices_row_stride;
@@ -96,7 +96,7 @@ struct QSATouchedMetadataParams {
 
 namespace detail {
 
-struct QSAMembershipSegment {
+struct QTokenKvBlockSparseMembershipSegment {
   uint32_t logical_block;
   uint32_t memberships;
 };
@@ -105,9 +105,10 @@ struct QSAMembershipSegment {
 // operation is associative over this monotonic-key domain, which is the input
 // contract consumed by CUB BlockScan.  It gives every run-end lane the exact
 // membership OR without a serial walk, even when an input row has duplicates.
-struct QSAMembershipSegmentedOr {
-  __device__ __forceinline__ QSAMembershipSegment
-  operator()(const QSAMembershipSegment& left, const QSAMembershipSegment& right) const {
+struct QTokenKvBlockSparseMembershipSegmentedOr {
+  __device__ __forceinline__ QTokenKvBlockSparseMembershipSegment
+  operator()(const QTokenKvBlockSparseMembershipSegment& left,
+             const QTokenKvBlockSparseMembershipSegment& right) const {
     return {right.logical_block, left.logical_block == right.logical_block
                                      ? left.memberships | right.memberships
                                      : right.memberships};
@@ -115,22 +116,23 @@ struct QSAMembershipSegmentedOr {
 };
 
 template <int BlockThreads, int ItemsPerThread>
-using QSAKeySort = cub::BlockRadixSort<uint32_t, BlockThreads, ItemsPerThread>;
+using QTokenKvBlockSparseKeySort = cub::BlockRadixSort<uint32_t, BlockThreads, ItemsPerThread>;
 
 template <int BlockThreads>
-using QSASegmentScan = cub::BlockScan<QSAMembershipSegment, BlockThreads>;
+using QTokenKvBlockSparseSegmentScan =
+    cub::BlockScan<QTokenKvBlockSparseMembershipSegment, BlockThreads>;
 
 template <int BlockThreads>
-using QSAOutputRankScan = cub::BlockScan<int, BlockThreads>;
+using QTokenKvBlockSparseOutputRankScan = cub::BlockScan<int, BlockThreads>;
 
 template <int BlockThreads, int ItemsPerThread>
-union QSACollectiveTempStorage {
-  typename QSAKeySort<BlockThreads, ItemsPerThread>::TempStorage key_sort;
-  typename QSASegmentScan<BlockThreads>::TempStorage membership_scan;
-  typename QSAOutputRankScan<BlockThreads>::TempStorage output_rank_scan;
+union QTokenKvBlockSparseCollectiveTempStorage {
+  typename QTokenKvBlockSparseKeySort<BlockThreads, ItemsPerThread>::TempStorage key_sort;
+  typename QTokenKvBlockSparseSegmentScan<BlockThreads>::TempStorage membership_scan;
+  typename QTokenKvBlockSparseOutputRankScan<BlockThreads>::TempStorage output_rank_scan;
 };
 
-struct QSARouteState {
+struct QTokenKvBlockSparseRouteState {
   int32_t valid;
   int32_t request;
   int32_t first_row;
@@ -140,18 +142,19 @@ struct QSARouteState {
 };
 
 template <int BlockThreads, int ItemsPerThread>
-struct QSATouchedMetadataSharedStorage {
+struct QTokenKvBlockSparseTouchedMetadataSharedStorage {
   static constexpr int kSortCapacity = BlockThreads * ItemsPerThread;
 
-  QSACollectiveTempStorage<BlockThreads, ItemsPerThread> temp;
+  QTokenKvBlockSparseCollectiveTempStorage<BlockThreads, ItemsPerThread> temp;
   uint32_t sorted_logical_blocks[kSortCapacity];
-  QSARouteState route;
+  QTokenKvBlockSparseRouteState route;
   int32_t union_pages;
 };
 
 template <typename PositionType, int GroupSize, bool PackedQuery>
-__device__ __forceinline__ void InitRoute(const QSATouchedMetadataParams<PositionType>& params,
-                                          QSARouteState* route) {
+__device__ __forceinline__ void InitRoute(
+    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
+    QTokenKvBlockSparseRouteState* route) {
   if (threadIdx.x != 0) {
     return;
   }
@@ -205,9 +208,9 @@ __device__ __forceinline__ void InitRoute(const QSATouchedMetadataParams<Positio
 
 template <typename PositionType>
 __device__ __forceinline__ void StorePageMetadata(
-    const QSATouchedMetadataParams<PositionType>& params, const QSARouteState& route,
-    uint32_t logical_block, uint8_t membership, int32_t output_rank, int32_t* group_indices,
-    uint8_t* group_memberships) {
+    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
+    const QTokenKvBlockSparseRouteState& route, uint32_t logical_block, uint8_t membership,
+    int32_t output_rank, int32_t* group_indices, uint8_t* group_memberships) {
   uint32_t storage_page;
   uint32_t subpage;
   params.subpages_per_storage_page.divmod(logical_block, storage_page, subpage);
@@ -234,9 +237,10 @@ __device__ __forceinline__ void StorePageMetadata(
 }
 
 template <typename PositionType, bool PackedQuery>
-__global__ __launch_bounds__(kQSAQ1BlockThreads) void QSAQ1MetadataKernel(
-    const __grid_constant__ QSATouchedMetadataParams<PositionType> params) {
-  __shared__ QSARouteState route;
+__global__
+__launch_bounds__(kQTokenKvBlockSparseQ1BlockThreads) void QTokenKvBlockSparseQ1MetadataKernel(
+    const __grid_constant__ QTokenKvBlockSparseTouchedMetadataParams<PositionType> params) {
+  __shared__ QTokenKvBlockSparseRouteState route;
   if (threadIdx.x == 0) {
     route = {0, -1, 0, 0, -1, -1};
   }
@@ -244,25 +248,26 @@ __global__ __launch_bounds__(kQSAQ1BlockThreads) void QSAQ1MetadataKernel(
   InitRoute<PositionType, 1, PackedQuery>(params, &route);
   __syncthreads();
 
-  int32_t* row_indices =
-      params.qsa_page_indices + static_cast<int64_t>(blockIdx.x) * params.page_capacity;
+  int32_t* row_indices = params.q_token_kv_block_sparse_page_indices +
+                         static_cast<int64_t>(blockIdx.x) * params.page_capacity;
   const int64_t visible_tokens = route.valid ? route.first_position + 1 : 0;
   const int32_t complete_blocks =
-      static_cast<int32_t>(visible_tokens / kQSASparseBlockSize < params.block_topk
-                               ? visible_tokens / kQSASparseBlockSize
+      static_cast<int32_t>(visible_tokens / kQTokenKvBlockSparseSparseBlockSize < params.block_topk
+                               ? visible_tokens / kQTokenKvBlockSparseSparseBlockSize
                                : params.block_topk);
 
   // Initialize the complete fixed-capacity row on every replay. Attention may
   // speculatively load a rounded page tile before token-lane predicates apply.
   for (int32_t output_rank = threadIdx.x; output_rank < params.page_capacity;
-       output_rank += kQSAQ1BlockThreads) {
+       output_rank += kQTokenKvBlockSparseQ1BlockThreads) {
     int32_t locator = -1;
     if (route.valid && output_rank < complete_blocks) {
       const int32_t logical_block = params.block_indices[static_cast<int64_t>(route.first_row) *
                                                              params.block_indices_row_stride +
                                                          static_cast<int64_t>(output_rank) *
                                                              params.block_indices_column_stride];
-      if (logical_block >= 0 && logical_block < visible_tokens / kQSASparseBlockSize &&
+      if (logical_block >= 0 &&
+          logical_block < visible_tokens / kQTokenKvBlockSparseSparseBlockSize &&
           logical_block < params.model_block_bound) {
         uint32_t storage_page;
         uint32_t subpage;
@@ -289,10 +294,11 @@ __global__ __launch_bounds__(kQSAQ1BlockThreads) void QSAQ1MetadataKernel(
 
   if (threadIdx.x == 0) {
     const int32_t tail_tokens =
-        route.valid ? static_cast<int32_t>(visible_tokens % kQSASparseBlockSize) : 0;
+        route.valid ? static_cast<int32_t>(visible_tokens % kQTokenKvBlockSparseSparseBlockSize)
+                    : 0;
     if (tail_tokens != 0) {
       const uint32_t tail_logical_block =
-          static_cast<uint32_t>(visible_tokens / kQSASparseBlockSize);
+          static_cast<uint32_t>(visible_tokens / kQTokenKvBlockSparseSparseBlockSize);
       uint32_t storage_page;
       uint32_t subpage;
       params.subpages_per_storage_page.divmod(tail_logical_block, storage_page, subpage);
@@ -309,7 +315,8 @@ __global__ __launch_bounds__(kQSAQ1BlockThreads) void QSAQ1MetadataKernel(
         }
       }
     }
-    const int32_t compact_length = complete_blocks * kQSASparseBlockSize + tail_tokens;
+    const int32_t compact_length =
+        complete_blocks * kQTokenKvBlockSparseSparseBlockSize + tail_tokens;
     params.seq_lens[blockIdx.x] = route.valid ? (compact_length > 0 ? compact_length : 1) : 1;
   }
   __syncthreads();
@@ -325,14 +332,16 @@ __global__ __launch_bounds__(kQSAQ1BlockThreads) void QSAQ1MetadataKernel(
 
 template <typename PositionType, int GroupSize>
 __device__ __forceinline__ int BuildTouchedUnion(
-    const QSATouchedMetadataParams<PositionType>& params,
-    QSATouchedMetadataSharedStorage<QSATouchedMetadataKernelTraits<GroupSize>::kBlockThreads,
-                                    QSATouchedMetadataKernelTraits<GroupSize>::kItemsPerThread>&
-        shared,
+    const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params,
+    QTokenKvBlockSparseTouchedMetadataSharedStorage<
+        QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads,
+        QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kItemsPerThread>& shared,
     uint32_t active_logical_capacity, int active_radix_end_bit, uint32_t low_mask,
     int32_t* group_indices, uint8_t* group_memberships) {
-  constexpr int kBlockThreads = QSATouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
-  constexpr int kItemsPerThread = QSATouchedMetadataKernelTraits<GroupSize>::kItemsPerThread;
+  constexpr int kBlockThreads =
+      QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
+  constexpr int kItemsPerThread =
+      QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kItemsPerThread;
   constexpr int kSortCapacity = kBlockThreads * kItemsPerThread;
 
   uint32_t encoded_keys[kItemsPerThread];
@@ -347,7 +356,7 @@ __device__ __forceinline__ int BuildTouchedUnion(
     if (shared.route.valid && query < static_cast<uint32_t>(shared.route.query_count) &&
         candidate_rank < static_cast<uint32_t>(GroupSize * (params.block_topk + 1))) {
       const int64_t visible_tokens = shared.route.first_position + query + 1;
-      const int64_t complete_block_count = visible_tokens / kQSASparseBlockSize;
+      const int64_t complete_block_count = visible_tokens / kQTokenKvBlockSparseSparseBlockSize;
       const int32_t selected_count = static_cast<int32_t>(
           complete_block_count < params.block_topk ? complete_block_count : params.block_topk);
       if (query_item < static_cast<uint32_t>(selected_count)) {
@@ -364,8 +373,8 @@ __device__ __forceinline__ int BuildTouchedUnion(
           logical_block = selected_block;
         }
       } else if (query_item == static_cast<uint32_t>(params.block_topk) &&
-                 visible_tokens % kQSASparseBlockSize != 0) {
-        logical_block = visible_tokens / kQSASparseBlockSize;
+                 visible_tokens % kQTokenKvBlockSparseSparseBlockSize != 0) {
+        logical_block = visible_tokens / kQTokenKvBlockSparseSparseBlockSize;
       }
     }
 
@@ -376,10 +385,10 @@ __device__ __forceinline__ int BuildTouchedUnion(
              : low_mask;
   }
 
-  QSAKeySort<kBlockThreads, kItemsPerThread>(shared.temp.key_sort)
+  QTokenKvBlockSparseKeySort<kBlockThreads, kItemsPerThread>(shared.temp.key_sort)
       .Sort(encoded_keys, 0, active_radix_end_bit);
 
-  QSAMembershipSegment segments[kItemsPerThread];
+  QTokenKvBlockSparseMembershipSegment segments[kItemsPerThread];
 #pragma unroll
   for (int item = 0; item < kItemsPerThread; ++item) {
     const int rank = threadIdx.x * kItemsPerThread + item;
@@ -393,8 +402,8 @@ __device__ __forceinline__ int BuildTouchedUnion(
 
   // Exact duplicate handling: the segmented scan propagates the membership
   // OR across each complete equal-key run in logarithmic collective depth.
-  QSASegmentScan<kBlockThreads>(shared.temp.membership_scan)
-      .InclusiveScan(segments, segments, QSAMembershipSegmentedOr{});
+  QTokenKvBlockSparseSegmentScan<kBlockThreads>(shared.temp.membership_scan)
+      .InclusiveScan(segments, segments, QTokenKvBlockSparseMembershipSegmentedOr{});
   __syncthreads();
 
   int unique_flags[kItemsPerThread];
@@ -412,7 +421,7 @@ __device__ __forceinline__ int BuildTouchedUnion(
 
   int thread_output_begin = 0;
   int union_pages = 0;
-  QSAOutputRankScan<kBlockThreads>(shared.temp.output_rank_scan)
+  QTokenKvBlockSparseOutputRankScan<kBlockThreads>(shared.temp.output_rank_scan)
       .ExclusiveSum(local_unique_count, thread_output_begin, union_pages);
 
   int local_output_rank = 0;
@@ -430,18 +439,21 @@ __device__ __forceinline__ int BuildTouchedUnion(
 
 template <typename PositionType, int GroupSize, bool PackedQuery>
 __global__ __launch_bounds__(
-    QSATouchedMetadataKernelTraits<GroupSize>::
-        kBlockThreads) void QSATouchedMetadataKernel(const __grid_constant__
-                                                         QSATouchedMetadataParams<PositionType>
-                                                             params) {
-  constexpr int kBlockThreads = QSATouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
-  constexpr int kItemsPerThread = QSATouchedMetadataKernelTraits<GroupSize>::kItemsPerThread;
+    QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::
+        kBlockThreads) void QTokenKvBlockSparseTouchedMetadataKernel(const __grid_constant__
+                                                                         QTokenKvBlockSparseTouchedMetadataParams<
+                                                                             PositionType>
+                                                                             params) {
+  constexpr int kBlockThreads =
+      QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
+  constexpr int kItemsPerThread =
+      QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kItemsPerThread;
   constexpr int kSortCapacity = kBlockThreads * kItemsPerThread;
-  constexpr int kMaximumCandidates = GroupSize * (kQSAMaxBlockTopK + 1);
+  constexpr int kMaximumCandidates = GroupSize * (kQTokenKvBlockSparseMaxBlockTopK + 1);
   static_assert(kSortCapacity >= kMaximumCandidates);
   static_assert(GroupSize <= 8, "query membership is stored in one byte");
 
-  __shared__ QSATouchedMetadataSharedStorage<kBlockThreads, kItemsPerThread> shared;
+  __shared__ QTokenKvBlockSparseTouchedMetadataSharedStorage<kBlockThreads, kItemsPerThread> shared;
 
   // Initialize CTA-local state before reading semantic inputs. This metadata
   // kernel has no producer dependency; its terminal release may launch the
@@ -455,15 +467,17 @@ __global__ __launch_bounds__(
   __syncthreads();
 
   const int64_t causal_block_bound =
-      shared.route.valid ? (shared.route.last_position + kQSASparseBlockSize) / kQSASparseBlockSize
+      shared.route.valid ? (shared.route.last_position + kQTokenKvBlockSparseSparseBlockSize) /
+                               kQTokenKvBlockSparseSparseBlockSize
                          : 0;
   const uint32_t active_logical_capacity = static_cast<uint32_t>(
       causal_block_bound < params.model_block_bound ? causal_block_bound
                                                     : params.model_block_bound);
-  int32_t* group_indices =
-      params.qsa_page_indices + static_cast<int64_t>(blockIdx.x) * params.page_capacity;
-  uint8_t* group_memberships = reinterpret_cast<uint8_t*>(
-      params.qsa_page_memberships + static_cast<int64_t>(blockIdx.x) * params.membership_words);
+  int32_t* group_indices = params.q_token_kv_block_sparse_page_indices +
+                           static_cast<int64_t>(blockIdx.x) * params.page_capacity;
+  uint8_t* group_memberships =
+      reinterpret_cast<uint8_t*>(params.q_token_kv_block_sparse_page_memberships +
+                                 static_cast<int64_t>(blockIdx.x) * params.membership_words);
 
   // bit_width(N) leaves an all-ones sentinel strictly above every live
   // [0, N) key, including when N is a power of two.
@@ -484,9 +498,11 @@ __global__ __launch_bounds__(
   if (threadIdx.x == 0) {
     if (shared.route.valid && shared.union_pages > 0) {
       const int tail_tokens =
-          static_cast<int>((shared.route.last_position + 1) % kQSASparseBlockSize);
-      const int tail_padding = tail_tokens == 0 ? 0 : kQSASparseBlockSize - tail_tokens;
-      params.seq_lens[blockIdx.x] = shared.union_pages * kQSASparseBlockSize - tail_padding;
+          static_cast<int>((shared.route.last_position + 1) % kQTokenKvBlockSparseSparseBlockSize);
+      const int tail_padding =
+          tail_tokens == 0 ? 0 : kQTokenKvBlockSparseSparseBlockSize - tail_tokens;
+      params.seq_lens[blockIdx.x] =
+          shared.union_pages * kQTokenKvBlockSparseSparseBlockSize - tail_padding;
     } else {
       // Attention requires one addressable sentinel entry for an inert route.
       group_indices[0] = -1;
@@ -508,40 +524,46 @@ __global__ __launch_bounds__(
 }
 
 template <typename PositionType, int GroupSize, bool PackedQuery>
-cudaError_t LaunchQSATouchedMetadataTyped(QSATouchedMetadataParams<PositionType> params,
-                                          cudaStream_t stream) {
-  constexpr int kBlockThreads = QSATouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
-  auto kernel = QSATouchedMetadataKernel<PositionType, GroupSize, PackedQuery>;
+cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
+    QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, cudaStream_t stream) {
+  constexpr int kBlockThreads =
+      QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
+  auto kernel = QTokenKvBlockSparseTouchedMetadataKernel<PositionType, GroupSize, PackedQuery>;
   kernel<<<params.groups, kBlockThreads, 0, stream>>>(params);
   return cudaGetLastError();
 }
 
 template <typename PositionType, bool PackedQuery>
-cudaError_t LaunchQSAQ1MetadataTyped(QSATouchedMetadataParams<PositionType> params,
-                                     cudaStream_t stream) {
-  auto kernel = QSAQ1MetadataKernel<PositionType, PackedQuery>;
-  kernel<<<params.groups, kQSAQ1BlockThreads, 0, stream>>>(params);
+cudaError_t LaunchQTokenKvBlockSparseQ1MetadataTyped(
+    QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, cudaStream_t stream) {
+  auto kernel = QTokenKvBlockSparseQ1MetadataKernel<PositionType, PackedQuery>;
+  kernel<<<params.groups, kQTokenKvBlockSparseQ1BlockThreads, 0, stream>>>(params);
   return cudaGetLastError();
 }
 
 }  // namespace detail
 
 template <typename PositionType, bool PackedQuery>
-cudaError_t LaunchQSATouchedMetadata(QSATouchedMetadataParams<PositionType> params,
-                                     int32_t group_size, cudaStream_t stream) {
+cudaError_t LaunchQTokenKvBlockSparseTouchedMetadata(
+    QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, int32_t group_size,
+    cudaStream_t stream) {
   static_assert(std::is_same_v<PositionType, int32_t> || std::is_same_v<PositionType, int64_t>);
   if (params.groups == 0) {
     return cudaSuccess;
   }
   switch (group_size) {
     case 1:
-      return detail::LaunchQSAQ1MetadataTyped<PositionType, PackedQuery>(params, stream);
+      return detail::LaunchQTokenKvBlockSparseQ1MetadataTyped<PositionType, PackedQuery>(params,
+                                                                                         stream);
     case 2:
-      return detail::LaunchQSATouchedMetadataTyped<PositionType, 2, PackedQuery>(params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 2, PackedQuery>(
+          params, stream);
     case 4:
-      return detail::LaunchQSATouchedMetadataTyped<PositionType, 4, PackedQuery>(params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 4, PackedQuery>(
+          params, stream);
     case 5:
-      return detail::LaunchQSATouchedMetadataTyped<PositionType, 5, PackedQuery>(params, stream);
+      return detail::LaunchQTokenKvBlockSparseTouchedMetadataTyped<PositionType, 5, PackedQuery>(
+          params, stream);
     default:
       return cudaErrorInvalidValue;
   }
@@ -551,4 +573,4 @@ cudaError_t LaunchQSATouchedMetadata(QSATouchedMetadataParams<PositionType> para
 }  // namespace attention
 }  // namespace flashinfer
 
-#endif  // FLASHINFER_ATTENTION_PRIMS_TS_QSA_METADATA_CUH_
+#endif  // FLASHINFER_ATTENTION_PRIMS_TS_Q_TOKEN_KV_BLOCK_SPARSE_METADATA_CUH_

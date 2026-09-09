@@ -60,19 +60,19 @@ _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _WORKSPACE_ALIGNMENT = 256
 _WORKSPACE_DTYPES = (torch.int8, torch.uint8)
 _MAX_HEAD_RATIO = 128
-_QSA_GROUPING_MAX_TILE_SIZE_Q = 64
-_QSA_SUPPORTED_GROUP_SIZES = (1, 2, 4, 5)
-_QSA_SUPPORTED_TILE_SIZES_Q = (8, 16, 32, 64)
-_QSA_TILE_SIZE_KV = 128
-_QSA_GROUPED_MIN_LOOP_ITERS_PER_SPLIT = 2
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPING_MAX_TILE_SIZE_Q = 64
+_Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_GROUP_SIZES = (1, 2, 4, 5)
+_Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_TILE_SIZES_Q = (8, 16, 32, 64)
+_Q_TOKEN_KV_BLOCK_SPARSE_TILE_SIZE_KV = 128
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_MIN_LOOP_ITERS_PER_SPLIT = 2
 # The shared standalone reducer supports up to 128 splits. Fixed decode selects
 # the largest useful fanout that stays within the first service wave; grouped
 # routes retain at least two K/V iterations per CTA and packed prefill remains
 # nonsplit.
-_QSA_MAX_SPLITS_KV = 128
+_Q_TOKEN_KV_BLOCK_SPARSE_MAX_SPLITS_KV = 128
 # Q1's bounded 2K domain uses at most the qualified split-8 reducer tier.
 # Allowing split nine would double padded reducer capacity for one tail CTA.
-_QSA_Q1_MAX_SPLITS_KV = 8
+_Q_TOKEN_KV_BLOCK_SPARSE_Q1_MAX_SPLITS_KV = 8
 
 
 @dataclass(frozen=True)
@@ -183,7 +183,7 @@ class PrimsTSBatchDecodePlan:
     The plan retains the K/V cache, dense block-table storage, compiled
     callables, and typed workspace views validated at construction. Block-table
     and sequence-length values may change between completed launches, which is
-    the contract needed by QSA metadata builders. Query and output storage may
+    the contract needed by QToken-KvBlock-Sparse-Attention metadata builders. Query and output storage may
     also change, but must preserve the exact shape, dtype, device, and strides
     proven by the representative tensors passed to
     :func:`prepare_prims_ts_batch_decode_with_kv_cache`.
@@ -207,7 +207,7 @@ class PrimsTSBatchDecodePlan:
     _seq_lens: torch.Tensor
     _qo_indptr: Optional[torch.Tensor]
     _block_table: torch.Tensor
-    _qsa_page_memberships: torch.Tensor
+    _q_token_kv_block_sparse_page_memberships: torch.Tensor
     _workspace: _DecodeWorkspaceViews
     _compiled_main: Callable[..., object]
     _compiled_reducer: Optional[Callable[..., object]]
@@ -270,7 +270,7 @@ class PrimsTSBatchDecodePlan:
             self._seq_lens,
             q_offsets,
             self._block_table,
-            self._qsa_page_memberships,
+            self._q_token_kv_block_sparse_page_memberships,
             self._workspace.partial_o,
             self._workspace.partial_stats,
             self._workspace.split_kv_counter,
@@ -522,7 +522,7 @@ def _resolve_decode_workspace_layout(
     window_left: int,
     storage_page_size: int,
     device: Optional[Union[int, str, torch.device]],
-    use_qsa_route: bool = False,
+    use_q_token_kv_block_sparse_route: bool = False,
     use_pdl: bool = False,
 ) -> _DecodeWorkspaceLayout:
     """Resolve the byte layout for one already-validated semantic key."""
@@ -545,7 +545,7 @@ def _resolve_decode_workspace_layout(
         use_packed_q,
         window_left,
         storage_page_size,
-        use_qsa_route,
+        use_q_token_kv_block_sparse_route,
         use_pdl,
     )
     return _make_decode_workspace_layout(
@@ -1302,38 +1302,44 @@ def _validate_block_table_metadata(
     return device, batch_size, max_num_pages
 
 
-def _validate_qsa_page_memberships(
-    qsa_page_memberships: torch.Tensor,
+def _validate_q_token_kv_block_sparse_page_memberships(
+    q_token_kv_block_sparse_page_memberships: torch.Tensor,
     *,
     expected_device: torch.device,
     batch_size: int,
     max_num_pages: int,
 ) -> None:
-    """Validate the private grouped-QSA packed-membership table."""
+    """Validate the private grouped-QToken-KvBlock-Sparse-Attention packed-membership table."""
 
-    if not isinstance(qsa_page_memberships, torch.Tensor):
-        raise TypeError("qsa_page_memberships must be a torch.Tensor")
-    if qsa_page_memberships.ndim != 2:
-        raise ValueError(
-            f"qsa_page_memberships must be rank 2, got rank {qsa_page_memberships.ndim}"
+    if not isinstance(q_token_kv_block_sparse_page_memberships, torch.Tensor):
+        raise TypeError(
+            "q_token_kv_block_sparse_page_memberships must be a torch.Tensor"
         )
-    if qsa_page_memberships.dtype != torch.int32:
-        raise TypeError("qsa_page_memberships must have dtype torch.int32")
-    if qsa_page_memberships.device != expected_device:
+    if q_token_kv_block_sparse_page_memberships.ndim != 2:
         raise ValueError(
-            f"qsa_page_memberships must be on {expected_device}, got "
-            f"{qsa_page_memberships.device}"
+            f"q_token_kv_block_sparse_page_memberships must be rank 2, got rank {q_token_kv_block_sparse_page_memberships.ndim}"
         )
-    if not qsa_page_memberships.is_contiguous():
-        raise ValueError("qsa_page_memberships must be contiguous")
+    if q_token_kv_block_sparse_page_memberships.dtype != torch.int32:
+        raise TypeError(
+            "q_token_kv_block_sparse_page_memberships must have dtype torch.int32"
+        )
+    if q_token_kv_block_sparse_page_memberships.device != expected_device:
+        raise ValueError(
+            f"q_token_kv_block_sparse_page_memberships must be on {expected_device}, got "
+            f"{q_token_kv_block_sparse_page_memberships.device}"
+        )
+    if not q_token_kv_block_sparse_page_memberships.is_contiguous():
+        raise ValueError("q_token_kv_block_sparse_page_memberships must be contiguous")
     expected_shape = (batch_size, (max_num_pages + 3) // 4)
-    if tuple(qsa_page_memberships.shape) != expected_shape:
+    if tuple(q_token_kv_block_sparse_page_memberships.shape) != expected_shape:
         raise ValueError(
-            "qsa_page_memberships must have shape "
-            f"{expected_shape}, got {tuple(qsa_page_memberships.shape)}"
+            "q_token_kv_block_sparse_page_memberships must have shape "
+            f"{expected_shape}, got {tuple(q_token_kv_block_sparse_page_memberships.shape)}"
         )
-    if qsa_page_memberships.data_ptr() % 4 != 0:
-        raise ValueError("qsa_page_memberships data pointer must be 4-byte aligned")
+    if q_token_kv_block_sparse_page_memberships.data_ptr() % 4 != 0:
+        raise ValueError(
+            "q_token_kv_block_sparse_page_memberships data pointer must be 4-byte aligned"
+        )
 
 
 def _read_block_table_plan_values(
@@ -1469,7 +1475,7 @@ def _decode_launch_spec_from_config(
     )
 
 
-def _resolve_qsa_decode_config(
+def _resolve_q_token_kv_block_sparse_decode_config(
     make_config: Callable[..., "FmhaDecodeConfig"],
     *,
     batch_size: int,
@@ -1487,7 +1493,7 @@ def _resolve_qsa_decode_config(
     max_active_clusters: int,
     use_pdl: bool,
 ) -> "FmhaDecodeConfig":
-    """Resolve the private encoded-page QSA profile without compiling it."""
+    """Resolve the private encoded-page QToken-KvBlock-Sparse-Attention profile without compiling it."""
 
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
@@ -1495,48 +1501,60 @@ def _resolve_qsa_decode_config(
     )
 
     heads_q_per_kv = num_qo_heads // num_kv_heads
-    _validate_prims_ts_qsa_group_capacity(
+    _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
         seq_len_q,
         num_qo_heads,
         num_kv_heads,
     )
-    qsa_dtype_supported = q_dtype_key == output_dtype_key == "bfloat16" or (
-        q_dtype_key == "float8_e4m3fn" and output_dtype_key in ("float16", "bfloat16")
+    q_token_kv_block_sparse_dtype_supported = (
+        q_dtype_key == output_dtype_key == "bfloat16"
+        or (
+            q_dtype_key == "float8_e4m3fn"
+            and output_dtype_key in ("float16", "bfloat16")
+        )
     )
     if not (
         page_size == 4
         and head_dim == 256
-        and qsa_dtype_supported
+        and q_token_kv_block_sparse_dtype_supported
         and mask_type == "causal"
         and window_left < 0
     ):
         raise ValueError(
-            "PrimTS QSA requires sparse_block_size=4, head_dim=256, "
+            "PrimTS QToken-KvBlock-Sparse-Attention requires sparse_block_size=4, head_dim=256, "
             "BF16 Q/K/V/output or FP8 Q/K/V with FP16/BF16 output, "
             "and a causal non-windowed mask"
         )
 
-    qsa_tile_size_q, qsa_num_insts_kv = _prims_ts_qsa_group_launch_profile(
-        seq_len_q,
-        heads_q_per_kv,
+    q_token_kv_block_sparse_tile_size_q, q_token_kv_block_sparse_num_insts_kv = (
+        _prims_ts_q_token_kv_block_sparse_group_launch_profile(
+            seq_len_q,
+            heads_q_per_kv,
+        )
     )
     if seq_len_q == 1 and q_dtype_key == "float8_e4m3fn":
-        qsa_tile_size_q = 64
-    qsa_use_keeps = qsa_tile_size_q == 64
-    qsa_num_insts_kv = 1 if qsa_use_keeps else qsa_num_insts_kv
+        q_token_kv_block_sparse_tile_size_q = 64
+    q_token_kv_block_sparse_use_keeps = q_token_kv_block_sparse_tile_size_q == 64
+    q_token_kv_block_sparse_num_insts_kv = (
+        1 if q_token_kv_block_sparse_use_keeps else q_token_kv_block_sparse_num_insts_kv
+    )
 
     # Packed prefill keeps its caller-provided routes nonsplit. Fixed decode
     # fills, but never crosses, the first service wave; the fanout is
-    # independent of QSA group size because one CTA owns the complete group.
-    qsa_splits = 1
+    # independent of QToken-KvBlock-Sparse-Attention group size because one CTA owns the complete group.
+    q_token_kv_block_sparse_splits = 1
     if not use_packed_q:
-        max_splits_kv = _QSA_Q1_MAX_SPLITS_KV if seq_len_q == 1 else _QSA_MAX_SPLITS_KV
-        qsa_splits = select_splits_kv(
+        max_splits_kv = (
+            _Q_TOKEN_KV_BLOCK_SPARSE_Q1_MAX_SPLITS_KV
+            if seq_len_q == 1
+            else _Q_TOKEN_KV_BLOCK_SPARSE_MAX_SPLITS_KV
+        )
+        q_token_kv_block_sparse_splits = select_splits_kv(
             seq_len_kv=max_kv_len,
             batch_size=batch_size,
             num_heads_kv=num_kv_heads,
-            tile_size_kv=_QSA_TILE_SIZE_KV,
-            num_insts_kv=qsa_num_insts_kv,
+            tile_size_kv=_Q_TOKEN_KV_BLOCK_SPARSE_TILE_SIZE_KV,
+            num_insts_kv=q_token_kv_block_sparse_num_insts_kv,
             num_q_tiles=1,
             service_capacity=max_active_clusters,
             max_splits_kv=max_splits_kv,
@@ -1552,21 +1570,21 @@ def _resolve_qsa_decode_config(
     # FP8 Swaps publication with encoded subpages is not qualified on a direct
     # path. Use the same KV128 Q64 Keeps profile instead of introducing an
     # artificial second wave solely as a workaround.
-    if q_dtype_key == "float8_e4m3fn" and qsa_splits == 1:
-        qsa_tile_size_q = 64
-        qsa_use_keeps = True
-        qsa_num_insts_kv = 1
+    if q_dtype_key == "float8_e4m3fn" and q_token_kv_block_sparse_splits == 1:
+        q_token_kv_block_sparse_tile_size_q = 64
+        q_token_kv_block_sparse_use_keeps = True
+        q_token_kv_block_sparse_num_insts_kv = 1
 
-    qsa_profile = {
+    q_token_kv_block_sparse_profile = {
         "use_variable_seqlens_q": use_packed_q,
-        "use_qsa_route": True,
+        "use_q_token_kv_block_sparse_route": True,
         "use_pdl": use_pdl,
-        "use_keeps_mma_ab": qsa_use_keeps,
+        "use_keeps_mma_ab": q_token_kv_block_sparse_use_keeps,
         "groups_tokens_heads_q": True,
-        "tile_size_q": qsa_tile_size_q,
-        "tile_size_kv": _QSA_TILE_SIZE_KV,
+        "tile_size_q": q_token_kv_block_sparse_tile_size_q,
+        "tile_size_kv": _Q_TOKEN_KV_BLOCK_SPARSE_TILE_SIZE_KV,
         "head_dim_per_stage_kv": 128,
-        "num_insts_kv": qsa_num_insts_kv,
+        "num_insts_kv": q_token_kv_block_sparse_num_insts_kv,
         "use_persistent_scheduler": False,
         "correction_num_warps": 4,
         "mma_warp_idx": 12,
@@ -1580,15 +1598,17 @@ def _resolve_qsa_decode_config(
             4 if seq_len_q == 1 and q_dtype_key == "float8_e4m3fn" else 8
         ),
     }
-    if qsa_use_keeps:
-        qsa_profile["o_stages"] = 1
+    if q_token_kv_block_sparse_use_keeps:
+        q_token_kv_block_sparse_profile["o_stages"] = 1
     return make_config(
-        qsa_profile,
+        q_token_kv_block_sparse_profile,
         split_kv_mode=(
-            "gmem_reduction_with_separate_kernel" if qsa_splits > 1 else "disabled"
+            "gmem_reduction_with_separate_kernel"
+            if q_token_kv_block_sparse_splits > 1
+            else "disabled"
         ),
-        splits_kv=qsa_splits,
-        max_splits_kv=qsa_splits,
+        splits_kv=q_token_kv_block_sparse_splits,
+        max_splits_kv=q_token_kv_block_sparse_splits,
         min_loop_iters_per_split=(1 if seq_len_q == 1 else MIN_LOOP_ITERS_PER_SPLIT),
     )
 
@@ -1611,7 +1631,7 @@ def _resolve_decode_launch_spec(
     use_packed_q: bool,
     window_left: int,
     storage_page_size: Optional[int] = None,
-    use_qsa_route: bool = False,
+    use_q_token_kv_block_sparse_route: bool = False,
     use_pdl: bool = False,
 ) -> _DecodeLaunchSpec:
     """Resolve automatic policy and workspace geometry without compiling."""
@@ -1706,8 +1726,8 @@ def _resolve_decode_launch_spec(
     # target device context without introducing caller-visible policy knobs.
     with torch.cuda.device(device_index):
         max_active_clusters = get_max_active_clusters_for_cluster_size(1)
-        if use_qsa_route:
-            cfg = _resolve_qsa_decode_config(
+        if use_q_token_kv_block_sparse_route:
+            cfg = _resolve_q_token_kv_block_sparse_decode_config(
                 make_config,
                 batch_size=batch_size,
                 num_qo_heads=num_qo_heads,
@@ -1778,7 +1798,7 @@ def _resolve_decode_launch_spec(
                     ):
                         cfg = head_band_cfg
 
-            qsa_scattered_fp8 = (
+            q_token_kv_block_sparse_scattered_fp8 = (
                 page_size == 4
                 and storage_page_size > page_size
                 and q_dtype_key == "float8_e4m3fn"
@@ -1787,7 +1807,9 @@ def _resolve_decode_launch_spec(
             unsafe_split_publisher = (
                 cfg.use_split_kv and not cfg.use_separate_reduction_kernel
             )
-            if qsa_scattered_fp8 and (unsafe_direct_swaps or unsafe_split_publisher):
+            if q_token_kv_block_sparse_scattered_fp8 and (
+                unsafe_direct_swaps or unsafe_split_publisher
+            ):
                 # Direct, fused-GMEM, and cluster-SMEM publication are not
                 # qualified with encoded subpage locators on the FP8 pipeline.
                 safe_splits = int(cfg.splits_kv) if cfg.use_split_kv else 2
@@ -1916,7 +1938,7 @@ def _get_compiled_decode(
         seq_lens: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
         block_table: cute.Tensor,
-        qsa_page_memberships: cute.Tensor,
+        q_token_kv_block_sparse_page_memberships: cute.Tensor,
         partial_o: cute.Tensor,
         partial_stats: cute.Tensor,
         split_kv_counter: cute.Tensor,
@@ -1970,7 +1992,7 @@ def _get_compiled_decode(
             q_offsets_iter,
             total_q_tokens,
             block_table.iterator,
-            qsa_page_memberships.iterator,
+            q_token_kv_block_sparse_page_memberships.iterator,
             partial_o.iterator,
             partial_stats.iterator,
             split_kv_counter.iterator,
@@ -1985,7 +2007,7 @@ def _get_compiled_decode(
             False,
             True,
             Int32(block_table.shape[1]),
-            Int32(qsa_page_memberships.stride[0]),
+            Int32(q_token_kv_block_sparse_page_memberships.stride[0]),
             num_physical_kv_pages,
             k_page_stride,
             k_head_stride,
@@ -2125,7 +2147,9 @@ def _get_compiled_decode(
         Int32, (runtime_num_q_offsets,) if use_packed_q else (1,), 4
     )
     block_table_fake = fake_compact(Int32, (batch_size, logical_pages), 4)
-    qsa_page_memberships_fake = fake_compact(Int32, (batch_size, membership_words), 4)
+    q_token_kv_block_sparse_page_memberships_fake = fake_compact(
+        Int32, (batch_size, membership_words), 4
+    )
     partial_o_shape, partial_stats_shape, counter_shape = _decode_scratch_shapes(
         cfg,
         batch_size=batch_size,
@@ -2150,7 +2174,7 @@ def _get_compiled_decode(
             seq_lens_fake,
             cu_seqlens_q_fake,
             block_table_fake,
-            qsa_page_memberships_fake,
+            q_token_kv_block_sparse_page_memberships_fake,
             partial_o_fake,
             partial_stats_fake,
             counter_fake,
@@ -2202,58 +2226,60 @@ def _get_compiled_decode(
     return compiled_main, compiled_reducer
 
 
-def _validate_prims_ts_qsa_group_value(group_size: int) -> int:
-    """Validate one caller-selected QSA grouping value."""
+def _validate_prims_ts_q_token_kv_block_sparse_group_value(group_size: int) -> int:
+    """Validate one caller-selected QToken-KvBlock-Sparse-Attention grouping value."""
 
     group_size = _validate_positive_int(group_size, "group_size")
-    if group_size not in _QSA_SUPPORTED_GROUP_SIZES:
+    if group_size not in _Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_GROUP_SIZES:
         raise ValueError(
-            "QSA group_size must be one of "
-            f"{_QSA_SUPPORTED_GROUP_SIZES}, got {group_size}"
+            "QToken-KvBlock-Sparse-Attention group_size must be one of "
+            f"{_Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_GROUP_SIZES}, got {group_size}"
         )
     return group_size
 
 
-def _validate_prims_ts_qsa_group_capacity(
+def _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
     group_size: int,
     num_qo_heads: int,
     num_kv_heads: int,
 ) -> int:
-    """Validate that one caller-selected QSA group fits the Q64 route."""
+    """Validate that one caller-selected QToken-KvBlock-Sparse-Attention group fits the Q64 route."""
 
     from .kernels.fmha_decode.fmha_decode_constants import (
-        QSA_PAGE_MEMBERSHIP_BITS,
+        Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
     )
 
-    group_size = _validate_prims_ts_qsa_group_value(group_size)
+    group_size = _validate_prims_ts_q_token_kv_block_sparse_group_value(group_size)
     _validate_head_geometry(num_qo_heads, num_kv_heads)
     heads_q_per_kv = num_qo_heads // num_kv_heads
     max_group_size = min(
-        QSA_PAGE_MEMBERSHIP_BITS,
-        _QSA_GROUPING_MAX_TILE_SIZE_Q // heads_q_per_kv,
+        Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
+        _Q_TOKEN_KV_BLOCK_SPARSE_GROUPING_MAX_TILE_SIZE_Q // heads_q_per_kv,
     )
     if group_size > max_group_size:
         raise ValueError(
-            f"QSA group_size={group_size} exceeds the TileQ64/head capacity "
+            f"QToken-KvBlock-Sparse-Attention group_size={group_size} exceeds the TileQ64/head capacity "
             f"of {max_group_size}"
         )
 
     return group_size
 
 
-def _prims_ts_qsa_group_launch_profile(
+def _prims_ts_q_token_kv_block_sparse_group_launch_profile(
     group_size: int,
     heads_q_per_kv: int,
 ) -> tuple[int, int]:
-    """Return the qualified TileQ and K/V instructions for one QSA group."""
+    """Return the qualified TileQ and K/V instructions for one QToken-KvBlock-Sparse-Attention group."""
 
     group_rows = group_size * heads_q_per_kv
     tile_size_q = next(
         tile_size_q
-        for tile_size_q in _QSA_SUPPORTED_TILE_SIZES_Q
+        for tile_size_q in _Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_TILE_SIZES_Q
         if group_rows <= tile_size_q
     )
-    num_insts_kv = 1 if tile_size_q == _QSA_GROUPING_MAX_TILE_SIZE_Q else 2
+    num_insts_kv = (
+        1 if tile_size_q == _Q_TOKEN_KV_BLOCK_SPARSE_GROUPING_MAX_TILE_SIZE_Q else 2
+    )
     return tile_size_q, num_insts_kv
 
 
@@ -2320,18 +2346,19 @@ def suggest_q_token_kv_block_sparse_group_size(
 
     legal_group_sizes = tuple(
         group_size
-        for group_size in _QSA_SUPPORTED_GROUP_SIZES
+        for group_size in _Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_GROUP_SIZES
         if group_size <= seq_len_q
-        and group_size * heads_q_per_kv <= _QSA_GROUPING_MAX_TILE_SIZE_Q
+        and group_size * heads_q_per_kv
+        <= _Q_TOKEN_KV_BLOCK_SPARSE_GROUPING_MAX_TILE_SIZE_Q
     )
     if not legal_group_sizes:
         raise ValueError(
-            "QSA requires at least one supported group size that fits "
+            "QToken-KvBlock-Sparse-Attention requires at least one supported group size that fits "
             "TileQ64/head capacity"
         )
 
     for group_size in reversed(legal_group_sizes):
-        _, num_insts_kv = _prims_ts_qsa_group_launch_profile(
+        _, num_insts_kv = _prims_ts_q_token_kv_block_sparse_group_launch_profile(
             group_size,
             heads_q_per_kv,
         )
@@ -2340,19 +2367,27 @@ def suggest_q_token_kv_block_sparse_group_size(
         if base_ctas >= multi_processor_count:
             return group_size
 
-        # Mirror the current QSA split work bound. Q1 has no union-membership
+        # Mirror the current QToken-KvBlock-Sparse-Attention split work bound. Q1 has no union-membership
         # work and permits one K/V pipeline iteration; grouped routes retain
         # two iterations per split to amortize standalone reduction.
-        min_loop_iters = 1 if group_size == 1 else _QSA_GROUPED_MIN_LOOP_ITERS_PER_SPLIT
+        min_loop_iters = (
+            1
+            if group_size == 1
+            else _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_MIN_LOOP_ITERS_PER_SPLIT
+        )
         route_candidate_kv = group_size * selected_seq_len_kv
-        tokens_per_split = _QSA_TILE_SIZE_KV * num_insts_kv * min_loop_iters
+        tokens_per_split = (
+            _Q_TOKEN_KV_BLOCK_SPARSE_TILE_SIZE_KV * num_insts_kv * min_loop_iters
+        )
         max_useful_splits = max(
             1,
             (route_candidate_kv + tokens_per_split - 1) // tokens_per_split,
         )
         max_useful_splits = min(
             max_useful_splits,
-            _QSA_Q1_MAX_SPLITS_KV if group_size == 1 else _QSA_MAX_SPLITS_KV,
+            _Q_TOKEN_KV_BLOCK_SPARSE_Q1_MAX_SPLITS_KV
+            if group_size == 1
+            else _Q_TOKEN_KV_BLOCK_SPARSE_MAX_SPLITS_KV,
         )
         one_wave_splits = max(multi_processor_count // base_ctas, 1)
         if max_useful_splits >= one_wave_splits:
@@ -2361,16 +2396,16 @@ def suggest_q_token_kv_block_sparse_group_size(
     return legal_group_sizes[0]
 
 
-def _validate_prims_ts_qsa_group_layout(
+def _validate_prims_ts_q_token_kv_block_sparse_group_layout(
     group_size: int,
     query_start_loc_cpu: Optional[torch.Tensor],
     num_query_tokens: int,
     num_qo_heads: int,
     num_kv_heads: int,
 ) -> int:
-    """Validate one caller-selected QSA group against the live query rows."""
+    """Validate one caller-selected QToken-KvBlock-Sparse-Attention group against the live query rows."""
 
-    group_size = _validate_prims_ts_qsa_group_capacity(
+    group_size = _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
         group_size,
         num_qo_heads,
         num_kv_heads,
@@ -2387,7 +2422,7 @@ def _validate_prims_ts_qsa_group_layout(
         or query_start_loc_cpu.dtype not in (torch.int32, torch.int64)
     ):
         raise ValueError(
-            "grouped QSA requires CPU int32/int64 query_start_loc with at "
+            "grouped QToken-KvBlock-Sparse-Attention requires CPU int32/int64 query_start_loc with at "
             "least two entries"
         )
 
@@ -2398,15 +2433,21 @@ def _validate_prims_ts_qsa_group_layout(
         or num_mapped_tokens < 0
         or num_mapped_tokens > num_query_tokens
     ):
-        raise ValueError("grouped QSA query boundaries do not cover valid rows")
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention query boundaries do not cover valid rows"
+        )
     query_lengths = [
         end - begin for begin, end in zip(query_starts, query_starts[1:], strict=False)
     ]
     if any(length < 0 for length in query_lengths):
-        raise ValueError("grouped QSA query boundaries must be nondecreasing")
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention query boundaries must be nondecreasing"
+        )
     query_lengths = [length for length in query_lengths if length > 0]
     if not query_lengths:
-        raise ValueError("grouped QSA requires at least one nonempty request")
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention requires at least one nonempty request"
+        )
 
     return group_size
 
@@ -2448,7 +2489,7 @@ def validate_q_token_kv_block_sparse_group_size(
     num_kv_heads : int
         Number of key/value heads.
     group_size : int
-        Caller-selected number of query rows per QSA route. Supported values
+        Caller-selected number of query rows per QToken-KvBlock-Sparse-Attention route. Supported values
         are Q1, Q2, Q4, and Q5, subject to the TileQ64 head-capacity bound.
 
     Returns
@@ -2457,7 +2498,7 @@ def validate_q_token_kv_block_sparse_group_size(
         The validated ``group_size``.
     """
 
-    return _validate_prims_ts_qsa_group_layout(
+    return _validate_prims_ts_q_token_kv_block_sparse_group_layout(
         group_size,
         query_start_loc_cpu,
         num_query_tokens,
@@ -2492,7 +2533,7 @@ def make_q_token_kv_block_sparse_qo_indptr(
         Total flattened query-row count, including any inert CUDA-graph
         padding suffix.
     group_size : int
-        Maximum number of rows in each request-safe QSA route.
+        Maximum number of rows in each request-safe QToken-KvBlock-Sparse-Attention route.
     device : int, str, torch.device, or None
         Destination device for the returned offsets. By default, PyTorch's
         default tensor device is used.
@@ -2504,7 +2545,7 @@ def make_q_token_kv_block_sparse_qo_indptr(
         most ``group_size`` rows and no route crosses a request boundary.
     """
 
-    group_size = _validate_prims_ts_qsa_group_value(group_size)
+    group_size = _validate_prims_ts_q_token_kv_block_sparse_group_value(group_size)
     num_query_tokens = _validate_positive_int(num_query_tokens, "num_query_tokens")
     if (
         not isinstance(query_start_loc_cpu, torch.Tensor)
@@ -2514,7 +2555,7 @@ def make_q_token_kv_block_sparse_qo_indptr(
         or query_start_loc_cpu.dtype not in (torch.int32, torch.int64)
     ):
         raise ValueError(
-            "grouped QSA requires CPU int32/int64 query_start_loc with at "
+            "grouped QToken-KvBlock-Sparse-Attention requires CPU int32/int64 query_start_loc with at "
             "least two entries"
         )
 
@@ -2528,7 +2569,9 @@ def make_q_token_kv_block_sparse_qo_indptr(
             for begin, end in zip(request_offsets, request_offsets[1:], strict=False)
         )
     ):
-        raise ValueError("grouped QSA query boundaries do not cover valid rows")
+        raise ValueError(
+            "grouped QToken-KvBlock-Sparse-Attention query boundaries do not cover valid rows"
+        )
 
     route_offsets = [0]
     for begin, end in zip(request_offsets, request_offsets[1:], strict=False):
@@ -2545,7 +2588,7 @@ def make_q_token_kv_block_sparse_qo_indptr(
         route_offsets.append(next_offset)
 
     return torch.tensor(
-        _validate_qsa_route_offsets_cpu(
+        _validate_q_token_kv_block_sparse_route_offsets_cpu(
             route_offsets,
             num_query_tokens=num_query_tokens,
             group_size=group_size,
@@ -2555,23 +2598,25 @@ def make_q_token_kv_block_sparse_qo_indptr(
     )
 
 
-def _validate_qsa_route_offsets_cpu(
+def _validate_q_token_kv_block_sparse_route_offsets_cpu(
     route_offsets: list[int],
     *,
     num_query_tokens: int,
     group_size: int,
 ) -> tuple[int, ...]:
-    """Validate CPU-generated QSA routes before copying them to device storage."""
+    """Validate CPU-generated QToken-KvBlock-Sparse-Attention routes before copying them to device storage."""
 
     offsets = tuple(route_offsets)
     if len(offsets) < 2 or offsets[0] != 0 or offsets[-1] != num_query_tokens:
-        raise ValueError("QSA route offsets must cover exactly all query tokens")
+        raise ValueError(
+            "QToken-KvBlock-Sparse-Attention route offsets must cover exactly all query tokens"
+        )
     lengths = tuple(
         end - begin for begin, end in zip(offsets, offsets[1:], strict=False)
     )
     if any(length <= 0 or length > group_size for length in lengths):
         raise ValueError(
-            "QSA route offsets must describe nonempty routes no longer than group_size"
+            "QToken-KvBlock-Sparse-Attention route offsets must describe nonempty routes no longer than group_size"
         )
     return offsets
 
@@ -2783,7 +2828,7 @@ def _validate_decode_output_aliasing(
     seq_lens: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
     block_table: torch.Tensor,
-    qsa_page_memberships: torch.Tensor,
+    q_token_kv_block_sparse_page_memberships: torch.Tensor,
     workspace_buffer: torch.Tensor,
 ) -> None:
     """Keep output disjoint from every live FMHA decode allocation."""
@@ -2796,7 +2841,10 @@ def _validate_decode_output_aliasing(
         ("seq_lens", seq_lens),
         ("qo_indptr", qo_indptr),
         ("block_table", block_table),
-        ("qsa_page_memberships", qsa_page_memberships),
+        (
+            "q_token_kv_block_sparse_page_memberships",
+            q_token_kv_block_sparse_page_memberships,
+        ),
         ("workspace_buffer", workspace_buffer),
     )
 
@@ -2868,8 +2916,8 @@ def _prepare_prims_ts_batch_decode_plan(
     window_left: int,
     kv_layout: Literal["HND"],
     page_size: Optional[int],
-    qsa_page_memberships: Optional[torch.Tensor] = None,
-    use_qsa_route: bool = False,
+    q_token_kv_block_sparse_page_memberships: Optional[torch.Tensor] = None,
+    use_q_token_kv_block_sparse_route: bool = False,
     use_pdl: bool = False,
 ) -> tuple[PrimsTSBatchDecodePlan, torch.Tensor]:
     """Validate and freeze one dense-block-table PrimTS launch contract."""
@@ -2939,7 +2987,7 @@ def _prepare_prims_ts_batch_decode_plan(
         query.dtype,
         k_cache.dtype,
         output_dtype,
-        allow_fp8_bf16_output=use_qsa_route,
+        allow_fp8_bf16_output=use_q_token_kv_block_sparse_route,
     )
     device_index = _validate_runtime_device(query.device)
 
@@ -2960,29 +3008,29 @@ def _prepare_prims_ts_batch_decode_plan(
         use_packed_q,
         window_left,
         storage_page_size,
-        use_qsa_route,
+        use_q_token_kv_block_sparse_route,
         use_pdl,
     )
     spec = _resolve_decode_launch_spec(*policy_args)
-    if spec.config.uses_qsa_page_membership:
-        if qsa_page_memberships is None:
+    if spec.config.uses_q_token_kv_block_sparse_page_membership:
+        if q_token_kv_block_sparse_page_memberships is None:
             raise ValueError(
-                "grouped QSA requires a separate qsa_page_memberships tensor"
+                "grouped QToken-KvBlock-Sparse-Attention requires a separate q_token_kv_block_sparse_page_memberships tensor"
             )
-        _validate_qsa_page_memberships(
-            qsa_page_memberships,
+        _validate_q_token_kv_block_sparse_page_memberships(
+            q_token_kv_block_sparse_page_memberships,
             expected_device=query.device,
             batch_size=batch_size,
             max_num_pages=max_num_pages,
         )
     else:
-        if qsa_page_memberships is not None:
+        if q_token_kv_block_sparse_page_memberships is not None:
             raise ValueError(
-                "qsa_page_memberships is valid only for grouped QSA launches"
+                "q_token_kv_block_sparse_page_memberships is valid only for grouped QToken-KvBlock-Sparse-Attention launches"
             )
         # Keep one compiled tensor ABI without requiring Q1 or dense callers to
         # allocate an unused table. The kernel constexpr-elides all reads.
-        qsa_page_memberships = block_table
+        q_token_kv_block_sparse_page_memberships = block_table
     layout = _make_decode_workspace_layout(
         spec.scratch_shapes,
         output_dtype,
@@ -3037,7 +3085,10 @@ def _prepare_prims_ts_batch_decode_plan(
         ("seq_lens", seq_lens),
         ("qo_indptr", qo_indptr),
         ("block_table", block_table),
-        ("qsa_page_memberships", qsa_page_memberships),
+        (
+            "q_token_kv_block_sparse_page_memberships",
+            q_token_kv_block_sparse_page_memberships,
+        ),
     )
     if caller_provided_out:
         _validate_decode_output_aliasing(
@@ -3045,7 +3096,7 @@ def _prepare_prims_ts_batch_decode_plan(
             seq_lens=seq_lens,
             qo_indptr=qo_indptr,
             block_table=block_table,
-            qsa_page_memberships=qsa_page_memberships,
+            q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
             workspace_buffer=workspace_buffer,
         )
     compile_spec = _make_decode_compile_spec(
@@ -3085,7 +3136,7 @@ def _prepare_prims_ts_batch_decode_plan(
         _seq_lens=seq_lens,
         _qo_indptr=qo_indptr,
         _block_table=block_table,
-        _qsa_page_memberships=qsa_page_memberships,
+        _q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
         _workspace=workspace,
         _compiled_main=compiled_main,
         _compiled_reducer=compiled_reducer,
@@ -3179,7 +3230,7 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         window_left=window_left,
         kv_layout=kv_layout,
         page_size=page_size,
-        use_qsa_route=False,
+        use_q_token_kv_block_sparse_route=False,
     )
     if prepared_out is not out:
         raise RuntimeError("prepared PrimTS output storage changed unexpectedly")
@@ -3328,7 +3379,7 @@ def prims_ts_batch_decode_with_kv_cache(
         window_left=window_left,
         kv_layout=kv_layout,
         page_size=page_size,
-        use_qsa_route=False,
+        use_q_token_kv_block_sparse_route=False,
     )
     return plan.run(
         query,
@@ -3735,7 +3786,7 @@ class BatchDecodePagedTSWrapper:
                 seq_lens=self._seq_lens,
                 qo_indptr=self._qo_indptr,
                 block_table=self._block_table,
-                qsa_page_memberships=self._block_table,
+                q_token_kv_block_sparse_page_memberships=self._block_table,
                 workspace_buffer=self._workspace_buffer,
             )
         return _launch_decode(

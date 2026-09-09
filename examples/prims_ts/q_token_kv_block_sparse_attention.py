@@ -20,7 +20,7 @@ Uniform decode uses ``[B, Nq, G, Hq, D]``, where ``G = MTP + 1``, and needs no
 route-offset tensor. Both paths prepare metadata and attention together so the
 hot-path call accepts only current semantic inputs and a framework-owned output.
 The workspace-owned intermediate metadata is the triple
-``(qsa_page_indices, qsa_page_memberships, seq_lens)``. Page indices are plain
+``(q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens)``. Page indices are plain
 Int32 cache locators. Grouped routes store four 8-bit query-membership masks per
 Int32 word; Q1 has a zero-width membership table. ``seq_lens`` selects each
 route's live locator prefix, and no value is promised for the unused locator
@@ -29,7 +29,7 @@ hidden and do not add it to the public attention signature.
 
 The caller fixes ``G`` for a prepared plan. The optional pure-host group-size
 suggestion helper uses a caller-cached SM count and never queries the device or
-reads a tensor. QSA normally chooses the smallest qualified TileQ in
+reads a tensor. QToken-KvBlock-Sparse-Attention normally chooses the smallest qualified TileQ in
 8/16/32/64 that can hold ``G * (Hq / Hkv)`` rows and always uses a 128-token
 K/V tile. FP8 Q1 uses its qualified Q64/Keeps profile. Packed prefill is
 nonsplit; fixed decode fills, but does not cross, the first active-CTA service
@@ -324,7 +324,9 @@ def main() -> None:
         raise RuntimeError("This example requires CUDA")
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) not in ((10, 0), (10, 3)):
-        raise RuntimeError("PrimTS QSA currently requires SM100 or SM103")
+        raise RuntimeError(
+            "PrimTS QToken-KvBlock-Sparse-Attention currently requires SM100 or SM103"
+        )
 
     torch.manual_seed(42)
     device = torch.device("cuda")

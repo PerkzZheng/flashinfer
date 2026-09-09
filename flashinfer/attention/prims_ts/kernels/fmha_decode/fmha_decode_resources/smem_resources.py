@@ -51,9 +51,9 @@ from ..fmha_decode_constants import (
     KV_KIND_K,
     KV_KIND_V,
     KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM,
-    QSA_PAGE_MEMBERSHIP_BITS,
-    QSA_PAGE_MEMBERSHIP_MASK,
-    QSA_PAGE_MEMBERSHIPS_PER_WORD,
+    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
+    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_MASK,
+    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD,
 )
 from ...stage import FmhaStage
 from ...tensor_map import transform_ragged_coords
@@ -1327,11 +1327,11 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     cfg: Constexpr[FmhaDecodeConfig] = None
     stage_page_ids_per_tile: Constexpr[bool] = False
     page_idx_kv: cute.Pointer | None = None
-    qsa_page_memberships: cute.Pointer | None = None
+    q_token_kv_block_sparse_page_memberships: cute.Pointer | None = None
     seqlens_kv: cute.Pointer | None = None
     use_native_paged_kv: Constexpr[bool] = False
     page_table_stride: Int32 = None
-    qsa_page_membership_stride: Int32 = None
+    q_token_kv_block_sparse_page_membership_stride: Int32 = None
     max_seq_len_kv: Int32 = None
     h_k_idx: Int32 = None
     b_idx: Int32 = None
@@ -1340,7 +1340,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     _alloc: Constexpr[SmemAllocation | None] = None
     _membership_alloc: Constexpr[SmemAllocation | None] = None
     _smem_page_offsets: cutlass.Array = None
-    _smem_qsa_memberships: cutlass.Array = None
+    _smem_q_token_kv_block_sparse_memberships: cutlass.Array = None
     cached_page_ids: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __post_init__(self) -> None:
@@ -1364,7 +1364,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
     def page_ids_per_stage(self) -> int:
         """Return the locator capacity published by one pipeline stage.
 
-        QSA keeps every page-4 locator owned by the CTA work tile in one held
+        QToken-KvBlock-Sparse-Attention keeps every page-4 locator owned by the CTA work tile in one held
         window. K and V use the same native dense-table row, so direct,
         persistent, and split-KV routes can reuse that window across the
         complete K0/K1/V0/V1 cadence instead of reloading each tile once for K
@@ -1379,7 +1379,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
 
     @property
     def stages_encoded_locators_per_tile(self) -> bool:
-        """Whether a long graph-stable QSA route stages one locator tile."""
+        """Whether a long graph-stable QToken-KvBlock-Sparse-Attention route stages one locator tile."""
 
         return (
             self.use_native_paged_kv
@@ -1390,25 +1390,25 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
 
     @property
     def holds_encoded_locator_window(self) -> bool:
-        """Whether one SMEM stage retains this CTA's complete QSA route."""
+        """Whether one SMEM stage retains this CTA's complete QToken-KvBlock-Sparse-Attention route."""
 
         return self.use_native_paged_kv and self.cfg.uses_held_encoded_locator_window
 
     @property
-    def qsa_membership_entries(self) -> int:
+    def q_token_kv_block_sparse_membership_entries(self) -> int:
         """Return packed membership words retained by grouped-Q routes."""
 
-        if not self.cfg.uses_qsa_page_membership:
+        if not self.cfg.uses_q_token_kv_block_sparse_page_membership:
             return 0
         pages_per_tile = self.cfg.tile_size_kv // self.cfg.num_tokens_per_page
         page_entries = self.encoded_locator_window_tiles * pages_per_tile
         return (
-            page_entries + QSA_PAGE_MEMBERSHIPS_PER_WORD - 1
-        ) // QSA_PAGE_MEMBERSHIPS_PER_WORD
+            page_entries + Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD - 1
+        ) // Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
 
     @property
     def encoded_locator_window_tiles(self) -> int:
-        """Return the instruction-aligned tile capacity of a held QSA window."""
+        """Return the instruction-aligned tile capacity of a held QToken-KvBlock-Sparse-Attention window."""
         # The two-instance schedule executes an even final group. Include its
         # inert partner in odd-tail direct launches so lane-partitioned locator
         # reads remain in bounds; the producer fills that partner with -1.
@@ -1427,8 +1427,8 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         self._smem_page_offsets = _placeholder_smem_array(
             Int32, num_stages * self.page_ids_per_stage
         )
-        self._smem_qsa_memberships = _placeholder_smem_array(
-            Uint32, self.qsa_membership_entries
+        self._smem_q_token_kv_block_sparse_memberships = _placeholder_smem_array(
+            Uint32, self.q_token_kv_block_sparse_membership_entries
         )
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
@@ -1443,11 +1443,11 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 alignment=16,
             )
         allocations = [self._alloc]
-        if self.qsa_membership_entries:
+        if self.q_token_kv_block_sparse_membership_entries:
             if self._membership_alloc is None:
                 self._membership_alloc = SmemAllocation(
-                    name=f"{self.name}_qsaMembership",
-                    size_bytes=self.qsa_membership_entries * 4,
+                    name=f"{self.name}_q_token_kv_block_sparse_membership",
+                    size_bytes=self.q_token_kv_block_sparse_membership_entries * 4,
                     alignment=16,
                 )
             allocations.append(self._membership_alloc)
@@ -1474,11 +1474,11 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 shape=(num_stages * self.page_ids_per_stage,),
                 addrspace=3,
             )
-            if cutlass.const_expr(self.qsa_membership_entries):
-                self._smem_qsa_memberships = cutlass.Array(
+            if cutlass.const_expr(self.q_token_kv_block_sparse_membership_entries):
+                self._smem_q_token_kv_block_sparse_memberships = cutlass.Array(
                     context.smem_base.data_ptr() + self._membership_alloc.offset,
                     dtype=Uint32,
-                    shape=(self.qsa_membership_entries,),
+                    shape=(self.q_token_kv_block_sparse_membership_entries,),
                     addrspace=3,
                 )
         return {}
@@ -1572,29 +1572,32 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         return Int32(self._smem_page_offsets[offset + page_frag])
 
     @cute.jit
-    def qsa_page_membership(
+    def q_token_kv_block_sparse_page_membership(
         self,
         stage_info: StageInfo,
         local_tile_idx: Int32,
         page_frag: Int32,
     ) -> Uint32:
         """Load one grouped-Q membership byte for a score fragment."""
-        assert self.cfg.uses_qsa_page_membership
+        assert self.cfg.uses_q_token_kv_block_sparse_page_membership
         self._create_initial_task_locals(stage_info.context)
         pages_per_tile = Int32(self.cfg.tile_size_kv // self.cfg.num_tokens_per_page)
         membership_idx = local_tile_idx * pages_per_tile + page_frag
         membership_word = Uint32(
-            self._smem_qsa_memberships[
-                membership_idx // Int32(QSA_PAGE_MEMBERSHIPS_PER_WORD)
+            self._smem_q_token_kv_block_sparse_memberships[
+                membership_idx
+                // Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD)
             ]
         )
         membership_shift = (
-            membership_idx % Int32(QSA_PAGE_MEMBERSHIPS_PER_WORD)
-        ) * Int32(QSA_PAGE_MEMBERSHIP_BITS)
-        return (membership_word >> membership_shift) & Uint32(QSA_PAGE_MEMBERSHIP_MASK)
+            membership_idx % Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD)
+        ) * Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS)
+        return (membership_word >> membership_shift) & Uint32(
+            Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_MASK
+        )
 
     @cute.jit
-    def qsa_page_memberships4(
+    def q_token_kv_block_sparse_page_memberships4(
         self,
         stage_info: StageInfo,
         local_tile_idx: Int32,
@@ -1606,7 +1609,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         assemble each lane-local 16-page membership word.
         """
 
-        assert self.cfg.uses_qsa_page_membership
+        assert self.cfg.uses_q_token_kv_block_sparse_page_membership
         self._create_initial_task_locals(stage_info.context)
         pages_per_tile = Int32(self.cfg.tile_size_kv // self.cfg.num_tokens_per_page)
         membership_idx = local_tile_idx * pages_per_tile + page_frag
@@ -1616,15 +1619,17 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
             space=cutlass.AddressSpace.rmem,
         )
         membership_word = Uint32(
-            self._smem_qsa_memberships[
-                membership_idx // Int32(QSA_PAGE_MEMBERSHIPS_PER_WORD)
+            self._smem_q_token_kv_block_sparse_memberships[
+                membership_idx
+                // Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD)
             ]
         )
         for elem_idx in cutlass.range_constexpr(4):
             memberships[elem_idx] = (
-                membership_word >> Int32(QSA_PAGE_MEMBERSHIP_BITS * elem_idx)
+                membership_word
+                >> Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS * elem_idx)
             ) & Uint32(
-                QSA_PAGE_MEMBERSHIP_MASK,
+                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_MASK,
             )
         return memberships
 
@@ -1713,22 +1718,24 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         smem_page_offsets = self._smem_page_offsets
         lane_idx = cute.arch.thread_idx()[0] & Int32(0x1F)
         if cutlass.const_expr(
-            self.qsa_membership_entries
+            self.q_token_kv_block_sparse_membership_entries
             and section == FmhaStage.Head
             and inst_id == KV_INST0
         ):
             # One page-offset producer warp cooperatively stages the separate
             # packed membership row. Each Uint32 supplies four page bytes to
             # Softmax, independent of the plain Int32 locator table below.
-            assert self.qsa_page_memberships is not None
-            membership_words = self.qsa_membership_entries
+            assert self.q_token_kv_block_sparse_page_memberships is not None
+            membership_words = self.q_token_kv_block_sparse_membership_entries
             raw_tile_base = Int32(
                 _decode_gen_task_cache(stage_info)[_TASK_CACHE_KV_RAW_TILE_BASE]
             )
             membership_word_base = (raw_tile_base * pages_per_tile) // Int32(
-                QSA_PAGE_MEMBERSHIPS_PER_WORD
+                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
             )
-            membership_table_offset = logical_b_idx * self.qsa_page_membership_stride
+            membership_table_offset = (
+                logical_b_idx * self.q_token_kv_block_sparse_page_membership_stride
+            )
             for membership_vector_idx in cutlass.range_constexpr(
                 (membership_words + 31) // 32
             ):
@@ -1737,11 +1744,12 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                     membership_word = Uint32(0)
                     first_logical_page_idx = (
                         raw_tile_base * pages_per_tile
-                        + membership_word_idx * Int32(QSA_PAGE_MEMBERSHIPS_PER_WORD)
+                        + membership_word_idx
+                        * Int32(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD)
                     )
                     if first_logical_page_idx <= page_idx_ub:
                         membership_word = Uint32(
-                            self.qsa_page_memberships[
+                            self.q_token_kv_block_sparse_page_memberships[
                                 membership_table_offset
                                 + membership_word_base
                                 + membership_word_idx
@@ -1753,15 +1761,19 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                         live_memberships = (
                             page_idx_ub - first_logical_page_idx + Int32(1)
                         )
-                        if live_memberships < Int32(QSA_PAGE_MEMBERSHIPS_PER_WORD):
+                        if live_memberships < Int32(
+                            Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+                        ):
                             live_bits = live_memberships * Int32(
-                                QSA_PAGE_MEMBERSHIP_BITS
+                                Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
                             )
                             membership_word &= (Uint32(1) << live_bits) - Uint32(1)
-                    self._smem_qsa_memberships[membership_word_idx] = membership_word
+                    self._smem_q_token_kv_block_sparse_memberships[
+                        membership_word_idx
+                    ] = membership_word
         if cutlass.const_expr(self.holds_encoded_locator_window):
             # One or more coalesced warp loads per local KV tile materialize
-            # the complete 32-entry QSA KV128/page4 locator window. The stage
+            # the complete 32-entry QToken-KvBlock-Sparse-Attention KV128/page4 locator window. The stage
             # remains live until the matching V tail, so K and V both consume
             # these entries without another global read or pipeline handoff.
             raw_tile_base = Int32(
@@ -2284,7 +2296,7 @@ class SmemKvResource(DecodeGenResourceBase):
                 stage_base = self._stage_base(stage_info)
                 if cutlass.const_expr(cfg.uses_scattered_page_route):
                     assert page_fragments == 32
-                    # A QSA KV128 stage contains 32 independent page fragments
+                    # A QToken-KvBlock-Sparse-Attention KV128 stage contains 32 independent page fragments
                     # per D64 head-dimension chunk. Flatten (chunk, fragment)
                     # across all load warps so they feed the same byte-counted
                     # stage barrier concurrently for D64, D128, or D256.

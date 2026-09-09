@@ -17,7 +17,7 @@ control (CLC) assigns work to resident CTAs. Underfilled fixed-Q grids may
 instead split the K/V sequence and reduce partial outputs; other grids use the
 direct static launch.
 
-QSA metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
+QToken-KvBlock-Sparse-Attention metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
 blocks and causal tail directly through the dense page table. Q2/Q4/Q5 sort at
 most ``group_size * (block_topk + 1)`` tagged selected/tail candidates in
 shared memory, unique equal logical IDs while OR-reducing query-membership
@@ -26,27 +26,27 @@ not scale with the configured model length or global cache capacity. Plain
 Int32 locators and packed membership words remain separate outputs; membership
 bits are never fused into a locator.
 
-The combined QSA metadata+attention API uses programmatic dependent launch
-(PDL) for its final metadata-to-attention handoff. QSA metadata producers
+The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
+(PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
 release only after their page indices, membership words, and sequence lengths
 are published. Every active attention CTA allocates and initializes its task
 barriers, SMEM, and TMEM first, then waits immediately before TaskManager can
-read either output. Split-KV QSA sends every configured split CTA through that
+read either output. Split-KV QToken-KvBlock-Sparse-Attention sends every configured split CTA through that
 initialization and acquire, then contracts the useful runtime prefix. Pruned
 split CTAs use the same TMEM teardown and dependent-release helpers before a
 CTA-uniform PTX exit. Padded packed-Q CTAs have no task resources; they still
 acquire through their explicit zero-work path and signal a following reducer
 when one exists. A final nonsplit attention grid has no dependent to release.
-Standalone attention over an already-built QSA metadata triple remains stream
+Standalone attention over an already-built QToken-KvBlock-Sparse-Attention metadata triple remains stream
 ordered and does not enter this PDL chain.
 
 When split-KV uses a separate reduction kernel, each active attention CTA
-signals at its true tail after task completion and TMEM teardown. Deferred QSA
+signals at its true tail after task completion and TMEM teardown. Deferred QToken-KvBlock-Sparse-Attention
 split padding retires as described above, while other runtime-inactive CTAs use
 their terminal zero-work branch. The reducer initializes its register state
 and any required shared-memory storage, then waits before reading any
 producer-written partial output or statistics.
-Independent query-offset metadata may be read before that wait. QSA sequence
+Independent query-offset metadata may be read before that wait. QToken-KvBlock-Sparse-Attention sequence
 lengths remain behind it because they originate in the metadata producer two
 PDL stages upstream. This preserves producer-to-reducer overlap while gating
 every producer-dependent global-memory read.
@@ -126,8 +126,8 @@ and split-KV statistics are internal scratch.
 - `max_pages` must cover `ceil(max_kv_len / page_size)`. Request `b` reads only
   the first `ceil(seq_lens[b] / page_size)` entries; later columns are padding.
 
-The advanced QSA metadata builder returns
-`(qsa_page_indices, qsa_page_memberships, seq_lens)`. For `groups` routes and
+The advanced QToken-KvBlock-Sparse-Attention metadata builder returns
+`(q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens)`. For `groups` routes and
 `page_capacity = group_size * (block_topk + 1)`, the first tensor is a
 contiguous Int32 table `[groups, page_capacity]` of plain cache locators. The
 second is `[groups, ceil(page_capacity / 4)]`; each Int32 word packs four
@@ -135,7 +135,7 @@ consecutive 8-bit masks whose bit `i` records whether query `i` in the group
 uses that page. Q1 returns a `[groups, 0]` membership tensor. The final tensor
 is Int32 `[groups]` and stores compact K/V lengths in tokens. For route `g`,
 only
-`qsa_page_indices[g, :ceil(seq_lens[g] / sparse_block_size)]` and the
+`q_token_kv_block_sparse_page_indices[g, :ceil(seq_lens[g] / sparse_block_size)]` and the
 corresponding membership bytes are live. The unused locator suffix, unused
 membership words, and padding bytes in the final membership word have
 unspecified values.

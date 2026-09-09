@@ -329,8 +329,8 @@ def _build_decode_gen_schedule(
     tma_desc_v_summary_atom: cutlass.Pointer | None = None,
     page_idx_kv: cute.Pointer | None = None,
     page_table_stride: Int32 | None = None,
-    qsa_page_memberships: cute.Pointer | None = None,
-    qsa_page_membership_stride: Int32 | None = None,
+    q_token_kv_block_sparse_page_memberships: cute.Pointer | None = None,
+    q_token_kv_block_sparse_page_membership_stride: Int32 | None = None,
     h_k_idx: Int32 | None = None,
     b_idx: Int32 | None = None,
     q_group_idx: Int32 | None = None,
@@ -385,12 +385,12 @@ def _build_decode_gen_schedule(
     if cfg.uses_scattered_page_route and not use_native_paged_kv:
         raise ValueError("scattered page routes require the native paged-KV ABI")
     if (
-        cfg.uses_qsa_page_membership
+        cfg.uses_q_token_kv_block_sparse_page_membership
         and tma_desc_q is not None
-        and qsa_page_memberships is None
+        and q_token_kv_block_sparse_page_memberships is None
     ):
         raise ValueError(
-            "grouped QSA kernel construction requires qsa_page_memberships"
+            "grouped QToken-KvBlock-Sparse-Attention kernel construction requires q_token_kv_block_sparse_page_memberships"
         )
     if cfg.use_paged_kv:
         cfg.validate_paged_kv_staging_config()
@@ -665,7 +665,7 @@ def _build_decode_gen_schedule(
             3 if use_separate_kv_page_offset_resources else cfg.page_offsets_stages
         )
         if use_native_paged_kv and cfg.uses_held_encoded_locator_window:
-            # QSA publishes its complete CTA-local locator span once per work
+            # QToken-KvBlock-Sparse-Attention publishes its complete CTA-local locator span once per work
             # tile and holds it through the K/V tail. Only one stage is live
             # for direct, persistent, and split-KV routes alike.
             page_offsets_stages = 1
@@ -882,8 +882,8 @@ def _build_decode_gen_schedule(
             stage_page_ids_per_tile=stage_page_ids_per_tile,
             page_idx_kv=page_idx_kv,
             page_table_stride=page_table_stride,
-            qsa_page_memberships=qsa_page_memberships,
-            qsa_page_membership_stride=qsa_page_membership_stride,
+            q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
+            q_token_kv_block_sparse_page_membership_stride=q_token_kv_block_sparse_page_membership_stride,
             seqlens_kv=kv_seqlens,
             use_native_paged_kv=use_native_paged_kv,
             max_seq_len_kv=max_seq_len_kv,
@@ -904,8 +904,8 @@ def _build_decode_gen_schedule(
                 stage_page_ids_per_tile=stage_page_ids_per_tile,
                 page_idx_kv=page_idx_kv,
                 page_table_stride=page_table_stride,
-                qsa_page_memberships=qsa_page_memberships,
-                qsa_page_membership_stride=qsa_page_membership_stride,
+                q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
+                q_token_kv_block_sparse_page_membership_stride=q_token_kv_block_sparse_page_membership_stride,
                 seqlens_kv=kv_seqlens,
                 use_native_paged_kv=use_native_paged_kv,
                 max_seq_len_kv=max_seq_len_kv,
@@ -1118,7 +1118,7 @@ def _build_decode_gen_schedule(
     # explicit descriptor route.
     tmem_s0.q_ref = smem_q
     tmem_s1.q_ref = smem_q
-    if cfg.uses_qsa_page_membership:
+    if cfg.uses_q_token_kv_block_sparse_page_membership:
         assert smem_page_offsets is not None
         tmem_s0.page_offsets_ref = smem_page_offsets
         tmem_s1.page_offsets_ref = smem_page_offsets
@@ -2126,8 +2126,8 @@ def _run_decode_gen_active(
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer,
     g_page_table_stride: Int32,
-    g_qsa_page_memberships: cute.Pointer,
-    g_qsa_page_membership_stride: Int32,
+    g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
+    g_q_token_kv_block_sparse_page_membership_stride: Int32,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_split_kv_counter: cute.Pointer,
@@ -2274,8 +2274,8 @@ def _run_decode_gen_active(
         tma_desc_v_summary_atom=tma_desc_v_summary_atom_ptr,
         page_idx_kv=g_page_idx_kv,
         page_table_stride=g_page_table_stride,
-        qsa_page_memberships=g_qsa_page_memberships,
-        qsa_page_membership_stride=g_qsa_page_membership_stride,
+        q_token_kv_block_sparse_page_memberships=g_q_token_kv_block_sparse_page_memberships,
+        q_token_kv_block_sparse_page_membership_stride=g_q_token_kv_block_sparse_page_membership_stride,
         h_k_idx=h_k_idx,
         b_idx=b_idx,
         q_group_idx=q_group_idx,
@@ -2440,8 +2440,8 @@ def _run_decode_gen_runtime_prefix(
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer,
     g_page_table_stride: Int32,
-    g_qsa_page_memberships: cute.Pointer,
-    g_qsa_page_membership_stride: Int32,
+    g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
+    g_q_token_kv_block_sparse_page_membership_stride: Int32,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_split_kv_counter: cute.Pointer,
@@ -2489,7 +2489,7 @@ def _run_decode_gen_runtime_prefix(
             # Preserve one neutral producer for fused empty-K semantics.
             active_splits_kv = cute.math.max(active_splits_kv, Int32(1))
             if cutlass.const_expr(
-                cfg.uses_qsa_sparse_page_route
+                cfg.uses_q_token_kv_block_sparse_page_route
                 and not cfg.supports_cluster_smem_reduction
             ):
                 # When only the final configured split is empty, retaining its
@@ -2518,8 +2518,8 @@ def _run_decode_gen_runtime_prefix(
                 g_cu_seqlens_q,
                 g_page_idx_kv,
                 g_page_table_stride,
-                g_qsa_page_memberships,
-                g_qsa_page_membership_stride,
+                g_q_token_kv_block_sparse_page_memberships,
+                g_q_token_kv_block_sparse_page_membership_stride,
                 g_partial_o,
                 g_partial_stats,
                 g_split_kv_counter,
@@ -2566,8 +2566,8 @@ def _run_decode_gen_runtime_prefix(
                 g_cu_seqlens_q,
                 g_page_idx_kv,
                 g_page_table_stride,
-                g_qsa_page_memberships,
-                g_qsa_page_membership_stride,
+                g_q_token_kv_block_sparse_page_memberships,
+                g_q_token_kv_block_sparse_page_membership_stride,
                 g_partial_o,
                 g_partial_stats,
                 g_split_kv_counter,
@@ -2615,8 +2615,8 @@ def decode_gen_kernel(
     g_cu_seqlens_q: cute.Pointer,
     g_page_idx_kv: cute.Pointer,
     g_page_table_stride: Int32,
-    g_qsa_page_memberships: cute.Pointer,
-    g_qsa_page_membership_stride: Int32,
+    g_q_token_kv_block_sparse_page_memberships: cute.Pointer,
+    g_q_token_kv_block_sparse_page_membership_stride: Int32,
     g_partial_o: cute.Pointer,
     g_partial_stats: cute.Pointer,
     g_split_kv_counter: cute.Pointer,
@@ -2674,8 +2674,8 @@ def decode_gen_kernel(
                 g_cu_seqlens_q,
                 g_page_idx_kv,
                 g_page_table_stride,
-                g_qsa_page_memberships,
-                g_qsa_page_membership_stride,
+                g_q_token_kv_block_sparse_page_memberships,
+                g_q_token_kv_block_sparse_page_membership_stride,
                 g_partial_o,
                 g_partial_stats,
                 g_split_kv_counter,
@@ -2718,8 +2718,8 @@ def decode_gen_kernel(
                 g_cu_seqlens_q,
                 g_page_idx_kv,
                 g_page_table_stride,
-                g_qsa_page_memberships,
-                g_qsa_page_membership_stride,
+                g_q_token_kv_block_sparse_page_memberships,
+                g_q_token_kv_block_sparse_page_membership_stride,
                 g_partial_o,
                 g_partial_stats,
                 g_split_kv_counter,
@@ -2763,8 +2763,8 @@ def decode_gen_kernel(
                 g_cu_seqlens_q,
                 g_page_idx_kv,
                 g_page_table_stride,
-                g_qsa_page_memberships,
-                g_qsa_page_membership_stride,
+                g_q_token_kv_block_sparse_page_memberships,
+                g_q_token_kv_block_sparse_page_membership_stride,
                 g_partial_o,
                 g_partial_stats,
                 g_split_kv_counter,
@@ -2808,7 +2808,7 @@ def fmha_decode_launch(
     cu_seqlens_q_iter: cute.Pointer,
     total_q_tokens: Int32,
     page_idx_kv_iter: cute.Pointer,
-    qsa_page_memberships_iter: cute.Pointer,
+    q_token_kv_block_sparse_page_memberships_iter: cute.Pointer,
     partial_o_iter: cute.Pointer,
     partial_stats_iter: cute.Pointer,
     split_kv_counter_iter: cute.Pointer,
@@ -2823,7 +2823,7 @@ def fmha_decode_launch(
     use_variable_seqlens_kv: cutlass.Constexpr[bool] = False,
     use_native_paged_kv: cutlass.Constexpr[bool] = False,
     page_table_stride: Int32 = 0,
-    qsa_page_membership_stride: Int32 = 0,
+    q_token_kv_block_sparse_page_membership_stride: Int32 = 0,
     num_physical_kv_pages: Int64 = 0,
     k_page_stride: Int64 = 0,
     k_head_stride: Int64 = 0,
@@ -3050,8 +3050,8 @@ def fmha_decode_launch(
         cu_seqlens_q_iter,
         page_idx_kv_iter,
         page_table_stride,
-        qsa_page_memberships_iter,
-        qsa_page_membership_stride,
+        q_token_kv_block_sparse_page_memberships_iter,
+        q_token_kv_block_sparse_page_membership_stride,
         partial_o_iter,
         partial_stats_iter,
         split_kv_counter_iter,
@@ -3337,7 +3337,7 @@ def fmha_block_sparse_launch(
         null_i32_ptr,
         Int32(0),  # g_page_table_stride
         null_i32_ptr,
-        Int32(0),  # g_qsa_page_membership_stride
+        Int32(0),  # g_q_token_kv_block_sparse_page_membership_stride
         o_iter,
         null_f32_ptr,
         null_i32_ptr,

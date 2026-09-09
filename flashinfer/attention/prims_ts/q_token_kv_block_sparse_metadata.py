@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CUDA-graph-safe compact QSA metadata construction.
+"""CUDA-graph-safe compact QToken-KvBlock-Sparse-Attention metadata construction.
 
 The public attention kernel consumes dense sparse-page indices and, for
 grouped routes, a parallel packed-membership table. Q1 rows map their compact
@@ -44,38 +44,40 @@ from flashinfer.api_logging import flashinfer_api
 from ...utils import device_support_pdl
 from ._tensor_aliasing import _validate_tensor_does_not_overlap_inputs
 
-_QSA_SUPPORTED_SPARSE_BLOCK_SIZE = 4
-_QSA_MAX_BLOCK_TOPK = 512
+_Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_SPARSE_BLOCK_SIZE = 4
+_Q_TOKEN_KV_BLOCK_SPARSE_MAX_BLOCK_TOPK = 512
 # Reserve three high key bits for grouped-query membership tags and retain an
 # out-of-range radix sentinel in the CUDA/CUB touched-union representation.
-_QSA_MAX_SEQ_LEN_KV = ((1 << 29) - 1) * _QSA_SUPPORTED_SPARSE_BLOCK_SIZE
-_QSA_MEMBERSHIPS_PER_WORD = 4
-_QSA_INT32_LOCATOR_CAPACITY = 1 << 31
-_QSA_WORKSPACE_ALIGNMENT = 256
+_Q_TOKEN_KV_BLOCK_SPARSE_MAX_SEQ_LEN_KV = (
+    (1 << 29) - 1
+) * _Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_SPARSE_BLOCK_SIZE
+_Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD = 4
+_Q_TOKEN_KV_BLOCK_SPARSE_INT32_LOCATOR_CAPACITY = 1 << 31
+_Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT = 256
 
 
 @functools.cache
-def _get_prims_ts_qsa_metadata_module() -> Any:
-    """Build and cache the CUDA C++ QSA metadata implementation."""
+def _get_prims_ts_q_token_kv_block_sparse_metadata_module() -> Any:
+    """Build and cache the CUDA C++ QToken-KvBlock-Sparse-Attention metadata implementation."""
 
-    from ...jit import gen_prims_ts_qsa_metadata_module
+    from ...jit import gen_prims_ts_q_token_kv_block_sparse_metadata_module
 
-    return gen_prims_ts_qsa_metadata_module().build_and_load()
+    return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
 
 
 @dataclass(frozen=True)
-class _PrimsTSQSAWorkspaceViews:
-    """Typed views bound to one caller-owned QSA attention workspace."""
+class _PrimsTSQTokenKvBlockSparseWorkspaceViews:
+    """Typed views bound to one caller-owned QToken-KvBlock-Sparse-Attention attention workspace."""
 
-    qsa_page_indices: torch.Tensor
-    qsa_page_memberships: torch.Tensor
+    q_token_kv_block_sparse_page_indices: torch.Tensor
+    q_token_kv_block_sparse_page_memberships: torch.Tensor
     seq_lens: torch.Tensor
     attention_workspace_buffer: torch.Tensor
 
 
 @dataclass(frozen=True)
-class _QSATensorDescriptor:
-    """Structural replacement-storage contract for a prepared QSA plan."""
+class _QTokenKvBlockSparseTensorDescriptor:
+    """Structural replacement-storage contract for a prepared QToken-KvBlock-Sparse-Attention plan."""
 
     shape: tuple[int, ...]
     stride: tuple[int, ...]
@@ -83,8 +85,10 @@ class _QSATensorDescriptor:
     dtype: torch.dtype
 
 
-def _describe_qsa_tensor(tensor: torch.Tensor) -> _QSATensorDescriptor:
-    return _QSATensorDescriptor(
+def _describe_q_token_kv_block_sparse_tensor(
+    tensor: torch.Tensor,
+) -> _QTokenKvBlockSparseTensorDescriptor:
+    return _QTokenKvBlockSparseTensorDescriptor(
         shape=tuple(tensor.shape),
         stride=tuple(tensor.stride()),
         device=tensor.device,
@@ -92,10 +96,10 @@ def _describe_qsa_tensor(tensor: torch.Tensor) -> _QSATensorDescriptor:
     )
 
 
-def _validate_qsa_plan_tensor(
+def _validate_q_token_kv_block_sparse_plan_tensor(
     tensor: torch.Tensor,
     name: str,
-    descriptor: _QSATensorDescriptor,
+    descriptor: _QTokenKvBlockSparseTensorDescriptor,
 ) -> None:
     """Check one replacement tensor without inspecting device values."""
 
@@ -109,14 +113,14 @@ def _validate_qsa_plan_tensor(
     ):
         raise ValueError(
             f"{name} must preserve the shape, strides, device, and dtype "
-            "validated by the QSA plan"
+            "validated by the QToken-KvBlock-Sparse-Attention plan"
         )
 
 
-def _validate_qsa_paged_kv_cache(
+def _validate_q_token_kv_block_sparse_paged_kv_cache(
     paged_kv_cache: object,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Validate and return the two rank-four QSA cache tensors."""
+    """Validate and return the two rank-four QToken-KvBlock-Sparse-Attention cache tensors."""
 
     if (
         not isinstance(paged_kv_cache, tuple)
@@ -140,7 +144,7 @@ def _validate_qsa_paged_kv_cache(
     return k_cache, v_cache
 
 
-def _validate_qsa_workspace_aliasing(
+def _validate_q_token_kv_block_sparse_workspace_aliasing(
     workspace_buffer: torch.Tensor,
     *,
     query: torch.Tensor,
@@ -153,7 +157,7 @@ def _validate_qsa_workspace_aliasing(
     qo_indptr: Optional[torch.Tensor],
     out: Optional[torch.Tensor],
 ) -> None:
-    """Keep the unified workspace disjoint from every live QSA tensor."""
+    """Keep the unified workspace disjoint from every live QToken-KvBlock-Sparse-Attention tensor."""
 
     _validate_tensor_does_not_overlap_inputs(
         workspace_buffer,
@@ -170,7 +174,7 @@ def _validate_qsa_workspace_aliasing(
     )
 
 
-def _validate_qsa_locator_capacity(
+def _validate_q_token_kv_block_sparse_locator_capacity(
     k_cache: torch.Tensor,
     *,
     sparse_block_size: int,
@@ -182,17 +186,17 @@ def _validate_qsa_locator_capacity(
     num_encoded_locators = (
         int(k_cache.shape[0]) * storage_page_size // sparse_block_size
     )
-    if num_encoded_locators > _QSA_INT32_LOCATOR_CAPACITY:
+    if num_encoded_locators > _Q_TOKEN_KV_BLOCK_SPARSE_INT32_LOCATOR_CAPACITY:
         raise NotImplementedError(
-            "the encoded QSA cache-locator extent must fit in nonnegative "
+            "the encoded QToken-KvBlock-Sparse-Attention cache-locator extent must fit in nonnegative "
             "signed int32: got "
-            f"{num_encoded_locators}, limit is {_QSA_INT32_LOCATOR_CAPACITY}"
+            f"{num_encoded_locators}, limit is {_Q_TOKEN_KV_BLOCK_SPARSE_INT32_LOCATOR_CAPACITY}"
         )
 
 
 @dataclass(frozen=True)
-class _PrimsTSQSAWorkspaceLayout:
-    """Layout of QSA metadata outputs and disjoint kernel scratch.
+class _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
+    """Layout of QToken-KvBlock-Sparse-Attention metadata outputs and disjoint kernel scratch.
 
     The dense page-index and packed-membership tables plus compact sequence
     lengths remain live from metadata construction through the attention
@@ -203,11 +207,11 @@ class _PrimsTSQSAWorkspaceLayout:
     Semantic inputs such as block tables and query mappings remain outside.
     """
 
-    qsa_page_indices_shape: tuple[int, int]
-    qsa_page_indices_bytes: int
-    qsa_page_memberships_shape: tuple[int, int]
-    qsa_page_memberships_byte_offset: int
-    qsa_page_memberships_bytes: int
+    q_token_kv_block_sparse_page_indices_shape: tuple[int, int]
+    q_token_kv_block_sparse_page_indices_bytes: int
+    q_token_kv_block_sparse_page_memberships_shape: tuple[int, int]
+    q_token_kv_block_sparse_page_memberships_byte_offset: int
+    q_token_kv_block_sparse_page_memberships_bytes: int
     seq_lens_byte_offset: int
     seq_lens_bytes: int
     attention_workspace_byte_offset: int
@@ -216,25 +220,29 @@ class _PrimsTSQSAWorkspaceLayout:
     max_seq_len: int
     total_bytes: int
 
-    def bind(self, workspace_buffer: torch.Tensor) -> _PrimsTSQSAWorkspaceViews:
+    def bind(
+        self, workspace_buffer: torch.Tensor
+    ) -> _PrimsTSQTokenKvBlockSparseWorkspaceViews:
         """Return zero-copy typed views over a validated byte workspace."""
 
-        _validate_qsa_attention_workspace(workspace_buffer, self.total_bytes)
-        workspace_bytes = workspace_buffer.reshape(-1).view(torch.uint8)
-        qsa_page_indices = (
-            workspace_bytes[: self.qsa_page_indices_bytes]
-            .view(torch.int32)
-            .view(self.qsa_page_indices_shape)
+        _validate_q_token_kv_block_sparse_attention_workspace(
+            workspace_buffer, self.total_bytes
         )
-        qsa_page_memberships = (
+        workspace_bytes = workspace_buffer.reshape(-1).view(torch.uint8)
+        q_token_kv_block_sparse_page_indices = (
+            workspace_bytes[: self.q_token_kv_block_sparse_page_indices_bytes]
+            .view(torch.int32)
+            .view(self.q_token_kv_block_sparse_page_indices_shape)
+        )
+        q_token_kv_block_sparse_page_memberships = (
             workspace_bytes[
-                self.qsa_page_memberships_byte_offset : (
-                    self.qsa_page_memberships_byte_offset
-                    + self.qsa_page_memberships_bytes
+                self.q_token_kv_block_sparse_page_memberships_byte_offset : (
+                    self.q_token_kv_block_sparse_page_memberships_byte_offset
+                    + self.q_token_kv_block_sparse_page_memberships_bytes
                 )
             ]
             .view(torch.int32)
-            .view(self.qsa_page_memberships_shape)
+            .view(self.q_token_kv_block_sparse_page_memberships_shape)
         )
         seq_lens = workspace_bytes[
             self.seq_lens_byte_offset : self.seq_lens_byte_offset + self.seq_lens_bytes
@@ -243,20 +251,20 @@ class _PrimsTSQSAWorkspaceLayout:
             self.attention_workspace_byte_offset : self.attention_workspace_byte_offset
             + self.attention_scratch_bytes
         ]
-        return _PrimsTSQSAWorkspaceViews(
-            qsa_page_indices=qsa_page_indices,
-            qsa_page_memberships=qsa_page_memberships,
+        return _PrimsTSQTokenKvBlockSparseWorkspaceViews(
+            q_token_kv_block_sparse_page_indices=q_token_kv_block_sparse_page_indices,
+            q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
             seq_lens=seq_lens,
             attention_workspace_buffer=attention_workspace_buffer,
         )
 
 
 @dataclass(frozen=True)
-class _PrimsTSQSAMetadataPlan:
+class _PrimsTSQTokenKvBlockSparseMetadataPlan:
     """Unchecked metadata launch state with all geometry pre-resolved."""
 
-    qsa_page_indices: torch.Tensor
-    qsa_page_memberships: torch.Tensor
+    q_token_kv_block_sparse_page_indices: torch.Tensor
+    q_token_kv_block_sparse_page_memberships: torch.Tensor
     seq_lens: torch.Tensor
     qo_indptr: Optional[torch.Tensor]
     metadata_run: Any
@@ -283,8 +291,8 @@ class _PrimsTSQSAMetadataPlan:
                 token_to_request,
                 query_positions,
                 self.qo_indptr,
-                self.qsa_page_indices,
-                self.qsa_page_memberships,
+                self.q_token_kv_block_sparse_page_indices,
+                self.q_token_kv_block_sparse_page_memberships,
                 self.seq_lens,
                 self.group_size,
                 self.storage_page_size,
@@ -298,8 +306,8 @@ class _PrimsTSQSAMetadataPlan:
                 block_table,
                 token_to_request,
                 query_positions,
-                self.qsa_page_indices,
-                self.qsa_page_memberships,
+                self.q_token_kv_block_sparse_page_indices,
+                self.q_token_kv_block_sparse_page_memberships,
                 self.seq_lens,
                 self.group_size,
                 self.storage_page_size,
@@ -310,7 +318,7 @@ class _PrimsTSQSAMetadataPlan:
 
 
 @dataclass(frozen=True)
-class _PrimsTSQSAPlan:
+class _PrimsTSQTokenKvBlockSparsePlan:
     """Prepared compact-metadata and PrimTS-attention launch state.
 
     The plan binds output/workspace storage and freezes input geometry once.
@@ -325,16 +333,16 @@ class _PrimsTSQSAPlan:
     compiled and their workspace state is initialized outside the graph.
     """
 
-    _metadata_plan: _PrimsTSQSAMetadataPlan
+    _metadata_plan: _PrimsTSQTokenKvBlockSparseMetadataPlan
     _bmm1_scale: float
     _bmm2_scale: float
     _attention_plan: Any
-    _query: _QSATensorDescriptor
-    _block_indices: _QSATensorDescriptor
-    _block_table: _QSATensorDescriptor
-    _token_to_request: _QSATensorDescriptor
-    _query_positions: _QSATensorDescriptor
-    _out: _QSATensorDescriptor
+    _query: _QTokenKvBlockSparseTensorDescriptor
+    _block_indices: _QTokenKvBlockSparseTensorDescriptor
+    _block_table: _QTokenKvBlockSparseTensorDescriptor
+    _token_to_request: _QTokenKvBlockSparseTensorDescriptor
+    _query_positions: _QTokenKvBlockSparseTensorDescriptor
+    _out: _QTokenKvBlockSparseTensorDescriptor
     _fixed_query_group_size: Optional[int] = None
 
     def run(
@@ -349,22 +357,26 @@ class _PrimsTSQSAPlan:
         sm_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
     ) -> torch.Tensor:
-        """Launch prepared QSA metadata and attention on the current stream."""
+        """Launch prepared QToken-KvBlock-Sparse-Attention metadata and attention on the current stream."""
 
-        _validate_qsa_plan_tensor(query, "query", self._query)
-        _validate_qsa_plan_tensor(block_indices, "block_indices", self._block_indices)
-        _validate_qsa_plan_tensor(block_table, "block_table", self._block_table)
-        _validate_qsa_plan_tensor(
+        _validate_q_token_kv_block_sparse_plan_tensor(query, "query", self._query)
+        _validate_q_token_kv_block_sparse_plan_tensor(
+            block_indices, "block_indices", self._block_indices
+        )
+        _validate_q_token_kv_block_sparse_plan_tensor(
+            block_table, "block_table", self._block_table
+        )
+        _validate_q_token_kv_block_sparse_plan_tensor(
             token_to_request,
             "token_to_request",
             self._token_to_request,
         )
-        _validate_qsa_plan_tensor(
+        _validate_q_token_kv_block_sparse_plan_tensor(
             query_positions,
             "query_positions",
             self._query_positions,
         )
-        _validate_qsa_plan_tensor(out, "out", self._out)
+        _validate_q_token_kv_block_sparse_plan_tensor(out, "out", self._out)
 
         from .decode import _validate_16byte_alignment
 
@@ -377,8 +389,12 @@ class _PrimsTSQSAPlan:
             token_to_request,
             query_positions,
         )
-        attention_query = _flatten_fixed_qsa_groups(query, self._fixed_query_group_size)
-        attention_out = _flatten_fixed_qsa_groups(out, self._fixed_query_group_size)
+        attention_query = _flatten_fixed_q_token_kv_block_sparse_groups(
+            query, self._fixed_query_group_size
+        )
+        attention_out = _flatten_fixed_q_token_kv_block_sparse_groups(
+            out, self._fixed_query_group_size
+        )
         from .decode import _validate_scale
 
         scale_qk = _validate_scale(
@@ -453,7 +469,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
 
     def __init__(self) -> None:
         self._config: Optional[_QTokenKvBlockSparsePlanConfig] = None
-        self._prepared_plan: Optional[_PrimsTSQSAPlan] = None
+        self._prepared_plan: Optional[_PrimsTSQTokenKvBlockSparsePlan] = None
         self._prepared_key: Optional[tuple[object, ...]] = None
         self._default_out: Optional[torch.Tensor] = None
         self._plan_lock = threading.Lock()
@@ -528,7 +544,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             raise ValueError("workspace_buffer must be on the planned device")
 
         max_num_storage_pages = (max_seq_len_kv + page_size - 1) // page_size
-        layout = _get_prims_ts_qsa_workspace_layout(
+        layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
             batch_size * seq_len_q,
             block_topk,
             max_num_storage_pages,
@@ -546,7 +562,9 @@ class QTokenKvBlockSparsePagedTSWrapper:
             use_packed_q=use_packed_q,
             sparse_block_size=kv_block_size,
         )
-        _validate_qsa_attention_workspace(workspace_buffer, layout.total_bytes)
+        _validate_q_token_kv_block_sparse_attention_workspace(
+            workspace_buffer, layout.total_bytes
+        )
         with torch.cuda.device(device_index):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
@@ -620,7 +638,9 @@ class QTokenKvBlockSparsePagedTSWrapper:
         if config.use_packed_q:
             if q.ndim != 3 or qo_indptr is None:
                 raise ValueError("packed Q requires [total_q,Hq,D] and qo_indptr")
-            _validate_qsa_qo_indptr_tensor(qo_indptr, expected_device=config.device)
+            _validate_q_token_kv_block_sparse_qo_indptr_tensor(
+                qo_indptr, expected_device=config.device
+            )
             if qo_indptr.numel() != config.batch_size + 1:
                 raise ValueError("qo_indptr length must match the planned route count")
             if q.shape[0] <= 0 or q.shape[0] > config.batch_size * config.seq_len_q:
@@ -661,7 +681,9 @@ class QTokenKvBlockSparsePagedTSWrapper:
         if query_positions.shape != (num_query_tokens,):
             raise ValueError("query_positions must have one entry per query token")
 
-        k_cache, v_cache = _validate_qsa_paged_kv_cache(paged_kv_cache)
+        k_cache, v_cache = _validate_q_token_kv_block_sparse_paged_kv_cache(
+            paged_kv_cache
+        )
         if (
             k_cache.device != config.device
             or k_cache.dtype != config.kv_data_type
@@ -698,7 +720,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         ):
             raise ValueError("out must match q shape and the planned output dtype")
 
-        _validate_qsa_workspace_aliasing(
+        _validate_q_token_kv_block_sparse_workspace_aliasing(
             config.workspace_buffer,
             query=q,
             k_cache=k_cache,
@@ -759,11 +781,11 @@ class QTokenKvBlockSparsePagedTSWrapper:
         )
 
 
-def _flatten_fixed_qsa_groups(
+def _flatten_fixed_q_token_kv_block_sparse_groups(
     tensor: torch.Tensor,
     group_size: Optional[int],
 ) -> torch.Tensor:
-    """Return the lower-level decode view for a canonical fixed QSA tensor."""
+    """Return the lower-level decode view for a canonical fixed QToken-KvBlock-Sparse-Attention tensor."""
 
     if group_size is None:
         return tensor
@@ -779,7 +801,7 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
     num_query_groups: Optional[int] = None,
     sparse_block_size: int = 4,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-    """Return ``(qsa_page_indices, qsa_page_memberships, seq_lens)`` shapes.
+    """Return ``(q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens)`` shapes.
 
     ``sparse_block_size`` must be a positive power of two; only four is
     implemented today. Grouped membership masks use four packed bytes per
@@ -793,7 +815,7 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
     block_topk : int
         Number of selected logical sparse blocks supplied for each query row.
     group_size : int
-        Maximum number of query rows represented by one QSA route.
+        Maximum number of query rows represented by one QToken-KvBlock-Sparse-Attention route.
     num_query_groups : int, optional
         Explicit route count for a packed query. If omitted, query rows are
         partitioned into fixed groups and ``num_query_tokens`` must be
@@ -805,7 +827,7 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
     Returns
     -------
     tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
-        Shapes for ``qsa_page_indices``, ``qsa_page_memberships``, and
+        Shapes for ``q_token_kv_block_sparse_page_indices``, ``q_token_kv_block_sparse_page_memberships``, and
         ``seq_lens``, in that order.
     """
 
@@ -820,13 +842,13 @@ def _get_q_token_kv_block_sparse_metadata_output_shapes(
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _QSA_MEMBERSHIPS_PER_WORD - 1)
-        // _QSA_MEMBERSHIPS_PER_WORD
+        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
     )
     return (groups, page_capacity), (groups, membership_words), (groups,)
 
 
-def _get_prims_ts_qsa_workspace_layout(
+def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     num_query_tokens: int,
     block_topk: int,
     max_num_storage_pages: int,
@@ -844,10 +866,10 @@ def _get_prims_ts_qsa_workspace_layout(
     num_query_groups: Optional[int] = None,
     use_packed_q: bool = False,
     sparse_block_size: int = 4,
-) -> _PrimsTSQSAWorkspaceLayout:
-    """Return the unified allocation layout for QSA metadata and attention.
+) -> _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
+    """Return the unified allocation layout for QToken-KvBlock-Sparse-Attention metadata and attention.
 
-    The workspace owns the dense QSA page-index table, grouped membership
+    The workspace owns the dense QToken-KvBlock-Sparse-Attention page-index table, grouped membership
     words, compact sequence lengths, and kernel scratch. The caller continues
     to provide the model block table, request mappings, and query positions as
     explicit semantic inputs.
@@ -860,7 +882,9 @@ def _get_prims_ts_qsa_workspace_layout(
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     _validate_shape_parameters(num_query_tokens, block_topk, group_size)
     if num_query_tokens == 0:
-        raise ValueError("num_query_tokens must be positive for QSA attention")
+        raise ValueError(
+            "num_query_tokens must be positive for QToken-KvBlock-Sparse-Attention attention"
+        )
     if not isinstance(max_num_storage_pages, int) or isinstance(
         max_num_storage_pages, bool
     ):
@@ -868,17 +892,17 @@ def _get_prims_ts_qsa_workspace_layout(
     if max_num_storage_pages <= 0:
         raise ValueError("max_num_storage_pages must be positive")
     _validate_storage_page_size(storage_page_size, sparse_block_size)
-    max_seq_len_kv = _validate_qsa_max_seq_len_kv(
+    max_seq_len_kv = _validate_q_token_kv_block_sparse_max_seq_len_kv(
         max_seq_len_kv,
         block_table_token_capacity=max_num_storage_pages * storage_page_size,
     )
 
     from .decode import (
         _resolve_decode_workspace_layout,
-        _validate_prims_ts_qsa_group_capacity,
+        _validate_prims_ts_q_token_kv_block_sparse_group_capacity,
     )
 
-    group_size = _validate_prims_ts_qsa_group_capacity(
+    group_size = _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
         group_size,
         num_qo_heads,
         num_kv_heads,
@@ -893,16 +917,21 @@ def _get_prims_ts_qsa_workspace_layout(
     membership_words = (
         0
         if group_size == 1
-        else (page_capacity + _QSA_MEMBERSHIPS_PER_WORD - 1)
-        // _QSA_MEMBERSHIPS_PER_WORD
+        else (page_capacity + _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD - 1)
+        // _Q_TOKEN_KV_BLOCK_SPARSE_MEMBERSHIPS_PER_WORD
     )
-    qsa_page_indices_shape = (groups, page_capacity)
-    qsa_page_indices_bytes = groups * page_capacity * 4
-    qsa_page_memberships_shape = (groups, membership_words)
-    qsa_page_memberships_byte_offset = _align_up_qsa_workspace(qsa_page_indices_bytes)
-    qsa_page_memberships_bytes = groups * membership_words * 4
-    seq_lens_byte_offset = _align_up_qsa_workspace(
-        qsa_page_memberships_byte_offset + qsa_page_memberships_bytes
+    q_token_kv_block_sparse_page_indices_shape = (groups, page_capacity)
+    q_token_kv_block_sparse_page_indices_bytes = groups * page_capacity * 4
+    q_token_kv_block_sparse_page_memberships_shape = (groups, membership_words)
+    q_token_kv_block_sparse_page_memberships_byte_offset = (
+        _align_up_q_token_kv_block_sparse_workspace(
+            q_token_kv_block_sparse_page_indices_bytes
+        )
+    )
+    q_token_kv_block_sparse_page_memberships_bytes = groups * membership_words * 4
+    seq_lens_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
+        q_token_kv_block_sparse_page_memberships_byte_offset
+        + q_token_kv_block_sparse_page_memberships_bytes
     )
     seq_lens_numel = groups
     seq_lens_bytes = seq_lens_numel * 4
@@ -932,19 +961,19 @@ def _get_prims_ts_qsa_workspace_layout(
         -1,
         storage_page_size,
         device,
-        use_qsa_route=True,
+        use_q_token_kv_block_sparse_route=True,
         use_pdl=True,
     )
     attention_scratch_bytes = attention_layout.total_bytes
-    attention_workspace_byte_offset = _align_up_qsa_workspace(
+    attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
         seq_lens_byte_offset + seq_lens_bytes
     )
-    return _PrimsTSQSAWorkspaceLayout(
-        qsa_page_indices_shape=qsa_page_indices_shape,
-        qsa_page_indices_bytes=qsa_page_indices_bytes,
-        qsa_page_memberships_shape=qsa_page_memberships_shape,
-        qsa_page_memberships_byte_offset=qsa_page_memberships_byte_offset,
-        qsa_page_memberships_bytes=qsa_page_memberships_bytes,
+    return _PrimsTSQTokenKvBlockSparseWorkspaceLayout(
+        q_token_kv_block_sparse_page_indices_shape=q_token_kv_block_sparse_page_indices_shape,
+        q_token_kv_block_sparse_page_indices_bytes=q_token_kv_block_sparse_page_indices_bytes,
+        q_token_kv_block_sparse_page_memberships_shape=q_token_kv_block_sparse_page_memberships_shape,
+        q_token_kv_block_sparse_page_memberships_byte_offset=q_token_kv_block_sparse_page_memberships_byte_offset,
+        q_token_kv_block_sparse_page_memberships_bytes=q_token_kv_block_sparse_page_memberships_bytes,
         seq_lens_byte_offset=seq_lens_byte_offset,
         seq_lens_bytes=seq_lens_bytes,
         attention_workspace_byte_offset=attention_workspace_byte_offset,
@@ -977,7 +1006,7 @@ def get_q_token_kv_block_sparse_workspace_size(
     not require query-offset metadata. The first two fixed axes are flattened
     into the attention route axis without copying tensor storage.
 
-    The dense QSA page indices, grouped membership words, and compact sequence
+    The dense QToken-KvBlock-Sparse-Attention page indices, grouped membership words, and compact sequence
     lengths are owned by the workspace. These persistent metadata outputs and
     the attention scratch occupy disjoint regions, and callers do not allocate
     any metadata output separately.
@@ -1010,7 +1039,7 @@ def get_q_token_kv_block_sparse_workspace_size(
     qo_indptr : torch.Tensor, optional
         Contiguous CUDA Int32 cumulative offsets for packed query routes.
     seq_len_q : int, optional
-        Maximum packed-route length and QSA group size. It is required when
+        Maximum packed-route length and QToken-KvBlock-Sparse-Attention group size. It is required when
         ``qo_indptr`` is supplied.
     kv_block_size : int
         Logical sparse-block size in tokens. It must be a positive power of
@@ -1019,11 +1048,11 @@ def get_q_token_kv_block_sparse_workspace_size(
     Returns
     -------
     int
-        Required unified workspace size in bytes, including persistent QSA
+        Required unified workspace size in bytes, including persistent QToken-KvBlock-Sparse-Attention
         metadata outputs and a disjoint attention-scratch region.
     """
 
-    return _get_prims_ts_qsa_workspace_layout_from_tensors(
+    return _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
         q,
         k_cache,
         block_table,
@@ -1036,7 +1065,7 @@ def get_q_token_kv_block_sparse_workspace_size(
     ).total_bytes
 
 
-def _get_prims_ts_qsa_workspace_layout_from_tensors(
+def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
     query: torch.Tensor,
     k_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -1047,7 +1076,7 @@ def _get_prims_ts_qsa_workspace_layout_from_tensors(
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
     sparse_block_size: int = 4,
-) -> _PrimsTSQSAWorkspaceLayout:
+) -> _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     if not isinstance(query, torch.Tensor):
         raise TypeError("query must be a torch.Tensor")
@@ -1059,20 +1088,28 @@ def _get_prims_ts_qsa_workspace_layout_from_tensors(
         raise TypeError("block_table must be a torch.Tensor")
     use_packed_q = qo_indptr is not None
     if not use_packed_q and max_seq_len_q is not None:
-        raise ValueError("max_seq_len_q is only valid with packed QSA qo_indptr")
+        raise ValueError(
+            "max_seq_len_q is only valid with packed QToken-KvBlock-Sparse-Attention qo_indptr"
+        )
     if use_packed_q:
         if query.ndim != 3:
-            raise ValueError("packed QSA query must have shape [total_q,Hq,D]")
+            raise ValueError(
+                "packed QToken-KvBlock-Sparse-Attention query must have shape [total_q,Hq,D]"
+            )
         if max_seq_len_q is None:
-            raise ValueError("max_seq_len_q is required with QSA qo_indptr")
-        _validate_qsa_qo_indptr_layout_tensor(qo_indptr)
+            raise ValueError(
+                "max_seq_len_q is required with QToken-KvBlock-Sparse-Attention qo_indptr"
+            )
+        _validate_q_token_kv_block_sparse_qo_indptr_layout_tensor(qo_indptr)
         group_size = int(max_seq_len_q)
         groups = int(qo_indptr.numel()) - 1
         num_query_tokens, num_qo_heads, head_dim = query.shape
     elif query.ndim == 5:
         batch_size, groups_per_request, group_size, num_qo_heads, head_dim = query.shape
         if batch_size <= 0 or groups_per_request <= 0:
-            raise ValueError("fixed QSA batch and query-group counts must be positive")
+            raise ValueError(
+                "fixed QToken-KvBlock-Sparse-Attention batch and query-group counts must be positive"
+            )
         groups = int(batch_size) * int(groups_per_request)
     else:
         raise ValueError(
@@ -1087,13 +1124,13 @@ def _get_prims_ts_qsa_workspace_layout_from_tensors(
         raise ValueError("block_table must be a rank-two int32 tensor")
     if block_table.device != query.device:
         raise ValueError("block_table must be on the query device")
-    _validate_qsa_locator_capacity(
+    _validate_q_token_kv_block_sparse_locator_capacity(
         k_cache,
         sparse_block_size=sparse_block_size,
     )
     if out_dtype is None:
         out_dtype = query.dtype
-    return _get_prims_ts_qsa_workspace_layout(
+    return _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         int(query.shape[0]) if use_packed_q else groups * group_size,
         block_topk,
         block_table.shape[1],
@@ -1113,7 +1150,7 @@ def _get_prims_ts_qsa_workspace_layout_from_tensors(
     )
 
 
-def _build_prims_ts_qsa_metadata(
+def _build_prims_ts_q_token_kv_block_sparse_metadata(
     block_indices: torch.Tensor,
     block_table: torch.Tensor,
     token_to_request: torch.Tensor,
@@ -1127,7 +1164,7 @@ def _build_prims_ts_qsa_metadata(
     out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     release_attention_pdl: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build dense QSA indices and memberships from compact sparse-block IDs.
+    """Build dense QToken-KvBlock-Sparse-Attention indices and memberships from compact sparse-block IDs.
 
     ``block_indices`` contains compact logical four-token block IDs with shape
     ``[num_query_tokens, block_topk]``.  Adjacent Q2/Q4/Q5 rows must belong to
@@ -1149,7 +1186,7 @@ def _build_prims_ts_qsa_metadata(
     bounded ``group_size * (block_topk + 1)`` candidates, unique them while
     OR-reducing membership bits, and map the resulting logical pages through
     the dense block table. The terminal metadata grid releases a following
-    PDL-capable QSA attention launch when requested by the combined API.
+    PDL-capable QToken-KvBlock-Sparse-Attention attention launch when requested by the combined API.
     Packed ``qo_indptr`` must be an Int32 device copy of CPU-validated route
     offsets; this builder checks only its structural tensor contract and does
     not read route values back to the host.
@@ -1168,7 +1205,7 @@ def _build_prims_ts_qsa_metadata(
     rows, block_topk = block_indices.shape
     use_packed_q = qo_indptr is not None
     if use_packed_q:
-        _validate_qsa_qo_indptr_tensor(
+        _validate_q_token_kv_block_sparse_qo_indptr_tensor(
             qo_indptr,
             expected_device=block_indices.device,
         )
@@ -1188,7 +1225,7 @@ def _build_prims_ts_qsa_metadata(
     else:
         if not isinstance(out, tuple) or len(out) != 3:
             raise TypeError(
-                "out must be a (qsa_page_indices, qsa_page_memberships, seq_lens) tuple"
+                "out must be a (q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens) tuple"
             )
         outputs = out
         for tensor, shape in zip(outputs, expected_shapes, strict=True):
@@ -1199,16 +1236,20 @@ def _build_prims_ts_qsa_metadata(
                 or not tensor.is_contiguous()
             ):
                 raise ValueError(
-                    "QSA metadata outputs must be contiguous int32 tensors with "
+                    "QToken-KvBlock-Sparse-Attention metadata outputs must be contiguous int32 tensors with "
                     f"shapes {expected_shapes} on {block_indices.device}"
                 )
-    qsa_page_indices, qsa_page_memberships, seq_lens = outputs
+    (
+        q_token_kv_block_sparse_page_indices,
+        q_token_kv_block_sparse_page_memberships,
+        seq_lens,
+    ) = outputs
     groups = _resolve_num_query_groups(rows, group_size, groups)
     if groups == 0:
         return outputs
 
     enable_pdl = device_support_pdl(block_indices.device)
-    metadata_module = _get_prims_ts_qsa_metadata_module()
+    metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
     release_attention_pdl = enable_pdl and release_attention_pdl
     if use_packed_q:
         metadata_module.run_packed(
@@ -1217,8 +1258,8 @@ def _build_prims_ts_qsa_metadata(
             token_to_request,
             query_positions,
             qo_indptr,
-            qsa_page_indices,
-            qsa_page_memberships,
+            q_token_kv_block_sparse_page_indices,
+            q_token_kv_block_sparse_page_memberships,
             seq_lens,
             group_size,
             storage_page_size,
@@ -1232,8 +1273,8 @@ def _build_prims_ts_qsa_metadata(
             block_table,
             token_to_request,
             query_positions,
-            qsa_page_indices,
-            qsa_page_memberships,
+            q_token_kv_block_sparse_page_indices,
+            q_token_kv_block_sparse_page_memberships,
             seq_lens,
             group_size,
             storage_page_size,
@@ -1257,14 +1298,14 @@ def _build_q_token_kv_block_sparse_metadata(
     qo_indptr: Optional[torch.Tensor] = None,
     out: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build dense QSA page indices and memberships from sparse-block IDs.
+    """Build dense QToken-KvBlock-Sparse-Attention page indices and memberships from sparse-block IDs.
 
     ``block_indices`` is ``[num_query_tokens, block_topk]`` and contains
     selected logical sparse-block IDs. ``block_table`` is the model's dense
     ``[num_requests, max_storage_pages]`` physical storage-page table. The
-    returned ``qsa_page_indices`` has shape
+    returned ``q_token_kv_block_sparse_page_indices`` has shape
     ``[num_query_groups, group_size * (block_topk + 1)]``; ``seq_lens`` gives
-    each row's live token prefix. ``qsa_page_memberships`` stores four 8-bit
+    each row's live token prefix. ``q_token_kv_block_sparse_page_memberships`` stores four 8-bit
     per-page masks in each Int32 word for grouped routes and has shape
     ``[num_query_groups, 0]`` for Q1. Page-index entries are plain encoded cache
     locators for every group size.
@@ -1318,12 +1359,12 @@ def _build_q_token_kv_block_sparse_metadata(
     Returns
     -------
     tuple[torch.Tensor, torch.Tensor, torch.Tensor]
-        ``(qsa_page_indices, qsa_page_memberships, seq_lens)``. Memberships
+        ``(q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens)``. Memberships
         pack four per-page bytes into each Int32 word and have zero columns for
         Q1.
     """
 
-    return _build_prims_ts_qsa_metadata(
+    return _build_prims_ts_q_token_kv_block_sparse_metadata(
         block_indices,
         block_table,
         token_to_request,
@@ -1337,13 +1378,13 @@ def _build_q_token_kv_block_sparse_metadata(
     )
 
 
-def _prepare_prims_ts_qsa_metadata_plan(
+def _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
     block_indices: torch.Tensor,
     block_table: torch.Tensor,
     token_to_request: torch.Tensor,
     query_positions: torch.Tensor,
-    qsa_page_indices: torch.Tensor,
-    qsa_page_memberships: torch.Tensor,
+    q_token_kv_block_sparse_page_indices: torch.Tensor,
+    q_token_kv_block_sparse_page_memberships: torch.Tensor,
     seq_lens: torch.Tensor,
     *,
     group_size: int,
@@ -1351,7 +1392,7 @@ def _prepare_prims_ts_qsa_metadata_plan(
     max_seq_len_kv: int,
     sparse_block_size: int = 4,
     qo_indptr: Optional[torch.Tensor] = None,
-) -> _PrimsTSQSAMetadataPlan:
+) -> _PrimsTSQTokenKvBlockSparseMetadataPlan:
     """Freeze validated metadata tensors and launch constants."""
 
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
@@ -1362,18 +1403,18 @@ def _prepare_prims_ts_qsa_metadata_plan(
         group_size,
         int(qo_indptr.numel()) - 1 if use_packed_q else None,
     )
-    max_seq_len_kv = _validate_qsa_max_seq_len_kv(
+    max_seq_len_kv = _validate_q_token_kv_block_sparse_max_seq_len_kv(
         max_seq_len_kv,
         block_table_token_capacity=block_table.shape[1] * storage_page_size,
     )
     release_attention_pdl = device_support_pdl(block_indices.device)
-    metadata_module = _get_prims_ts_qsa_metadata_module()
+    metadata_module = _get_prims_ts_q_token_kv_block_sparse_metadata_module()
     metadata_run = (
         metadata_module.run_packed if use_packed_q else metadata_module.run_fixed
     )
-    return _PrimsTSQSAMetadataPlan(
-        qsa_page_indices=qsa_page_indices,
-        qsa_page_memberships=qsa_page_memberships,
+    return _PrimsTSQTokenKvBlockSparseMetadataPlan(
+        q_token_kv_block_sparse_page_indices=q_token_kv_block_sparse_page_indices,
+        q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
         seq_lens=seq_lens,
         qo_indptr=qo_indptr,
         metadata_run=metadata_run,
@@ -1402,8 +1443,8 @@ def _prepare_q_token_kv_block_sparse_attention(
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
     sparse_block_size: int = 4,
-) -> _PrimsTSQSAPlan:
-    """Prepare one graph-stable metadata-plus-attention QSA launch.
+) -> _PrimsTSQTokenKvBlockSparsePlan:
+    """Prepare one graph-stable metadata-plus-attention QToken-KvBlock-Sparse-Attention launch.
 
     Packed Q/output use ``[num_query_tokens, Hq, D]`` and describe Q1/Q2/Q4/Q5
     routes with ``qo_indptr`` and ``max_seq_len_q``. A request's final route
@@ -1411,7 +1452,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     ``[B, Nq, G, Hq, D]`` and omit ``qo_indptr``; ``B * Nq`` becomes the
     internal attention route count through a zero-copy view.
 
-    Frameworks call :meth:`_PrimsTSQSAPlan.run` with current inputs that preserve
+    Frameworks call :meth:`_PrimsTSQTokenKvBlockSparsePlan.run` with current inputs that preserve
     the prepared geometry. The plan owns its dense page-index table, grouped
     membership words, and compact sequence lengths inside ``workspace_buffer``
     and resolves metadata geometry and the PrimTS attention launch only once.
@@ -1466,7 +1507,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         Contiguous CUDA Int32 cumulative route offsets selecting packed-query
         mode.
     max_seq_len_q : int, optional
-        Maximum packed-route length and QSA group size. It is required when
+        Maximum packed-route length and QToken-KvBlock-Sparse-Attention group size. It is required when
         ``qo_indptr`` is supplied.
     sparse_block_size : int
         Logical sparse-block size in tokens. It must be a positive power of
@@ -1474,13 +1515,13 @@ def _prepare_q_token_kv_block_sparse_attention(
 
     Returns
     -------
-    _PrimsTSQSAPlan
+    _PrimsTSQTokenKvBlockSparsePlan
         Reusable prepared metadata-plus-attention plan. Call
-        :meth:`_PrimsTSQSAPlan.run` once before CUDA graph capture.
+        :meth:`_PrimsTSQTokenKvBlockSparsePlan.run` once before CUDA graph capture.
     """
 
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
-    k_cache, v_cache = _validate_qsa_paged_kv_cache(paged_kv_cache)
+    k_cache, v_cache = _validate_q_token_kv_block_sparse_paged_kv_cache(paged_kv_cache)
     if not isinstance(query, torch.Tensor):
         raise TypeError("query must be a torch.Tensor")
     if not isinstance(out, torch.Tensor):
@@ -1490,12 +1531,16 @@ def _prepare_q_token_kv_block_sparse_attention(
     fixed_query_group_size = None
     if use_packed_q:
         if query.ndim != 3:
-            raise ValueError("packed QSA query must have shape [total_q,Hq,D]")
+            raise ValueError(
+                "packed QToken-KvBlock-Sparse-Attention query must have shape [total_q,Hq,D]"
+            )
         if max_seq_len_q is None:
-            raise ValueError("max_seq_len_q is required with QSA qo_indptr")
+            raise ValueError(
+                "max_seq_len_q is required with QToken-KvBlock-Sparse-Attention qo_indptr"
+            )
         group_size = int(max_seq_len_q)
         num_query_tokens = int(query.shape[0])
-        _validate_qsa_qo_indptr_tensor(
+        _validate_q_token_kv_block_sparse_qo_indptr_tensor(
             qo_indptr,
             expected_device=query.device,
         )
@@ -1503,13 +1548,19 @@ def _prepare_q_token_kv_block_sparse_attention(
         attention_out = out
     elif query.ndim == 5:
         if out.shape != query.shape:
-            raise ValueError("fixed QSA output must have the same shape as query")
+            raise ValueError(
+                "fixed QToken-KvBlock-Sparse-Attention output must have the same shape as query"
+            )
         if not query.is_contiguous() or not out.is_contiguous():
-            raise ValueError("fixed QSA query and output must be contiguous")
+            raise ValueError(
+                "fixed QToken-KvBlock-Sparse-Attention query and output must be contiguous"
+            )
         group_size = int(query.shape[2])
         num_query_tokens = int(query.shape[0] * query.shape[1]) * group_size
-        attention_query = _flatten_fixed_qsa_groups(query, group_size)
-        attention_out = _flatten_fixed_qsa_groups(out, group_size)
+        attention_query = _flatten_fixed_q_token_kv_block_sparse_groups(
+            query, group_size
+        )
+        attention_out = _flatten_fixed_q_token_kv_block_sparse_groups(out, group_size)
         fixed_query_group_size = group_size
     else:
         raise ValueError(
@@ -1530,7 +1581,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     if block_indices.shape[0] != num_query_tokens:
         raise ValueError("block_indices must have one row per flattened query token")
 
-    layout = _get_prims_ts_qsa_workspace_layout_from_tensors(
+    layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
         query,
         k_cache,
         block_table,
@@ -1541,7 +1592,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         max_seq_len_q=max_seq_len_q,
         sparse_block_size=sparse_block_size,
     )
-    _validate_qsa_workspace_aliasing(
+    _validate_q_token_kv_block_sparse_workspace_aliasing(
         workspace_buffer,
         query=query,
         k_cache=k_cache,
@@ -1554,13 +1605,13 @@ def _prepare_q_token_kv_block_sparse_attention(
         out=out,
     )
     views = layout.bind(workspace_buffer)
-    metadata_plan = _prepare_prims_ts_qsa_metadata_plan(
+    metadata_plan = _prepare_prims_ts_q_token_kv_block_sparse_metadata_plan(
         block_indices,
         block_table,
         token_to_request,
         query_positions,
-        views.qsa_page_indices,
-        views.qsa_page_memberships,
+        views.q_token_kv_block_sparse_page_indices,
+        views.q_token_kv_block_sparse_page_memberships,
         views.seq_lens,
         group_size=group_size,
         storage_page_size=int(k_cache.shape[2]),
@@ -1579,7 +1630,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         attention_query,
         paged_kv_cache,
         views.attention_workspace_buffer,
-        views.qsa_page_indices,
+        views.q_token_kv_block_sparse_page_indices,
         views.seq_lens,
         layout.max_seq_len,
         out=attention_out,
@@ -1591,9 +1642,11 @@ def _prepare_q_token_kv_block_sparse_attention(
         window_left=-1,
         kv_layout="HND",
         page_size=sparse_block_size,
-        use_qsa_route=True,
+        use_q_token_kv_block_sparse_route=True,
         use_pdl=True,
-        qsa_page_memberships=(views.qsa_page_memberships if group_size > 1 else None),
+        q_token_kv_block_sparse_page_memberships=(
+            views.q_token_kv_block_sparse_page_memberships if group_size > 1 else None
+        ),
     )
     if (
         prepared_attention_out.data_ptr() != attention_out.data_ptr()
@@ -1601,17 +1654,17 @@ def _prepare_q_token_kv_block_sparse_attention(
         or prepared_attention_out.stride() != attention_out.stride()
     ):
         raise RuntimeError("prepared PrimTS output storage changed unexpectedly")
-    return _PrimsTSQSAPlan(
+    return _PrimsTSQTokenKvBlockSparsePlan(
         _metadata_plan=metadata_plan,
         _bmm1_scale=scale_qk,
         _bmm2_scale=scale_v,
         _attention_plan=attention_plan,
-        _query=_describe_qsa_tensor(query),
-        _block_indices=_describe_qsa_tensor(block_indices),
-        _block_table=_describe_qsa_tensor(block_table),
-        _token_to_request=_describe_qsa_tensor(token_to_request),
-        _query_positions=_describe_qsa_tensor(query_positions),
-        _out=_describe_qsa_tensor(out),
+        _query=_describe_q_token_kv_block_sparse_tensor(query),
+        _block_indices=_describe_q_token_kv_block_sparse_tensor(block_indices),
+        _block_table=_describe_q_token_kv_block_sparse_tensor(block_table),
+        _token_to_request=_describe_q_token_kv_block_sparse_tensor(token_to_request),
+        _query_positions=_describe_q_token_kv_block_sparse_tensor(query_positions),
+        _out=_describe_q_token_kv_block_sparse_tensor(out),
         _fixed_query_group_size=fixed_query_group_size,
     )
 
@@ -1699,7 +1752,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         Attention output in the same logical layout as ``q``.
     """
 
-    k_cache, v_cache = _validate_qsa_paged_kv_cache(paged_kv_cache)
+    k_cache, v_cache = _validate_q_token_kv_block_sparse_paged_kv_cache(paged_kv_cache)
     if not isinstance(q, torch.Tensor):
         raise TypeError("q must be a torch.Tensor")
     if not isinstance(indexer_block_ids, torch.Tensor) or indexer_block_ids.ndim != 2:
@@ -1727,7 +1780,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         batch_size = int(qo_indptr.numel()) - 1
         use_packed_q = True
 
-    _validate_qsa_workspace_aliasing(
+    _validate_q_token_kv_block_sparse_workspace_aliasing(
         workspace_buffer,
         query=q,
         k_cache=k_cache,
@@ -1788,9 +1841,9 @@ def _validate_shape_parameters(
         raise ValueError("num_query_tokens must be nonnegative")
     if block_topk <= 0:
         raise ValueError("block_topk must be positive")
-    from .decode import _validate_prims_ts_qsa_group_value
+    from .decode import _validate_prims_ts_q_token_kv_block_sparse_group_value
 
-    _validate_prims_ts_qsa_group_value(group_size)
+    _validate_prims_ts_q_token_kv_block_sparse_group_value(group_size)
 
 
 def _resolve_num_query_groups(
@@ -1804,7 +1857,7 @@ def _resolve_num_query_groups(
         if num_query_tokens % group_size:
             raise ValueError(
                 "num_query_tokens must be divisible by group_size without "
-                "packed QSA qo_indptr"
+                "packed QToken-KvBlock-Sparse-Attention qo_indptr"
             )
         return num_query_tokens // group_size
     if not isinstance(num_query_groups, int) or isinstance(num_query_groups, bool):
@@ -1820,8 +1873,10 @@ def _resolve_num_query_groups(
     return num_query_groups
 
 
-def _validate_qsa_qo_indptr_layout_tensor(qo_indptr: torch.Tensor) -> None:
-    """Validate the packed-Q offsets required to size QSA workspace."""
+def _validate_q_token_kv_block_sparse_qo_indptr_layout_tensor(
+    qo_indptr: torch.Tensor,
+) -> None:
+    """Validate the packed-Q offsets required to size QToken-KvBlock-Sparse-Attention workspace."""
 
     if (
         not isinstance(qo_indptr, torch.Tensor)
@@ -1829,20 +1884,22 @@ def _validate_qsa_qo_indptr_layout_tensor(qo_indptr: torch.Tensor) -> None:
         or qo_indptr.numel() < 2
         or qo_indptr.dtype != torch.int32
     ):
-        raise ValueError("QSA qo_indptr must be a rank-one int32 tensor")
+        raise ValueError(
+            "QToken-KvBlock-Sparse-Attention qo_indptr must be a rank-one int32 tensor"
+        )
 
 
-def _validate_qsa_qo_indptr_tensor(
+def _validate_q_token_kv_block_sparse_qo_indptr_tensor(
     qo_indptr: torch.Tensor,
     *,
     expected_device: torch.device,
 ) -> None:
     """Validate the synchronization-free packed-Q offset tensor contract."""
 
-    _validate_qsa_qo_indptr_layout_tensor(qo_indptr)
+    _validate_q_token_kv_block_sparse_qo_indptr_layout_tensor(qo_indptr)
     if qo_indptr.device != expected_device or not qo_indptr.is_contiguous():
         raise ValueError(
-            "QSA qo_indptr must be a contiguous CUDA int32 tensor on the query device"
+            "QToken-KvBlock-Sparse-Attention qo_indptr must be a contiguous CUDA int32 tensor on the query device"
         )
 
 
@@ -1853,9 +1910,9 @@ def _validate_sparse_block_size(sparse_block_size: int) -> int:
         raise TypeError("sparse_block_size must be an integer")
     if sparse_block_size <= 0 or sparse_block_size & (sparse_block_size - 1):
         raise ValueError("sparse_block_size must be a positive power of two")
-    if sparse_block_size != _QSA_SUPPORTED_SPARSE_BLOCK_SIZE:
+    if sparse_block_size != _Q_TOKEN_KV_BLOCK_SPARSE_SUPPORTED_SPARSE_BLOCK_SIZE:
         raise NotImplementedError(
-            "PrimTS QSA currently supports only sparse_block_size=4"
+            "PrimTS QToken-KvBlock-Sparse-Attention currently supports only sparse_block_size=4"
         )
     return sparse_block_size
 
@@ -1872,7 +1929,7 @@ def _validate_storage_page_size(
         )
 
 
-def _validate_qsa_max_seq_len_kv(
+def _validate_q_token_kv_block_sparse_max_seq_len_kv(
     max_seq_len_kv: int,
     *,
     block_table_token_capacity: Optional[int] = None,
@@ -1883,10 +1940,10 @@ def _validate_qsa_max_seq_len_kv(
         raise TypeError("max_seq_len_kv must be an integer")
     if max_seq_len_kv <= 0:
         raise ValueError("max_seq_len_kv must be positive")
-    if max_seq_len_kv > _QSA_MAX_SEQ_LEN_KV:
+    if max_seq_len_kv > _Q_TOKEN_KV_BLOCK_SPARSE_MAX_SEQ_LEN_KV:
         raise ValueError(
-            "max_seq_len_kv exceeds the current grouped QSA radix-key bound "
-            f"({_QSA_MAX_SEQ_LEN_KV})"
+            "max_seq_len_kv exceeds the current grouped QToken-KvBlock-Sparse-Attention radix-key bound "
+            f"({_Q_TOKEN_KV_BLOCK_SPARSE_MAX_SEQ_LEN_KV})"
         )
     if (
         block_table_token_capacity is not None
@@ -1899,11 +1956,11 @@ def _validate_qsa_max_seq_len_kv(
     return max_seq_len_kv
 
 
-def _align_up_qsa_workspace(value: int) -> int:
+def _align_up_q_token_kv_block_sparse_workspace(value: int) -> int:
     return (
-        (value + _QSA_WORKSPACE_ALIGNMENT - 1)
-        // _QSA_WORKSPACE_ALIGNMENT
-        * _QSA_WORKSPACE_ALIGNMENT
+        (value + _Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT - 1)
+        // _Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT
+        * _Q_TOKEN_KV_BLOCK_SPARSE_WORKSPACE_ALIGNMENT
     )
 
 
@@ -1927,21 +1984,23 @@ def _validate_inputs(
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor")
     if not block_indices.is_cuda:
-        raise ValueError("QSA metadata inputs must be CUDA tensors")
+        raise ValueError(
+            "QToken-KvBlock-Sparse-Attention metadata inputs must be CUDA tensors"
+        )
     if block_indices.ndim != 2 or block_indices.dtype != torch.int32:
         raise ValueError("block_indices must be a rank-two int32 tensor")
     rows, block_topk = block_indices.shape
     _validate_shape_parameters(rows, block_topk, group_size)
-    if block_topk > _QSA_MAX_BLOCK_TOPK:
+    if block_topk > _Q_TOKEN_KV_BLOCK_SPARSE_MAX_BLOCK_TOPK:
         raise NotImplementedError(
-            f"PrimTS QSA currently supports block_topk <= {_QSA_MAX_BLOCK_TOPK}"
+            f"PrimTS QToken-KvBlock-Sparse-Attention currently supports block_topk <= {_Q_TOKEN_KV_BLOCK_SPARSE_MAX_BLOCK_TOPK}"
         )
     _validate_storage_page_size(storage_page_size, sparse_block_size)
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
         raise ValueError("block_table must be a nonempty rank-two int32 tensor")
     if not all(block_table.shape):
         raise ValueError("block_table must be nonempty")
-    _validate_qsa_max_seq_len_kv(
+    _validate_q_token_kv_block_sparse_max_seq_len_kv(
         max_seq_len_kv,
         block_table_token_capacity=block_table.shape[1] * storage_page_size,
     )
@@ -1954,7 +2013,9 @@ def _validate_inputs(
         raise ValueError("query_positions must be int32/int64 with one value per row")
     tensors = (block_table, token_to_request, query_positions)
     if any(tensor.device != block_indices.device for tensor in tensors):
-        raise ValueError("QSA metadata inputs must share one CUDA device")
+        raise ValueError(
+            "QToken-KvBlock-Sparse-Attention metadata inputs must share one CUDA device"
+        )
     if block_indices.stride(1) != 1 or block_table.stride(1) != 1:
         raise ValueError("block_indices and block_table rows must be contiguous")
     if block_table.stride(0) < block_table.shape[1]:
@@ -1962,10 +2023,12 @@ def _validate_inputs(
             "block_table must be a non-overlapping dense row-strided page table"
         )
     if token_to_request.stride(0) != 1 or query_positions.stride(0) != 1:
-        raise ValueError("per-row QSA metadata must be contiguous")
+        raise ValueError(
+            "per-row QToken-KvBlock-Sparse-Attention metadata must be contiguous"
+        )
 
 
-def _validate_qsa_attention_workspace(
+def _validate_q_token_kv_block_sparse_attention_workspace(
     workspace_buffer: torch.Tensor,
     required_bytes: int,
 ) -> None:

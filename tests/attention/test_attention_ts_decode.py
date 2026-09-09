@@ -48,8 +48,8 @@ from flashinfer.attention.prims_ts.decode import (
     _DecodeRuntime,
     _make_decode_workspace_layout,
     _planned_kv_domain_has_unpaired_tail,
-    _validate_prims_ts_qsa_group_layout,
-    _validate_qsa_route_offsets_cpu,
+    _validate_prims_ts_q_token_kv_block_sparse_group_layout,
+    _validate_q_token_kv_block_sparse_route_offsets_cpu,
     _validate_decode_query_head_extent,
     _validate_decode_output_aliasing,
     _validate_decode_policy_kv_tile_size,
@@ -66,8 +66,8 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import
     make_decode_config,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_constants import (
-    QSA_PAGE_MEMBERSHIP_BITS,
-    QSA_PAGE_MEMBERSHIPS_PER_WORD,
+    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
+    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_kernel import (
     _build_decode_gen_schedule,
@@ -80,11 +80,11 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.hel
 )
 from flashinfer.decode import (
     get_prims_ts_batch_decode_workspace_size,
-    make_q_token_kv_block_sparse_qo_indptr as make_prims_ts_qsa_qo_indptr,
+    make_q_token_kv_block_sparse_qo_indptr as make_prims_ts_q_token_kv_block_sparse_qo_indptr,
     prepare_prims_ts_batch_decode_with_kv_cache,
     prims_ts_batch_decode_with_kv_cache,
-    suggest_q_token_kv_block_sparse_group_size as suggest_prims_ts_qsa_group_size,
-    validate_q_token_kv_block_sparse_group_size as validate_prims_ts_qsa_group_size,
+    suggest_q_token_kv_block_sparse_group_size as suggest_prims_ts_q_token_kv_block_sparse_group_size,
+    validate_q_token_kv_block_sparse_group_size as validate_prims_ts_q_token_kv_block_sparse_group_size,
 )
 from flashinfer.utils import is_sm100a_supported
 
@@ -116,7 +116,7 @@ from flashinfer.utils import is_sm100a_supported
         pytest.param([4] * 19 + [0], 79, 24, 2, 4, 4, id="unaligned-padding"),
     ],
 )
-def test_prims_ts_qsa_fixed_group_validation(
+def test_prims_ts_q_token_kv_block_sparse_fixed_group_validation(
     query_lengths: list[int],
     num_query_tokens: int,
     num_qo_heads: int,
@@ -136,19 +136,22 @@ def test_prims_ts_qsa_fixed_group_validation(
     )
     if expected_group_size is None:
         with pytest.raises(ValueError):
-            _validate_prims_ts_qsa_group_layout(*args)
+            _validate_prims_ts_q_token_kv_block_sparse_group_layout(*args)
     else:
-        assert _validate_prims_ts_qsa_group_layout(*args) == expected_group_size
+        assert (
+            _validate_prims_ts_q_token_kv_block_sparse_group_layout(*args)
+            == expected_group_size
+        )
 
 
-def test_prims_ts_qsa_fixed_group_validation_is_public() -> None:
+def test_prims_ts_q_token_kv_block_sparse_fixed_group_validation_is_public() -> None:
     num_query_tokens = 32
     query_start_loc_cpu = torch.tensor(
         [0, num_query_tokens],
         dtype=torch.int32,
     )
     assert (
-        validate_prims_ts_qsa_group_size(
+        validate_prims_ts_q_token_kv_block_sparse_group_size(
             query_start_loc_cpu,
             num_query_tokens,
             12,
@@ -158,7 +161,7 @@ def test_prims_ts_qsa_fixed_group_validation_is_public() -> None:
         == 4
     )
     assert (
-        validate_prims_ts_qsa_group_size(
+        validate_prims_ts_q_token_kv_block_sparse_group_size(
             None,
             num_query_tokens,
             12,
@@ -168,7 +171,7 @@ def test_prims_ts_qsa_fixed_group_validation_is_public() -> None:
         == 1
     )
     with pytest.raises(ValueError, match="query_start_loc"):
-        validate_prims_ts_qsa_group_size(
+        validate_prims_ts_q_token_kv_block_sparse_group_size(
             None,
             num_query_tokens,
             12,
@@ -203,7 +206,7 @@ def test_prims_ts_qsa_fixed_group_validation_is_public() -> None:
         (8, 5, 2051, 16, 1, 152, 4),
     ),
 )
-def test_suggest_prims_ts_qsa_group_size(
+def test_suggest_prims_ts_q_token_kv_block_sparse_group_size(
     batch_size: int,
     seq_len_q: int,
     selected_seq_len_kv: int,
@@ -213,7 +216,7 @@ def test_suggest_prims_ts_qsa_group_size(
     expected_group_size: int,
 ) -> None:
     assert (
-        suggest_prims_ts_qsa_group_size(
+        suggest_prims_ts_q_token_kv_block_sparse_group_size(
             batch_size,
             seq_len_q,
             selected_seq_len_kv,
@@ -234,7 +237,7 @@ def test_suggest_prims_ts_qsa_group_size(
         ("multi_processor_count", 0),
     ),
 )
-def test_suggest_prims_ts_qsa_group_size_rejects_invalid_extent(
+def test_suggest_prims_ts_q_token_kv_block_sparse_group_size_rejects_invalid_extent(
     argument: str,
     value: object,
 ) -> None:
@@ -248,7 +251,7 @@ def test_suggest_prims_ts_qsa_group_size_rejects_invalid_extent(
     }
     arguments[argument] = value
     with pytest.raises((TypeError, ValueError)):
-        suggest_prims_ts_qsa_group_size(**arguments)
+        suggest_prims_ts_q_token_kv_block_sparse_group_size(**arguments)
 
 
 @pytest.mark.parametrize(
@@ -262,13 +265,13 @@ def test_suggest_prims_ts_qsa_group_size_rejects_invalid_extent(
         ([0, 2, 3], 3, 1, [0, 1, 2, 3]),
     ],
 )
-def test_make_prims_ts_qsa_qo_indptr_keeps_request_boundaries(
+def test_make_prims_ts_q_token_kv_block_sparse_qo_indptr_keeps_request_boundaries(
     query_starts: list[int],
     num_query_tokens: int,
     group_size: int,
     expected: list[int],
 ) -> None:
-    actual = make_prims_ts_qsa_qo_indptr(
+    actual = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
         torch.tensor(query_starts, dtype=torch.int32),
         num_query_tokens,
         group_size=group_size,
@@ -285,13 +288,13 @@ def test_make_prims_ts_qsa_qo_indptr_keeps_request_boundaries(
         ([0, 5], 5, 4),
     ],
 )
-def test_qsa_cpu_route_offsets_must_be_safe_before_upload(
+def test_q_token_kv_block_sparse_cpu_route_offsets_must_be_safe_before_upload(
     route_offsets: list[int],
     num_query_tokens: int,
     group_size: int,
 ) -> None:
     with pytest.raises(ValueError):
-        _validate_qsa_route_offsets_cpu(
+        _validate_q_token_kv_block_sparse_route_offsets_cpu(
             route_offsets,
             num_query_tokens=num_query_tokens,
             group_size=group_size,
@@ -322,7 +325,7 @@ _REQUIRES_BLACKWELL_PRIMTS_GPU = pytest.mark.skipif(
     reason="PrimTS grouped decode requires an SM100a or SM103a GPU",
 )
 
-_QSA_TP_HEAD_GEOMETRIES = (
+_Q_TOKEN_KV_BLOCK_SPARSE_TP_HEAD_GEOMETRIES = (
     (1, 24, 2),
     (2, 12, 1),
     (4, 6, 1),
@@ -437,13 +440,13 @@ def _dense_block_table_from_csr(
     return block_table
 
 
-def _packed_qsa_page_memberships_from_csr(
+def _packed_q_token_kv_block_sparse_page_memberships_from_csr(
     paged_kv_indptr: torch.Tensor,
     page_memberships: torch.Tensor,
     *,
     min_num_pages: int = 0,
 ) -> torch.Tensor:
-    """Pack separate per-page membership bytes into the dense QSA ABI."""
+    """Pack separate per-page membership bytes into the dense QToken-KvBlock-Sparse-Attention ABI."""
 
     offsets = [int(value) for value in paged_kv_indptr.cpu().tolist()]
     offset_pairs = tuple(zip(offsets[:-1], offsets[1:], strict=True))
@@ -452,16 +455,18 @@ def _packed_qsa_page_memberships_from_csr(
     packed = page_memberships.new_zeros(
         (
             len(row_lengths),
-            (max_num_pages + QSA_PAGE_MEMBERSHIPS_PER_WORD - 1)
-            // QSA_PAGE_MEMBERSHIPS_PER_WORD,
+            (max_num_pages + Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD - 1)
+            // Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD,
         )
     )
     for row, (begin, end) in enumerate(offset_pairs):
         row_memberships = page_memberships[begin:end]
-        for byte_idx in range(QSA_PAGE_MEMBERSHIPS_PER_WORD):
-            byte_values = row_memberships[byte_idx::QSA_PAGE_MEMBERSHIPS_PER_WORD]
+        for byte_idx in range(Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD):
+            byte_values = row_memberships[
+                byte_idx::Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIPS_PER_WORD
+            ]
             packed[row, : byte_values.numel()] |= byte_values << (
-                byte_idx * QSA_PAGE_MEMBERSHIP_BITS
+                byte_idx * Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
             )
     return packed
 
@@ -1820,7 +1825,7 @@ def test_attention_ts_decode_alias_guard_covers_every_live_allocation() -> None:
         "seq_lens",
         "qo_indptr",
         "block_table",
-        "qsa_page_memberships",
+        "q_token_kv_block_sparse_page_memberships",
         "workspace_buffer",
     ):
         runtime = _decode_runtime_for_aliasing()
@@ -1828,7 +1833,7 @@ def test_attention_ts_decode_alias_guard_covers_every_live_allocation() -> None:
             "seq_lens": torch.empty(8),
             "qo_indptr": torch.empty(8),
             "block_table": torch.empty(8),
-            "qsa_page_memberships": torch.empty(8),
+            "q_token_kv_block_sparse_page_memberships": torch.empty(8),
             "workspace_buffer": torch.empty(8),
         }
         if aliased_name in ("k_cache", "v_cache"):
@@ -2494,17 +2499,17 @@ def test_attention_ts_decode_page_offsets_cross_window_schedule_is_safe(
 
 @pytest.mark.parametrize(
     ("tp_size", "num_qo_heads", "num_kv_heads"),
-    _QSA_TP_HEAD_GEOMETRIES,
+    _Q_TOKEN_KV_BLOCK_SPARSE_TP_HEAD_GEOMETRIES,
     ids=("tp1", "tp2", "tp4", "tp6", "tp8", "tp12", "tp24"),
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
-def test_attention_ts_decode_page4_qsa_causal_all_tp_geometries(
+def test_attention_ts_decode_page4_q_token_kv_block_sparse_causal_all_tp_geometries(
     tp_size: int,
     num_qo_heads: int,
     num_kv_heads: int,
 ) -> None:
-    """Cover every valid QSA TP shape and every compacted tail length."""
+    """Cover every valid QToken-KvBlock-Sparse-Attention TP shape and every compacted tail length."""
 
     assert num_qo_heads == 24 // tp_size
     assert num_kv_heads == max(1, 2 // tp_size)
@@ -2529,7 +2534,7 @@ def test_attention_ts_decode_page4_qsa_causal_all_tp_geometries(
 @pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
 def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> None:
-    """Prepared QSA-style launches reuse static proof with dynamic Q storage."""
+    """Prepared QToken-KvBlock-Sparse-Attention-style launches reuse static proof with dynamic Q storage."""
 
     storage_page_size = 16
     case = _make_decode_case(
@@ -2640,7 +2645,7 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
 )
 @pytest.mark.parametrize(
     ("tp_size", "num_qo_heads", "num_kv_heads"),
-    _QSA_TP_HEAD_GEOMETRIES,
+    _Q_TOKEN_KV_BLOCK_SPARSE_TP_HEAD_GEOMETRIES,
     ids=("tp1", "tp2", "tp4", "tp6", "tp8", "tp12", "tp24"),
 )
 @pytest.mark.arch_blackwell
@@ -2752,7 +2757,7 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
         headdim=256,
         args={
             "use_keeps_mma_ab": True,
-            "use_qsa_route": True,
+            "use_q_token_kv_block_sparse_route": True,
             "groups_tokens_heads_q": True,
             "tile_size_q": 64,
             "tile_size_kv": 128,
@@ -2846,9 +2851,11 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
         case.paged_kv_indptr,
         case.paged_kv_indices,
     )
-    qsa_page_memberships = _packed_qsa_page_memberships_from_csr(
-        case.paged_kv_indptr,
-        page_memberships,
+    q_token_kv_block_sparse_page_memberships = (
+        _packed_q_token_kv_block_sparse_page_memberships_from_csr(
+            case.paged_kv_indptr,
+            page_memberships,
+        )
     )
     workspace = torch.zeros(workspace_size, dtype=torch.uint8, device="cuda")
     try:
@@ -2868,8 +2875,8 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
             window_left=-1,
             kv_layout="HND",
             page_size=4,
-            qsa_page_memberships=qsa_page_memberships,
-            use_qsa_route=True,
+            q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
+            use_q_token_kv_block_sparse_route=True,
         )
         result = plan.run(
             case.q,
@@ -2903,7 +2910,7 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
     kv_lens = tuple(kv_tokens - 32 * batch_idx for batch_idx in range(batch_size))
     config_args = {
         "use_keeps_mma_ab": True,
-        "use_qsa_route": True,
+        "use_q_token_kv_block_sparse_route": True,
         "groups_tokens_heads_q": True,
         "tile_size_q": 64,
         "tile_size_kv": 128,
@@ -3003,7 +3010,7 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
     kernel_page_memberships = memberships
     kernel_indptr = case.paged_kv_indptr
     if kv_tokens == 240 and batch_size == 1:
-        # Model-facing grouped QSA uses a fixed-capacity dense row. Make its
+        # Model-facing grouped QToken-KvBlock-Sparse-Attention uses a fixed-capacity dense row. Make its
         # padding maximally hostile by pointing every unused slot at the
         # high-logit membership-full page; seq_lens, not row capacity, must
         # keep those entries inert.
@@ -3043,9 +3050,11 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
     )
     output = torch.empty_like(case.q)
     block_table = _dense_block_table_from_csr(kernel_indptr, kernel_page_indices)
-    qsa_page_memberships = _packed_qsa_page_memberships_from_csr(
-        kernel_indptr,
-        kernel_page_memberships,
+    q_token_kv_block_sparse_page_memberships = (
+        _packed_q_token_kv_block_sparse_page_memberships_from_csr(
+            kernel_indptr,
+            kernel_page_memberships,
+        )
     )
     workspace = torch.zeros(workspace_size, dtype=torch.uint8, device="cuda")
     try:
@@ -3065,8 +3074,8 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
             window_left=-1,
             kv_layout="HND",
             page_size=4,
-            qsa_page_memberships=qsa_page_memberships,
-            use_qsa_route=True,
+            q_token_kv_block_sparse_page_memberships=q_token_kv_block_sparse_page_memberships,
+            use_q_token_kv_block_sparse_route=True,
         )
         plan.run(
             case.q,
@@ -4485,7 +4494,7 @@ def test_attention_ts_decode_public_sq1_head_band_stays_kv128(monkeypatch) -> No
     assert public_spec.config.tile_size_kv == 128
 
 
-def _resolve_qsa_policy_for_test(
+def _resolve_q_token_kv_block_sparse_policy_for_test(
     monkeypatch,
     *,
     batch_size: int = 16,
@@ -4501,7 +4510,7 @@ def _resolve_qsa_policy_for_test(
     mask_type: str = "causal",
     window_left: int = -1,
 ):
-    """Resolve QSA policy without requiring a CUDA device in host tests."""
+    """Resolve QToken-KvBlock-Sparse-Attention policy without requiring a CUDA device in host tests."""
 
     from contextlib import nullcontext
 
@@ -4682,7 +4691,7 @@ def _resolve_qsa_policy_for_test(
         ),
     ),
 )
-def test_attention_ts_decode_qsa_policy_is_structural(
+def test_attention_ts_decode_q_token_kv_block_sparse_policy_is_structural(
     monkeypatch,
     batch_size: int,
     num_qo_heads: int,
@@ -4696,9 +4705,9 @@ def test_attention_ts_decode_qsa_policy_is_structural(
     expected_keeps: bool,
     expected_splits: int,
 ) -> None:
-    """Cover the complete fixed-group QSA policy without shape thresholds."""
+    """Cover the complete fixed-group QToken-KvBlock-Sparse-Attention policy without shape thresholds."""
 
-    spec = _resolve_qsa_policy_for_test(
+    spec = _resolve_q_token_kv_block_sparse_policy_for_test(
         monkeypatch,
         batch_size=batch_size,
         num_qo_heads=num_qo_heads,
@@ -4713,7 +4722,7 @@ def test_attention_ts_decode_qsa_policy_is_structural(
     heads_q_per_kv = num_qo_heads // num_kv_heads
     group_rows = heads_q_per_kv * group_size
 
-    assert cfg.use_qsa_route
+    assert cfg.use_q_token_kv_block_sparse_route
     assert cfg.groups_tokens_heads_q
     assert cfg.tile_size_q == expected_tile_size_q
     structural_tile_size_q = next(
@@ -4800,18 +4809,18 @@ def test_attention_ts_decode_qsa_policy_is_structural(
         ),
     ),
 )
-def test_attention_ts_decode_qsa_rejects_unsupported_contracts(
+def test_attention_ts_decode_q_token_kv_block_sparse_rejects_unsupported_contracts(
     monkeypatch,
     overrides: dict[str, object],
     message: str,
 ) -> None:
-    """Reject QSA inputs outside the deliberately narrow public contract."""
+    """Reject QToken-KvBlock-Sparse-Attention inputs outside the deliberately narrow public contract."""
 
     with pytest.raises(ValueError, match=message):
-        _resolve_qsa_policy_for_test(monkeypatch, **overrides)
+        _resolve_q_token_kv_block_sparse_policy_for_test(monkeypatch, **overrides)
 
 
-def test_attention_ts_decode_fixed_storage_subpages_do_not_infer_qsa(
+def test_attention_ts_decode_fixed_storage_subpages_do_not_infer_q_token_kv_block_sparse(
     monkeypatch,
 ) -> None:
     """Keep generic fixed multi-Q tables on the storage-subpage route."""
@@ -4858,9 +4867,9 @@ def test_attention_ts_decode_fixed_storage_subpages_do_not_infer_qsa(
 
     assert spec.config.has_storage_subpages
     assert spec.config.uses_scattered_page_route
-    assert not spec.config.use_qsa_route
-    assert not spec.config.uses_qsa_sparse_page_route
-    assert not spec.config.uses_qsa_page_membership
+    assert not spec.config.use_q_token_kv_block_sparse_route
+    assert not spec.config.uses_q_token_kv_block_sparse_page_route
+    assert not spec.config.uses_q_token_kv_block_sparse_page_membership
 
 
 def test_attention_ts_decode_public_head_band_does_not_reduce_kv_fanout(

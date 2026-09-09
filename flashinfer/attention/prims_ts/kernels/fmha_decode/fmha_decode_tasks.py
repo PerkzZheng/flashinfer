@@ -327,8 +327,8 @@ def _can_hold_native_page_window(
         return False
     pages_per_tile = cfg.tile_size_kv // cfg.num_tokens_per_page
     if cfg.uses_scattered_page_route:
-        # The page-offset resource gives every QSA route one stage sized for
-        # its complete instruction-aligned local span. Holding that stage lets
+        # Each sparse route gets a page-offset stage sized for its complete
+        # instruction-aligned local span. Holding that stage lets
         # K and V reuse the same dense-row locators, including -1 padding for
         # a short or odd tail. This applies to direct and persistent kernels as
         # well as split-KV: each work tile stages its own slice of that row.
@@ -1210,7 +1210,7 @@ def create_load_task(
         if hold_page_window:
             # The native K/V caches share one page table. Keep its single
             # consumer stage live across every K/V and head-dimension load
-            # owned by this CTA work tile. QSA sizes it for the full local
+            # owned by this CTA work tile. Sparse routes size it for the full local
             # span; other native split routes retain the aligned 32-ID window.
             if cfg.num_head_dim_stages_kv > 1 and not cfg.uses_scattered_page_route:
                 smem_page_offsets.wait()

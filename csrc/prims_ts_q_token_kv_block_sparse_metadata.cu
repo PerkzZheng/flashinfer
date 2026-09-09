@@ -15,20 +15,20 @@
  */
 
 #include <cstdint>
-#include <flashinfer/attention/prims_ts/qsa_metadata.cuh>
+#include <flashinfer/attention/prims_ts/q_token_kv_block_sparse_metadata.cuh>
 #include <limits>
 
 #include "tvm_ffi_utils.h"
 
 namespace {
 
-using flashinfer::attention::prims_ts::kQSAMaxBlockTopK;
-using flashinfer::attention::prims_ts::kQSAMembershipsPerWord;
-using flashinfer::attention::prims_ts::kQSASparseBlockSize;
-using flashinfer::attention::prims_ts::LaunchQSATouchedMetadata;
-using flashinfer::attention::prims_ts::QSATouchedMetadataParams;
+using flashinfer::attention::prims_ts::kQTokenKvBlockSparseMaxBlockTopK;
+using flashinfer::attention::prims_ts::kQTokenKvBlockSparseMembershipsPerWord;
+using flashinfer::attention::prims_ts::kQTokenKvBlockSparseSparseBlockSize;
+using flashinfer::attention::prims_ts::LaunchQTokenKvBlockSparseTouchedMetadata;
+using flashinfer::attention::prims_ts::QTokenKvBlockSparseTouchedMetadataParams;
 
-struct QSAMetadataGeometry {
+struct QTokenKvBlockSparseMetadataGeometry {
   int32_t rows;
   int32_t groups;
   int32_t num_requests;
@@ -64,17 +64,18 @@ int32_t BitWidth(uint32_t value) {
 }
 
 template <bool PackedQuery>
-QSAMetadataGeometry ValidateInputs(TensorView block_indices, TensorView block_table,
-                                   TensorView token_to_request, TensorView query_positions,
-                                   const TensorView* qo_indptr, TensorView qsa_page_indices,
-                                   TensorView qsa_page_memberships, TensorView seq_lens,
-                                   int64_t group_size, int64_t storage_page_size,
-                                   int64_t sparse_block_size, int64_t max_seq_len_kv) {
+QTokenKvBlockSparseMetadataGeometry ValidateInputs(
+    TensorView block_indices, TensorView block_table, TensorView token_to_request,
+    TensorView query_positions, const TensorView* qo_indptr,
+    TensorView q_token_kv_block_sparse_page_indices,
+    TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
+    int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv) {
   CheckInt32CUDA(block_indices, "block_indices");
   CheckInt32CUDA(block_table, "block_table");
   CheckInt32CUDA(token_to_request, "token_to_request");
-  CheckInt32CUDA(qsa_page_indices, "qsa_page_indices");
-  CheckInt32CUDA(qsa_page_memberships, "qsa_page_memberships");
+  CheckInt32CUDA(q_token_kv_block_sparse_page_indices, "q_token_kv_block_sparse_page_indices");
+  CheckInt32CUDA(q_token_kv_block_sparse_page_memberships,
+                 "q_token_kv_block_sparse_page_memberships");
   CheckInt32CUDA(seq_lens, "seq_lens");
   TVM_FFI_ICHECK_EQ(query_positions.device().device_type, kDLCUDA)
       << "query_positions must be a CUDA tensor";
@@ -85,19 +86,23 @@ QSAMetadataGeometry ValidateInputs(TensorView block_indices, TensorView block_ta
   CheckSameDevice(block_indices, block_table, "block_table");
   CheckSameDevice(block_indices, token_to_request, "token_to_request");
   CheckSameDevice(block_indices, query_positions, "query_positions");
-  CheckSameDevice(block_indices, qsa_page_indices, "qsa_page_indices");
-  CheckSameDevice(block_indices, qsa_page_memberships, "qsa_page_memberships");
+  CheckSameDevice(block_indices, q_token_kv_block_sparse_page_indices,
+                  "q_token_kv_block_sparse_page_indices");
+  CheckSameDevice(block_indices, q_token_kv_block_sparse_page_memberships,
+                  "q_token_kv_block_sparse_page_memberships");
   CheckSameDevice(block_indices, seq_lens, "seq_lens");
   if constexpr (PackedQuery) {
-    TVM_FFI_ICHECK(qo_indptr != nullptr) << "packed QSA requires qo_indptr";
+    TVM_FFI_ICHECK(qo_indptr != nullptr)
+        << "packed QToken-KvBlock-Sparse-Attention requires qo_indptr";
     CheckInt32CUDA(*qo_indptr, "qo_indptr");
     CheckSameDevice(block_indices, *qo_indptr, "qo_indptr");
   }
 
   TVM_FFI_ICHECK(group_size == 1 || group_size == 2 || group_size == 4 || group_size == 5)
       << "group_size must be 1, 2, 4, or 5";
-  TVM_FFI_ICHECK_EQ(sparse_block_size, kQSASparseBlockSize)
-      << "the touched-ID QSA metadata kernel currently supports sparse_block_size=4";
+  TVM_FFI_ICHECK_EQ(sparse_block_size, kQTokenKvBlockSparseSparseBlockSize)
+      << "the touched-ID QToken-KvBlock-Sparse-Attention metadata kernel currently supports "
+         "sparse_block_size=4";
   TVM_FFI_ICHECK(storage_page_size >= sparse_block_size &&
                  storage_page_size % sparse_block_size == 0 &&
                  storage_page_size <= std::numeric_limits<int32_t>::max())
@@ -111,7 +116,8 @@ QSAMetadataGeometry ValidateInputs(TensorView block_indices, TensorView block_ta
   TVM_FFI_ICHECK(block_indices.size(0) >= 0 &&
                  block_indices.size(0) <= std::numeric_limits<int32_t>::max())
       << "block_indices row count must fit int32";
-  TVM_FFI_ICHECK(block_indices.size(1) > 0 && block_indices.size(1) <= kQSAMaxBlockTopK)
+  TVM_FFI_ICHECK(block_indices.size(1) > 0 &&
+                 block_indices.size(1) <= kQTokenKvBlockSparseMaxBlockTopK)
       << "block_indices topk must be in [1, 512]";
   TVM_FFI_ICHECK_EQ(block_indices.stride(1), 1) << "block_indices rows must be contiguous";
 
@@ -145,31 +151,39 @@ QSAMetadataGeometry ValidateInputs(TensorView block_indices, TensorView block_ta
     TVM_FFI_ICHECK_EQ(qo_indptr->ndim(), 1) << "qo_indptr must be rank one";
     TVM_FFI_ICHECK_EQ(qo_indptr->size(0), groups + 1) << "qo_indptr must have groups + 1 entries";
     TVM_FFI_ICHECK(qo_indptr->IsContiguous()) << "qo_indptr must be contiguous";
-    TVM_FFI_ICHECK(groups > 0 && rows > 0) << "packed QSA requires at least one nonempty route";
+    TVM_FFI_ICHECK(groups > 0 && rows > 0)
+        << "packed QToken-KvBlock-Sparse-Attention requires at least one nonempty route";
   } else {
-    TVM_FFI_ICHECK_EQ(rows, groups * group_size) << "fixed QSA rows must equal groups * group_size";
+    TVM_FFI_ICHECK_EQ(rows, groups * group_size)
+        << "fixed QToken-KvBlock-Sparse-Attention rows must equal groups * group_size";
   }
   const int64_t page_capacity = group_size * (block_topk + 1);
   const int64_t membership_words =
-      group_size == 1 ? 0 : (page_capacity + kQSAMembershipsPerWord - 1) / kQSAMembershipsPerWord;
+      group_size == 1 ? 0
+                      : (page_capacity + kQTokenKvBlockSparseMembershipsPerWord - 1) /
+                            kQTokenKvBlockSparseMembershipsPerWord;
   TVM_FFI_ICHECK(page_capacity <= std::numeric_limits<int32_t>::max())
-      << "QSA page capacity must fit int32";
-  TVM_FFI_ICHECK_EQ(qsa_page_indices.ndim(), 2) << "qsa_page_indices must be rank two";
-  TVM_FFI_ICHECK_EQ(qsa_page_indices.size(0), groups) << "qsa_page_indices group count mismatch";
-  TVM_FFI_ICHECK_EQ(qsa_page_indices.size(1), page_capacity)
-      << "qsa_page_indices width must be group_size * (topk + 1)";
-  TVM_FFI_ICHECK(qsa_page_indices.IsContiguous()) << "qsa_page_indices must be contiguous";
-  TVM_FFI_ICHECK_EQ(qsa_page_memberships.ndim(), 2) << "qsa_page_memberships must be rank two";
-  TVM_FFI_ICHECK_EQ(qsa_page_memberships.size(0), groups)
-      << "qsa_page_memberships group count mismatch";
-  TVM_FFI_ICHECK_EQ(qsa_page_memberships.size(1), membership_words)
-      << "qsa_page_memberships must pack four membership bytes per int32 word";
+      << "QToken-KvBlock-Sparse-Attention page capacity must fit int32";
+  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_indices.ndim(), 2)
+      << "q_token_kv_block_sparse_page_indices must be rank two";
+  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_indices.size(0), groups)
+      << "q_token_kv_block_sparse_page_indices group count mismatch";
+  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_indices.size(1), page_capacity)
+      << "q_token_kv_block_sparse_page_indices width must be group_size * (topk + 1)";
+  TVM_FFI_ICHECK(q_token_kv_block_sparse_page_indices.IsContiguous())
+      << "q_token_kv_block_sparse_page_indices must be contiguous";
+  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_memberships.ndim(), 2)
+      << "q_token_kv_block_sparse_page_memberships must be rank two";
+  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_memberships.size(0), groups)
+      << "q_token_kv_block_sparse_page_memberships group count mismatch";
+  TVM_FFI_ICHECK_EQ(q_token_kv_block_sparse_page_memberships.size(1), membership_words)
+      << "q_token_kv_block_sparse_page_memberships must pack four membership bytes per int32 word";
   // DLPack does not require meaningful strides for a zero-element tensor, and
   // some FFI conversions therefore report [groups, 0] as non-contiguous. Q1
   // deliberately uses that shape because the direct route has no membership
   // table; no kernel dereferences its pointer.
-  TVM_FFI_ICHECK(membership_words == 0 || qsa_page_memberships.IsContiguous())
-      << "qsa_page_memberships must be contiguous";
+  TVM_FFI_ICHECK(membership_words == 0 || q_token_kv_block_sparse_page_memberships.IsContiguous())
+      << "q_token_kv_block_sparse_page_memberships must be contiguous";
 
   const int64_t subpages_per_storage_page = storage_page_size / sparse_block_size;
   const int64_t addressable_model_blocks = block_table.size(1) * subpages_per_storage_page;
@@ -196,17 +210,19 @@ QSAMetadataGeometry ValidateInputs(TensorView block_indices, TensorView block_ta
 
 template <typename PositionType, bool PackedQuery>
 void Launch(TensorView block_indices, TensorView block_table, TensorView token_to_request,
-            TensorView query_positions, const TensorView* qo_indptr, TensorView qsa_page_indices,
-            TensorView qsa_page_memberships, TensorView seq_lens,
-            const QSAMetadataGeometry& geometry, int32_t group_size, bool release_pdl) {
-  QSATouchedMetadataParams<PositionType> params{
+            TensorView query_positions, const TensorView* qo_indptr,
+            TensorView q_token_kv_block_sparse_page_indices,
+            TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens,
+            const QTokenKvBlockSparseMetadataGeometry& geometry, int32_t group_size,
+            bool release_pdl) {
+  QTokenKvBlockSparseTouchedMetadataParams<PositionType> params{
       static_cast<const int32_t*>(block_indices.data_ptr()),
       static_cast<const int32_t*>(block_table.data_ptr()),
       static_cast<const int32_t*>(token_to_request.data_ptr()),
       static_cast<const PositionType*>(query_positions.data_ptr()),
       PackedQuery ? static_cast<const int32_t*>(qo_indptr->data_ptr()) : nullptr,
-      static_cast<int32_t*>(qsa_page_indices.data_ptr()),
-      static_cast<int32_t*>(qsa_page_memberships.data_ptr()),
+      static_cast<int32_t*>(q_token_kv_block_sparse_page_indices.data_ptr()),
+      static_cast<int32_t*>(q_token_kv_block_sparse_page_memberships.data_ptr()),
       static_cast<int32_t*>(seq_lens.data_ptr()),
       block_indices.stride(0),
       block_indices.stride(1),
@@ -224,60 +240,66 @@ void Launch(TensorView block_indices, TensorView block_table, TensorView token_t
       geometry.model_radix_end_bit,
       flashinfer::uint_fastdiv(static_cast<uint32_t>(geometry.block_topk + 1)),
       flashinfer::uint_fastdiv(
-          static_cast<uint32_t>(geometry.storage_page_size / kQSASparseBlockSize)),
+          static_cast<uint32_t>(geometry.storage_page_size / kQTokenKvBlockSparseSparseBlockSize)),
       release_pdl};
 
   ffi::CUDADeviceGuard device_guard(block_indices.device().device_id);
   const cudaStream_t stream = get_stream(block_indices.device());
-  const cudaError_t status =
-      LaunchQSATouchedMetadata<PositionType, PackedQuery>(params, group_size, stream);
+  const cudaError_t status = LaunchQTokenKvBlockSparseTouchedMetadata<PositionType, PackedQuery>(
+      params, group_size, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "PrimTS QSA metadata launch failed: " << cudaGetErrorString(status);
+      << "PrimTS QToken-KvBlock-Sparse-Attention metadata launch failed: "
+      << cudaGetErrorString(status);
 }
 
 template <bool PackedQuery>
 void Run(TensorView block_indices, TensorView block_table, TensorView token_to_request,
-         TensorView query_positions, const TensorView* qo_indptr, TensorView qsa_page_indices,
-         TensorView qsa_page_memberships, TensorView seq_lens, int64_t group_size,
-         int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv,
-         bool release_pdl) {
-  const QSAMetadataGeometry geometry =
-      ValidateInputs<PackedQuery>(block_indices, block_table, token_to_request, query_positions,
-                                  qo_indptr, qsa_page_indices, qsa_page_memberships, seq_lens,
-                                  group_size, storage_page_size, sparse_block_size, max_seq_len_kv);
+         TensorView query_positions, const TensorView* qo_indptr,
+         TensorView q_token_kv_block_sparse_page_indices,
+         TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens,
+         int64_t group_size, int64_t storage_page_size, int64_t sparse_block_size,
+         int64_t max_seq_len_kv, bool release_pdl) {
+  const QTokenKvBlockSparseMetadataGeometry geometry = ValidateInputs<PackedQuery>(
+      block_indices, block_table, token_to_request, query_positions, qo_indptr,
+      q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens,
+      group_size, storage_page_size, sparse_block_size, max_seq_len_kv);
 
   if (encode_dlpack_dtype(query_positions.dtype()) == int32_code) {
     Launch<int32_t, PackedQuery>(block_indices, block_table, token_to_request, query_positions,
-                                 qo_indptr, qsa_page_indices, qsa_page_memberships, seq_lens,
-                                 geometry, static_cast<int32_t>(group_size), release_pdl);
+                                 qo_indptr, q_token_kv_block_sparse_page_indices,
+                                 q_token_kv_block_sparse_page_memberships, seq_lens, geometry,
+                                 static_cast<int32_t>(group_size), release_pdl);
   } else {
     Launch<int64_t, PackedQuery>(block_indices, block_table, token_to_request, query_positions,
-                                 qo_indptr, qsa_page_indices, qsa_page_memberships, seq_lens,
-                                 geometry, static_cast<int32_t>(group_size), release_pdl);
+                                 qo_indptr, q_token_kv_block_sparse_page_indices,
+                                 q_token_kv_block_sparse_page_memberships, seq_lens, geometry,
+                                 static_cast<int32_t>(group_size), release_pdl);
   }
 }
 
 }  // namespace
 
-void PrimsTSQSAMetadataRunFixed(TensorView block_indices, TensorView block_table,
-                                TensorView token_to_request, TensorView query_positions,
-                                TensorView qsa_page_indices, TensorView qsa_page_memberships,
-                                TensorView seq_lens, int64_t group_size, int64_t storage_page_size,
-                                int64_t sparse_block_size, int64_t max_seq_len_kv,
-                                bool release_pdl) {
+void PrimsTSQTokenKvBlockSparseMetadataRunFixed(
+    TensorView block_indices, TensorView block_table, TensorView token_to_request,
+    TensorView query_positions, TensorView q_token_kv_block_sparse_page_indices,
+    TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
+    int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv,
+    bool release_pdl) {
   Run<false>(block_indices, block_table, token_to_request, query_positions, nullptr,
-             qsa_page_indices, qsa_page_memberships, seq_lens, group_size, storage_page_size,
-             sparse_block_size, max_seq_len_kv, release_pdl);
+             q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships,
+             seq_lens, group_size, storage_page_size, sparse_block_size, max_seq_len_kv,
+             release_pdl);
 }
 
-void PrimsTSQSAMetadataRunPacked(TensorView block_indices, TensorView block_table,
-                                 TensorView token_to_request, TensorView query_positions,
-                                 TensorView qo_indptr, TensorView qsa_page_indices,
-                                 TensorView qsa_page_memberships, TensorView seq_lens,
-                                 int64_t group_size, int64_t storage_page_size,
-                                 int64_t sparse_block_size, int64_t max_seq_len_kv,
-                                 bool release_pdl) {
+void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
+    TensorView block_indices, TensorView block_table, TensorView token_to_request,
+    TensorView query_positions, TensorView qo_indptr,
+    TensorView q_token_kv_block_sparse_page_indices,
+    TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
+    int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv,
+    bool release_pdl) {
   Run<true>(block_indices, block_table, token_to_request, query_positions, &qo_indptr,
-            qsa_page_indices, qsa_page_memberships, seq_lens, group_size, storage_page_size,
-            sparse_block_size, max_seq_len_kv, release_pdl);
+            q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships,
+            seq_lens, group_size, storage_page_size, sparse_block_size, max_seq_len_kv,
+            release_pdl);
 }

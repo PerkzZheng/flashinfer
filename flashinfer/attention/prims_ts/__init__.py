@@ -43,7 +43,7 @@ from .mla_decode import (
     get_prims_ts_batch_decode_mla_workspace_size,
     prims_ts_batch_decode_with_kv_cache_mla,
 )
-from .qsa_metadata import (
+from .q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
     get_q_token_kv_block_sparse_workspace_size,
     q_token_kv_block_sparse_attention_with_paged_kv_cache,

@@ -55,8 +55,8 @@ from .fmha_decode_constants import (
     PARALLEL_REDUCTION_THREADS_PER_CTA,
     PARTIAL_O_ELEMENT_BYTES,
     PARTIAL_STATS_VALUES_PER_ROW,
-    QSA_HELD_LOCATOR_MAX_TILES,
-    QSA_PAGE_MEMBERSHIP_BITS,
+    Q_TOKEN_KV_BLOCK_SPARSE_HELD_LOCATOR_MAX_TILES,
+    Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS,
     Q_REPETITION_GROUP_HEADS,
     Q_ROW_ALIGNMENT_BYTES,
     REDUCTION_BYTES_PER_SLICE,
@@ -104,10 +104,10 @@ _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
     (Float16, Float16, Float16, 256, 128, 1, 1),
 }
 
-# QSA route unions use a Q64/KV128 profile that stages one D128 head band at a
-# time.  The recipe is independent of query group size; route membership and Q
+# Sparse route unions use a Q64/KV128 profile with one D128 head band per stage.
+# The recipe is independent of query group size; route membership and Q
 # tile capacity are validated separately.
-_QSA_GROUPED_KEEPS_PROFILES = {
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
     (BFloat16, BFloat16, BFloat16, 256, 128, 1, 1),
     (Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
     (Float8E4M3FN, Float8E4M3FN, BFloat16, 256, 128, 1, 1),
@@ -506,11 +506,11 @@ class FmhaDecodeConfig:
     # Select the packed Q/O ABI. Q and O are laid out as
     # [sum_q_tokens, num_heads_q, head_dim] and indexed by cu_seqlens_q.
     use_variable_seqlens_q: bool = False
-    # Select the private QSA page-4 route. This explicit discriminator keeps
+    # Select the private sparse-block route. This explicit discriminator keeps
     # ordinary storage-subpage callers on the generic paged-KV path. Grouped
-    # QSA routes consume query membership from a separate packed-word table;
+    # sparse routes consume query membership from a separate packed-word table;
     # Q1 uses the same scattered page route without membership masking.
-    use_qsa_route: bool = False
+    use_q_token_kv_block_sparse_route: bool = False
     # Allow the attention grid to acquire a programmatic launch dependency.
     # Callers must opt in only when a producer was launched immediately before
     # attention on the same stream and will release that dependency.
@@ -601,7 +601,7 @@ class FmhaDecodeConfig:
 
     # ------------------------------------------------------------------
     # Warp specialization layout (normally 4 warp groups / 16 warps; a static
-    # QSA throughput profile may add two producer-only groups)
+    # sparse-attention throughput profile may add two producer-only groups)
     # NOTE: please update `_active_warp_roles` after new roles are added.
     # ------------------------------------------------------------------
     # Softmax0Task: WG0 (warps 0–3) handles even K/V instances (K0/V0).
@@ -670,16 +670,16 @@ class FmhaDecodeConfig:
     @property
     def uses_scattered_page_route(self) -> bool:
         """Whether native paged loads consume one locator per page fragment."""
-        return self.has_storage_subpages or self.use_qsa_route
+        return self.has_storage_subpages or self.use_q_token_kv_block_sparse_route
 
     @property
-    def uses_qsa_page_membership(self) -> bool:
-        """Whether grouped QSA consumes a separate packed-membership table."""
-        return self.uses_qsa_sparse_page_route and self.max_seq_len_q > 1
+    def uses_q_token_kv_block_sparse_page_membership(self) -> bool:
+        """Whether grouped sparse attention uses a packed-membership table."""
+        return self.uses_q_token_kv_block_sparse_page_route and self.max_seq_len_q > 1
 
     @property
     def grouped_q_rows(self) -> int:
-        """Return logical query/head rows represented by one QSA group."""
+        """Return logical query/head rows represented by one sparse-route group."""
         return self.heads_q_per_kv * self.max_seq_len_q
 
     @property
@@ -692,7 +692,7 @@ class FmhaDecodeConfig:
         )
 
     @property
-    def uses_qsa_sparse_page_route(self) -> bool:
+    def uses_q_token_kv_block_sparse_page_route(self) -> bool:
         """Whether this grouped-Q route consumes sparse-block locators."""
         return (
             self.use_paged_kv
@@ -700,8 +700,8 @@ class FmhaDecodeConfig:
             and self.uses_scattered_page_route
             and self.num_tokens_per_page == 4
             and self.groups_tokens_heads_q
-            and self.use_qsa_route
-            and 0 < self.max_seq_len_q <= QSA_PAGE_MEMBERSHIP_BITS
+            and self.use_q_token_kv_block_sparse_route
+            and 0 < self.max_seq_len_q <= Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
             and self.grouped_q_fits_tile
         )
 
@@ -714,7 +714,8 @@ class FmhaDecodeConfig:
             and self.uses_scattered_page_route
             and self.tile_size_kv == 128
             and not self.use_sliding_window_causal
-            and self.static_local_kv_tiles <= QSA_HELD_LOCATOR_MAX_TILES
+            and self.static_local_kv_tiles
+            <= Q_TOKEN_KV_BLOCK_SPARSE_HELD_LOCATOR_MAX_TILES
         )
 
     @property
@@ -988,7 +989,10 @@ class FmhaDecodeConfig:
             self.q_dtype == Float8E4M3FN
             and (
                 self.out_dtype in (Float16, Float8E4M3FN)
-                or (self.use_qsa_route and self.out_dtype == BFloat16)
+                or (
+                    self.use_q_token_kv_block_sparse_route
+                    and self.out_dtype == BFloat16
+                )
             )
         )
 
@@ -1929,8 +1933,8 @@ class FmhaDecodeConfig:
             and self.max_splits_kv >= self.splits_kv
         )
 
-    def validate_qsa_grouped_keeps_profile(self) -> None:
-        """Validate the compact QSA-specific grouped-Keeps profile family."""
+    def validate_q_token_kv_block_sparse_grouped_keeps_profile(self) -> None:
+        """Validate the grouped-Keeps profiles for token-query sparse routes."""
         common_profile = (
             self.use_keeps_mma_ab
             and self.groups_tokens_heads_q
@@ -1939,7 +1943,7 @@ class FmhaDecodeConfig:
             and self.head_dim_per_stage_kv == 128
             and self.num_insts_kv == 1
             and self.o_stages == 1
-            and self.uses_qsa_sparse_page_route
+            and self.uses_q_token_kv_block_sparse_page_route
             and self.mask_type == CAUSAL
             and not self.use_cluster_smem_reduction
             and not self.use_persistent_scheduler
@@ -1947,13 +1951,14 @@ class FmhaDecodeConfig:
         )
         kv128_profile = (
             self.tile_size_kv == 128
-            and self._grouped_keeps_profile_key in _QSA_GROUPED_KEEPS_PROFILES
+            and self._grouped_keeps_profile_key
+            in _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES
             and not self.use_sliding_window_causal
             and (self.uses_direct_kv_launch or self.has_valid_split_kv_fanout)
         )
         if not (common_profile and kv128_profile):
             raise ValueError(
-                "QSA grouped KeepsMmaAb requires an encoded page-4 Q group "
+                "QToken-KvBlock-Sparse-Attention grouped KeepsMmaAb requires an encoded page-4 Q group "
                 "that fits Q64, the qualified D256/KV128 arithmetic recipe, "
                 "and a supported causal direct or split launch"
             )
@@ -3788,10 +3793,10 @@ def _validate_profile_support(
                 "parallel separate reduction cluster size "
                 f"{cluster_size} is not supported on this device"
             )
-    is_qsa_grouped_keeps = (
+    is_q_token_kv_block_sparse_grouped_keeps = (
         use_keeps_mma_ab
         and use_groups_tokens_heads_q
-        and cfg.uses_qsa_sparse_page_route
+        and cfg.uses_q_token_kv_block_sparse_page_route
     )
     if (
         cfg.use_pdl
@@ -3805,8 +3810,8 @@ def _validate_profile_support(
         raise ValueError(
             "split PDL requires nonpersistent attention with a standalone GMEM reducer"
         )
-    if is_qsa_grouped_keeps:
-        cfg.validate_qsa_grouped_keeps_profile()
+    if is_q_token_kv_block_sparse_grouped_keeps:
+        cfg.validate_q_token_kv_block_sparse_grouped_keeps_profile()
     supports_grouped_keeps = cfg.supports_grouped_keeps
     if cfg.tile_size_kv != 128 and not (
         cfg.tile_size_kv == 256 and supports_grouped_keeps
@@ -3816,7 +3821,7 @@ def _validate_profile_support(
             "KV256 native warp-specialized profile"
         )
     if use_keeps_mma_ab and use_groups_tokens_heads_q:
-        if not (is_qsa_grouped_keeps or supports_grouped_keeps):
+        if not (is_q_token_kv_block_sparse_grouped_keeps or supports_grouped_keeps):
             raise ValueError(
                 "grouped KeepsMmaAb currently supports only validated narrow "
                 "profiles; pass groups_tokens_heads_q=False to use a supported "
@@ -3827,7 +3832,7 @@ def _validate_profile_support(
         # grouped Keeps direct profile validated above.
         if use_keeps_mma_ab and not (
             use_groups_tokens_heads_q
-            and (is_qsa_grouped_keeps or supports_grouped_keeps)
+            and (is_q_token_kv_block_sparse_grouped_keeps or supports_grouped_keeps)
         ):
             raise ValueError(
                 "packed variable-Q KeepsMmaAb requires its supported grouped "
@@ -3872,10 +3877,10 @@ def _validate_profile_support(
             raise ValueError(
                 "fmha_decode keepsMmaAb requires numHeadsQPerKv == tile_size_q"
             )
-        fp8_qsa_bf16_output = (
+        fp8_q_token_kv_block_sparse_bf16_output = (
             cfg.out_dtype == BFloat16
             and use_groups_tokens_heads_q
-            and is_qsa_grouped_keeps
+            and is_q_token_kv_block_sparse_grouped_keeps
         )
         if (
             cfg.q_dtype == Float8E4M3FN
@@ -3884,7 +3889,7 @@ def _validate_profile_support(
                 Float16,
                 Float8E4M3FN,
             )
-            and not fp8_qsa_bf16_output
+            and not fp8_q_token_kv_block_sparse_bf16_output
         ):
             raise ValueError(
                 "fmha_decode keepsMmaAb fp8 qkv path supports fp16 or fp8 output"
@@ -3917,7 +3922,7 @@ def _validate_profile_support(
                 or (
                     tile_size_q == 64
                     and cfg.tile_size_kv == 128
-                    and cfg.uses_qsa_sparse_page_route
+                    and cfg.uses_q_token_kv_block_sparse_page_route
                 )
             )
             and effective_head_dim_stage == 128
@@ -3952,7 +3957,7 @@ def _validate_profile_support(
             raise ValueError(
                 "separate reduction keepsMmaAb profiles require "
                 "the established D128/Q64-Q128, D256/Q128, or "
-                "QSA D256/Q64-KV128 profiles, or a "
+                "QToken-KvBlock-Sparse-Attention D256/Q64-KV128 profiles, or a "
                 "fixed FP8/page-32 D64/Q64-Q128 or D256/Q64 profile; valid "
                 "reduction dtypes, Q layout, and static split-KV are required"
             )
@@ -4002,9 +4007,9 @@ def _validate_profile_support(
         and (
             tile_size_q in (16, 32)
             or qualified_fp8_q8_separate_reduction_supported
-            # QSA's staged D256 publisher and standalone reducer both index
+            # The sparse D256 publisher and standalone reducer both index
             # actual logical rows, so a partial TileQ8 is also valid.
-            or (tile_size_q == 8 and cfg.uses_qsa_sparse_page_route)
+            or (tile_size_q == 8 and cfg.uses_q_token_kv_block_sparse_page_route)
         )
         and headdim >= 64
     )
@@ -4012,7 +4017,7 @@ def _validate_profile_support(
         raise ValueError(
             "separate reduction SwapsMmaAb profiles require fixed SQ=1, "
             "fixed grouped Q, or packed variable Q; tile_size_q in {16,32}, "
-            "QSA TileQ8, or a fixed FP8 Q8/HqPerKv8 profile (legacy D128 with FP8 output, "
+            "QToken-KvBlock-Sparse-Attention TileQ8, or a fixed FP8 Q8/HqPerKv8 profile (legacy D128 with FP8 output, "
             "plus grouped paged-KV/page-32 D64 with FP8 output or D256 with "
             "FP16 output); valid reduction dtypes and static split-KV are required"
         )
