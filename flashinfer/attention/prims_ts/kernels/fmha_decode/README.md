@@ -37,12 +37,16 @@ per-thread word ranges (stored with an odd padded stride, so the loops stay
 bank-conflict-free at large maps) compacts the union in ascending order, and
 only that compact union is mapped through the dense page table. Dense routes
 issue their selected-block loads before the route is resolved so those loads
-overlap the route reads. Models whose map would exceed the device's opt-in
-shared-memory limit fall back to the bounded shared-memory radix sort (also
-selectable with ``FLASHINFER_QSA_METADATA_UNION=sort``), which uniques equal
-logical IDs while OR-reducing membership bits. Neither path scales its work or
-temporary storage with the global cache capacity. Plain Int32 locators and
-packed membership words remain separate outputs; membership bits are never
+overlap the route reads. The launcher takes the bounded shared-memory radix sort instead
+(also forced by ``FLASHINFER_QSA_METADATA_UNION=sort``) when the model's map
+would exceed the device's opt-in shared-memory limit, or when the map kernel's
+lower CTAs-per-SM for a long-context model would make this grid of routes need
+more waves than the sort (occupancies from
+``cudaOccupancyMaxActiveBlocksPerMultiprocessor``;
+``FLASHINFER_QSA_METADATA_DEBUG=1`` prints the decision). The sort uniques
+equal logical IDs while OR-reducing membership bits. Neither path scales its
+work or temporary storage with the global cache capacity. Plain Int32 locators
+and packed membership words remain separate outputs; membership bits are never
 fused into a locator.
 
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch

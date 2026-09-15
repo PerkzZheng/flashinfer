@@ -19,6 +19,9 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdio>
+#include <cstdlib>
+
 #include <cstdint>
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_scan.cuh>
@@ -998,63 +1001,144 @@ __global__ __launch_bounds__(
   ReleasePdlDependents(params, /*at_entry=*/false);
 }
 
-// Opt-in dynamic shared-memory limit of the current device, cached per device.
-inline int QTokenKvBlockSparseMaxDynamicSmemBytes(int device) {
-  static int cached[64] = {};
+// Per-device launch geometry for the union dispatch, cached per device.
+struct QTokenKvBlockSparseDeviceGeometry {
+  int max_dynamic_smem_bytes;  // opt-in limit per block; <= 0 when unknown
+  int sm_count;
+};
+
+inline QTokenKvBlockSparseDeviceGeometry QTokenKvBlockSparseGetDeviceGeometry(int device) {
+  static QTokenKvBlockSparseDeviceGeometry cached[64] = {};
+  static bool known[64] = {};
   if (device < 0 || device >= 64) {
-    return 0;
+    return {0, 0};
   }
-  if (cached[device] == 0) {
-    int value = 0;
-    if (cudaDeviceGetAttribute(&value, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) !=
-        cudaSuccess) {
-      value = -1;
+  if (!known[device]) {
+    QTokenKvBlockSparseDeviceGeometry geometry = {0, 0};
+    if (cudaDeviceGetAttribute(&geometry.max_dynamic_smem_bytes,
+                               cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess) {
+      geometry.max_dynamic_smem_bytes = -1;
     }
-    cached[device] = value;
+    if (cudaDeviceGetAttribute(&geometry.sm_count, cudaDevAttrMultiProcessorCount, device) !=
+        cudaSuccess) {
+      geometry.sm_count = 0;
+    }
+    cached[device] = geometry;
+    known[device] = true;
   }
   return cached[device];
 }
 
+// Diagnostic (not public API): FLASHINFER_QSA_METADATA_DEBUG=1 prints the
+// union dispatch decision once per distinct (device, map size, routes).
+inline bool QTokenKvBlockSparseDispatchDebug() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("FLASHINFER_QSA_METADATA_DEBUG");
+    return value != nullptr && value[0] == '1';
+  }();
+  return enabled;
+}
+
+// Union dispatch. The map kernel's per-route latency beats the radix sort for
+// every causal prefix up to ~1M tokens and trails it by ~1 us only for
+// multi-million-token prefixes, so it is the default whenever its model-sized
+// map fits shared memory. Its dynamic shared memory does, however, lower its
+// CTAs per SM for long-context models (one CTA per SM near the limit), so
+// when the grid has more routes than one wave can hold the sort, with its
+// small static footprint, may finish in fewer waves. The dispatch therefore
+// compares the waves each kernel needs for this grid (occupancy from the
+// runtime, which accounts for registers, threads, and shared memory) and
+// takes the sort when the map would need more.
 template <typename PositionType, int GroupSize, bool PackedQuery>
 cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
     QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, cudaStream_t stream) {
-  const size_t bitmap_smem_bytes =
+  constexpr int kSortBlockThreads =
+      QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
+  auto map_kernel = QTokenKvBlockSparseBitmapMetadataKernel<PositionType, GroupSize, PackedQuery>;
+  auto sort_kernel = QTokenKvBlockSparseTouchedMetadataKernel<PositionType, GroupSize, PackedQuery>;
+
+  const size_t map_smem_bytes =
       QTokenKvBlockSparseBitmapSmemBytes<GroupSize>(params.model_block_bound);
   int device = 0;
   cudaError_t status = cudaGetDevice(&device);
   if (status != cudaSuccess) {
     return status;
   }
-  const int max_dynamic_smem_bytes = QTokenKvBlockSparseMaxDynamicSmemBytes(device);
+  const QTokenKvBlockSparseDeviceGeometry geometry = QTokenKvBlockSparseGetDeviceGeometry(device);
   const int map_words_per_thread = QTokenKvBlockSparseWordsPerThread(
       QTokenKvBlockSparseMapWords(params.model_block_bound));
-  if (!params.force_sort_union && max_dynamic_smem_bytes > 0 &&
-      bitmap_smem_bytes <= static_cast<size_t>(max_dynamic_smem_bytes) &&
-      map_words_per_thread <= kQTokenKvBlockSparseBitmapMaxWordsPerThread) {
-    auto kernel = QTokenKvBlockSparseBitmapMetadataKernel<PositionType, GroupSize, PackedQuery>;
+  bool use_map = !params.force_sort_union && geometry.max_dynamic_smem_bytes > 0 &&
+                 map_smem_bytes <= static_cast<size_t>(geometry.max_dynamic_smem_bytes) &&
+                 map_words_per_thread <= kQTokenKvBlockSparseBitmapMaxWordsPerThread;
+  if (use_map) {
     // The dependent attention grid needs the maximum shared-memory carveout;
     // pin this kernel to the same carveout so SMs that hosted a metadata CTA
     // do not reconfigure (and drain) before accepting attention CTAs.
-    status = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+    status = cudaFuncSetAttribute(map_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
                                   cudaSharedmemCarveoutMaxShared);
     if (status != cudaSuccess) {
       return status;
     }
-    if (bitmap_smem_bytes > 48 * 1024) {
-      status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(bitmap_smem_bytes));
+    if (map_smem_bytes > 48 * 1024) {
+      status = cudaFuncSetAttribute(map_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(map_smem_bytes));
       if (status != cudaSuccess) {
         return status;
       }
     }
-    kernel<<<params.groups, kQTokenKvBlockSparseBitmapBlockThreads, bitmap_smem_bytes, stream>>>(
+
+    // Occupancy of both kernels, cached for the last (device, map size).
+    struct OccupancyCache {
+      int device;
+      size_t map_smem_bytes;
+      int map_blocks_per_sm;
+      int sort_blocks_per_sm;
+    };
+    static thread_local OccupancyCache cache = {-1, 0, 0, 0};
+    if (cache.device != device || cache.map_smem_bytes != map_smem_bytes) {
+      OccupancyCache fresh = {device, map_smem_bytes, 0, 0};
+      if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+              &fresh.map_blocks_per_sm, map_kernel, kQTokenKvBlockSparseBitmapBlockThreads,
+              map_smem_bytes) != cudaSuccess) {
+        fresh.map_blocks_per_sm = 0;
+        (void)cudaGetLastError();
+      }
+      if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fresh.sort_blocks_per_sm, sort_kernel,
+                                                        kSortBlockThreads, 0) != cudaSuccess) {
+        fresh.sort_blocks_per_sm = 0;
+        (void)cudaGetLastError();
+      }
+      cache = fresh;
+    }
+    if (cache.map_blocks_per_sm <= 0) {
+      use_map = false;
+    } else if (cache.sort_blocks_per_sm > 0 && geometry.sm_count > 0) {
+      const int64_t map_slots = static_cast<int64_t>(geometry.sm_count) * cache.map_blocks_per_sm;
+      const int64_t sort_slots =
+          static_cast<int64_t>(geometry.sm_count) * cache.sort_blocks_per_sm;
+      const int64_t map_waves = (params.groups + map_slots - 1) / map_slots;
+      const int64_t sort_waves = (params.groups + sort_slots - 1) / sort_slots;
+      use_map = map_waves <= sort_waves;
+    }
+    if (QTokenKvBlockSparseDispatchDebug()) {
+      static thread_local int64_t last_reported_groups = -1;
+      if (last_reported_groups != params.groups) {
+        last_reported_groups = params.groups;
+        std::fprintf(stderr,
+                     "[qsa-metadata] routes=%d model_blocks=%d map_smem=%zu B map_ctas/sm=%d "
+                     "sort_ctas/sm=%d sms=%d -> %s\n",
+                     params.groups, params.model_block_bound, map_smem_bytes,
+                     cache.map_blocks_per_sm, cache.sort_blocks_per_sm, geometry.sm_count,
+                     use_map ? "map" : "sort");
+      }
+    }
+  }
+  if (use_map) {
+    map_kernel<<<params.groups, kQTokenKvBlockSparseBitmapBlockThreads, map_smem_bytes, stream>>>(
         params);
     return cudaGetLastError();
   }
-  constexpr int kBlockThreads =
-      QTokenKvBlockSparseTouchedMetadataKernelTraits<GroupSize>::kBlockThreads;
-  auto kernel = QTokenKvBlockSparseTouchedMetadataKernel<PositionType, GroupSize, PackedQuery>;
-  kernel<<<params.groups, kBlockThreads, 0, stream>>>(params);
+  sort_kernel<<<params.groups, kSortBlockThreads, 0, stream>>>(params);
   return cudaGetLastError();
 }
 
