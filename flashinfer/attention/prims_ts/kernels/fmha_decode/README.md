@@ -28,9 +28,11 @@ maximum shared-memory carveout so SMs need no reconfiguration before hosting
 the dependent attention CTAs. Each route picks its granularity: prefixes up to
 32768 blocks use one byte per block that directly accumulates the query
 membership bits (four blocks per word keep the scatter atomics nearly
-conflict-free); longer prefixes use one bit per block and each candidate then
-recovers its block's compact rank from the prefix popcounts to OR its query bit
-into the compact entry. In both cases a block-wide count/scan over contiguous
+conflict-free); longer prefixes use one bit per block plus a per-thread summary
+bit per map word, so the count, compaction, and rank passes visit only the
+non-empty words, and each candidate then recovers its block's compact rank from
+the prefix popcounts to OR its query bit into the compact entry. In both cases
+a block-wide count/scan over contiguous
 per-thread word ranges (stored with an odd padded stride, so the loops stay
 bank-conflict-free at large maps) compacts the union in ascending order, and
 only that compact union is mapped through the dense page table. Dense routes
