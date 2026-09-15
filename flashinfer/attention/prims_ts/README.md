@@ -117,11 +117,13 @@ The convenience API infers physical page size from `paged_kv_cache`; only
 the prepared wrapper's `plan` takes `page_size` explicitly.
 
 On SM90 and newer, the combined route-builder and attention launch use PDL.
-Attention initializes its independent resources before acquiring immediately
-ahead of the first metadata-dependent read. Split-KV attention releases its
-reducer only after producer completion and TMEM teardown; the reducer
-initializes local resources before all threads acquire. Older architectures
-retain stream ordering.
+The route builder releases its dependent at kernel entry so the attention
+grid's launch and prologue overlap the metadata work; attention initializes
+its independent resources before acquiring immediately ahead of the first
+metadata-dependent read, and that acquire still waits for the whole metadata
+grid. Split-KV attention releases its reducer only after producer completion
+and TMEM teardown; the reducer initializes local resources before all threads
+acquire. Older architectures retain stream ordering.
 
 For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
 geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no

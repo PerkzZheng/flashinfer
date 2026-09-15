@@ -15,8 +15,10 @@
  */
 
 #include <cstdint>
+#include <cstdlib>
 #include <flashinfer/attention/prims_ts/q_token_kv_block_sparse_metadata.cuh>
 #include <limits>
+#include <string>
 
 #include "tvm_ffi_utils.h"
 
@@ -53,6 +55,27 @@ void CheckSameDevice(const TensorView& reference, const TensorView& tensor, cons
       << name << " must be on the same device as block_indices";
   TVM_FFI_ICHECK_EQ(tensor.device().device_id, reference.device().device_id)
       << name << " must be on the same device as block_indices";
+}
+
+// Diagnostic switch (not public API): FLASHINFER_QSA_METADATA_UNION=sort keeps the
+// radix-sort union even when the model length fits the shared-memory byte map.
+bool ForceSortUnion() {
+  static const bool force_sort = [] {
+    const char* mode = std::getenv("FLASHINFER_QSA_METADATA_UNION");
+    return mode != nullptr && std::string(mode) == "sort";
+  }();
+  return force_sort;
+}
+
+// Diagnostic switch (not public API): FLASHINFER_QSA_METADATA_PDL_RELEASE=tail
+// moves the PDL release back after the final metadata store instead of the
+// kernel entry.
+bool ReleasePdlAtEntry() {
+  static const bool at_entry = [] {
+    const char* mode = std::getenv("FLASHINFER_QSA_METADATA_PDL_RELEASE");
+    return !(mode != nullptr && std::string(mode) == "tail");
+  }();
+  return at_entry;
 }
 
 int32_t BitWidth(uint32_t value) {
@@ -241,7 +264,9 @@ void Launch(TensorView block_indices, TensorView block_table, TensorView token_t
       flashinfer::uint_fastdiv(static_cast<uint32_t>(geometry.block_topk + 1)),
       flashinfer::uint_fastdiv(
           static_cast<uint32_t>(geometry.storage_page_size / kQTokenKvBlockSparseSparseBlockSize)),
-      release_pdl};
+      release_pdl,
+      ForceSortUnion(),
+      ReleasePdlAtEntry()};
 
   ffi::CUDADeviceGuard device_guard(block_indices.device().device_id);
   const cudaStream_t stream = get_stream(block_indices.device());

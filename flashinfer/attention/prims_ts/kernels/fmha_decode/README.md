@@ -18,18 +18,28 @@ instead split the K/V sequence and reduce partial outputs; other grids use the
 direct static launch.
 
 QToken-KvBlock-Sparse-Attention metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
-blocks and causal tail directly through the dense page table. Q2/Q4/Q5 sort at
-most ``group_size * (block_topk + 1)`` tagged selected/tail candidates in
-shared memory, unique equal logical IDs while OR-reducing query-membership
-bits, and map only the compact union. Work and temporary storage therefore do
-not scale with the configured model length or global cache capacity. Plain
-Int32 locators and packed membership words remain separate outputs; membership
-bits are never fused into a locator.
+blocks and causal tail directly through the dense page table. Q2/Q4/Q5 build
+the union of at most ``group_size * (block_topk + 1)`` tagged selected/tail
+candidates in shared memory. When the model's logical block bound fits the
+32 KiB shared-memory byte map (32768 blocks, 131072 tokens at block size 4),
+each candidate ORs its query bit into its logical block's byte, a block-wide
+count/scan over the visible prefix compacts the non-zero bytes in ascending
+order, and only that compact union is mapped through the dense page table.
+Dense routes issue their selected-block loads before the route is resolved so
+those loads overlap the route reads. Longer models fall back to the bounded
+shared-memory radix sort (also selectable with
+``FLASHINFER_QSA_METADATA_UNION=sort``), which uniques equal logical IDs while
+OR-reducing membership bits. Neither path scales its work or temporary storage
+with the global cache capacity. Plain Int32 locators and packed membership
+words remain separate outputs; membership bits are never fused into a locator.
 
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
 (PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
-release only after their page indices, membership words, and sequence lengths
-are published. Every active attention CTA allocates and initializes its task
+release at kernel entry: the release only lets the attention grid schedule
+its prologue, while the attention grid's wait still blocks until the whole
+metadata grid has completed and published its page indices, membership words,
+and sequence lengths (``FLASHINFER_QSA_METADATA_PDL_RELEASE=tail`` restores
+the historical release after the final store). Every active attention CTA allocates and initializes its task
 barriers, SMEM, and TMEM first, then waits immediately before TaskManager can
 read either output. Split-KV QToken-KvBlock-Sparse-Attention sends every configured split CTA through that
 initialization and acquire, then contracts the useful runtime prefix. Pruned
@@ -41,15 +51,31 @@ Standalone attention over an already-built QToken-KvBlock-Sparse-Attention metad
 ordered and does not enter this PDL chain.
 
 When split-KV uses a separate reduction kernel, each active attention CTA
-signals at its true tail after task completion and TMEM teardown. Deferred QToken-KvBlock-Sparse-Attention
+signals at its true tail after task completion and TMEM teardown (releasing at
+the producer acquire instead, ``FLASHINFER_TS_REDUCER_RELEASE=acquire``, was
+measured slower because resident waiting reducer CTAs slow the attention
+body). Deferred QToken-KvBlock-Sparse-Attention
 split padding retires as described above, while other runtime-inactive CTAs use
 their terminal zero-work branch. The reducer initializes its register state
 and any required shared-memory storage, then waits before reading any
-producer-written partial output or statistics.
+producer-written partial output or statistics. After the wait it issues the
+stats and partial-O loads of every configured split slot of its row at once
+(the workspace always holds every configured slot) and only then reads the
+runtime split prefix, so the two dependent round trips overlap; slots beyond
+the active prefix are discarded at fold time.
 Independent query-offset metadata may be read before that wait. QToken-KvBlock-Sparse-Attention sequence
 lengths remain behind it because they originate in the metadata producer two
 PDL stages upstream. This preserves producer-to-reducer overlap while gating
 every producer-dependent global-memory read.
+
+Reducer topology: S2-S4 use one 512-thread CTA per 8 KiB output slice. S5-S16
+use one 512-thread CTA per 2 KiB slice in which four adjacent lanes share each
+16-byte output fragment, each lane folds an interleaved quarter of the (up to
+16) split slots, and a two-level warp butterfly merges the lanes before the
+first lane stores; the fold is a serial chain of dependent FP32 instructions
+at low occupancy, so shortening it and quadrupling the resident warps roughly
+halves the kernel. S17+ keep the clustered schedule (4/8/16 CTAs of 8 slots
+each with a distributed-shared-memory finalize).
 
 ## Public APIs
 

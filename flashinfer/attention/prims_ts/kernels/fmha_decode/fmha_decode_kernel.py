@@ -2359,6 +2359,16 @@ def _run_decode_gen_active(
         # SMEM/TMEM resource is initialized, but keep it before TaskManager
         # resolves any value published by the preceding producer grid.
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
+    if cutlass.const_expr(
+        cfg.use_parallel_separate_reduction_pdl and cfg.release_reducer_at_acquire
+    ):
+        # Release the standalone reducer grid as soon as this CTA holds its own
+        # producer dependency. The reducer's griddepcontrol.wait still blocks
+        # until every attention CTA has completed and flushed its partials, so
+        # this only overlaps the reducer's launch and prologue with the
+        # attention body instead of exposing them after the CTA tail. The
+        # tail release stays as a no-op safety net for pruned paths.
+        prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
     if cutlass.const_expr(defer_runtime_split_pruning):
         # A split launch cannot read its producer-owned sequence length until
         # the dependency above is acquired. Every physical split CTA

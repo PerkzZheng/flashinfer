@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import functools
 import math
 import numbers
+import os
 import struct
 from typing import TYPE_CHECKING, Literal, Optional, Union
 
@@ -2686,17 +2687,23 @@ def _resolve_q_token_kv_block_sparse_decode_config(
     }
     if q_token_kv_block_sparse_use_keeps:
         q_token_kv_block_sparse_profile["o_stages"] = 1
-    return make_config(
+    split_kv_mode = (
+        "gmem_reduction_with_separate_kernel"
+        if q_token_kv_block_sparse_splits > 1
+        else "disabled"
+    )
+    cfg = make_config(
         q_token_kv_block_sparse_profile,
-        split_kv_mode=(
-            "gmem_reduction_with_separate_kernel"
-            if q_token_kv_block_sparse_splits > 1
-            else "disabled"
-        ),
+        split_kv_mode=split_kv_mode,
         splits_kv=q_token_kv_block_sparse_splits,
         max_splits_kv=q_token_kv_block_sparse_splits,
         min_loop_iters_per_split=(1 if seq_len_q == 1 else MIN_LOOP_ITERS_PER_SPLIT),
     )
+    # Diagnostic A/B switch (not public API): release the reducer's PDL grid
+    # at the attention CTA's producer acquire instead of its tail.
+    if os.environ.get("FLASHINFER_TS_REDUCER_RELEASE") == "acquire":
+        cfg.release_reducer_at_acquire = True
+    return cfg
 
 
 def _validate_prims_ts_q_token_kv_block_sparse_group_value(group_size: int) -> int:

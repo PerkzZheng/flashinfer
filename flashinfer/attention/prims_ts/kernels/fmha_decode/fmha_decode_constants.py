@@ -165,8 +165,16 @@ PARALLEL_REDUCTION_THREADS_PER_CTA = 128
 PARALLEL_REDUCTION_BYTES_PER_SLICE = (
     PARALLEL_REDUCTION_THREADS_PER_CTA * REDUCTION_BYTES_PER_THREAD
 )
-PARALLEL_REDUCTION_LOAD_BATCH = 4
+# Issue every split slot's stats and partial-O loads before folding so one
+# reducer thread pays a single memory round trip for all of its split slots.
+PARALLEL_REDUCTION_LOAD_BATCH = 16
 PARALLEL_REDUCTION_FINAL_REDUCERS = 4
+# Single-CTA (G1) reducer profiles spread one output fragment's split slots
+# over this many adjacent lanes and merge them with warp shuffles. The fold is
+# a serial chain of dependent FP32 instructions at very low occupancy, so more
+# lanes with fewer slots each shortens the per-warp critical path and quadruples
+# the resident warps that hide it. Must divide the slots owned by each CTA.
+PARALLEL_REDUCTION_SLOT_LANES = 4
 
 # Each reduction thread produces an 8-element O vector backed by four packed
 # 16-bit registers.

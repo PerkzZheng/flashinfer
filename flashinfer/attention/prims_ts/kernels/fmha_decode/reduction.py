@@ -177,6 +177,11 @@ def _reduce_exact_splits_body(
     reduce_col_idx = (reduce_base_offset % bytes_per_output_row) // Int32(
         PARTIAL_O_ELEMENT_BYTES
     )
+    # Rows below the workspace row count address published split slots for
+    # every configured split, independent of the runtime Q length. Loads may
+    # be issued under this parameter-only predicate before cu_seqlens_q
+    # arrives; folding and storing still require ``valid_reduce_row``.
+    reduce_row_in_workspace = reduce_row_idx < g_q_output_rows
     q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
     active_splits_kv = Int32(cfg.splits_kv)
     valid_reduce_row = _q_logical_output_row_is_valid_for_seq(
@@ -211,62 +216,95 @@ def _reduce_exact_splits_body(
     if cutlass.const_expr(wait_for_pdl_producer):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
-    if cutlass.const_expr(not static_full_split_prefix):
-        # Sparse-route seq_lens may originate two PDL stages upstream. Keep this read
-        # behind the attention-producer acquire together with partial O/stats;
-        # ordinary reducers preserve the same instruction ordering harmlessly.
-        active_splits_kv = _reduction_active_splits_kv(
-            cfg,
-            g_seqlens_kv,
-            b_idx,
-            g_q_output_rows,
-            reduce_row_idx,
-            seq_len_q,
-        )
+    # Issue every configured split slot's stats and partial-O loads before the
+    # runtime split prefix or Q length is known. The workspace retains
+    # configured-max strides, so speculative reads of slots beyond the
+    # published active prefix stay in bounds; they are discarded below. This
+    # overlaps the sequence-length reads with the partial reads instead of
+    # serializing dependent memory round trips.
+    partial_lse_all = cutlass.Array(
+        Float32, cfg.max_splits_kv, space=cutlass.AddressSpace.rmem
+    )
+    partial_regs_all = cutlass.Array(
+        Int32,
+        cfg.max_splits_kv * PACKED_OUTPUT_REGS_PER_THREAD,
+        space=cutlass.AddressSpace.rmem,
+    )
+    for split_idx_i in cutlass.range_constexpr(cfg.max_splits_kv):
+        partial_lse_all[split_idx_i] = Float32(-Float32.inf)
+        regs_base = split_idx_i * PACKED_OUTPUT_REGS_PER_THREAD
+        for reg_idx in cutlass.range_constexpr(PACKED_OUTPUT_REGS_PER_THREAD):
+            partial_regs_all[regs_base + reg_idx] = Int32(0)
+    if reduce_row_in_workspace:
+        for split_idx_i in cutlass.range_constexpr(cfg.max_splits_kv):
+            split_idx = Int32(split_idx_i)
+            # LSE layout: [logical_kv][configured split][row].
+            workspace_row = _separate_workspace_row_offset(
+                logical_kv_idx,
+                split_idx,
+                reduce_row_idx,
+                g_q_output_rows,
+                cfg,
+            )
+            stats_offset = workspace_row * Int64(
+                SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * FP32_BYTES
+            )
+            stats_src = cutlass.inttoptr(
+                g_partial_stats.toint() + stats_offset,
+                mem_space=1,
+                dtype=Float32,
+            )
+            partial_lse_all[split_idx_i] = stats_src.load()
+
+            partial_o_offset = workspace_row * Int64(
+                cfg.headdim * PARTIAL_O_ELEMENT_BYTES
+            ) + Int64(reduce_col_idx) * Int64(PARTIAL_O_ELEMENT_BYTES)
+            partial_o_src = cutlass.inttoptr(
+                g_partial_o.toint() + partial_o_offset,
+                mem_space=1,
+                dtype=Int32,
+            )
+            loaded_partial_regs = partial_o_src.load(
+                count=PACKED_OUTPUT_REGS_PER_THREAD,
+                alignment=PACKED_OUTPUT_REGS_PER_THREAD * PACKED_REGISTER_BYTES,
+            )
+            regs_base = split_idx_i * PACKED_OUTPUT_REGS_PER_THREAD
+            for reg_idx in cutlass.range_constexpr(PACKED_OUTPUT_REGS_PER_THREAD):
+                partial_regs_all[regs_base + reg_idx] = loaded_partial_regs[reg_idx]
 
     if valid_reduce_row:
-        # The workspace retains configured-max strides, but only the runtime
-        # active prefix was published by producer CTAs.
+        if cutlass.const_expr(not static_full_split_prefix):
+            # Sparse-route seq_lens may originate two PDL stages upstream. Keep
+            # this read behind the attention-producer acquire together with
+            # partial O/stats; ordinary reducers preserve the same ordering.
+            active_splits_kv = _reduction_active_splits_kv(
+                cfg,
+                g_seqlens_kv,
+                b_idx,
+                g_q_output_rows,
+                reduce_row_idx,
+                seq_len_q,
+            )
+        else:
+            active_splits_kv = Int32(cfg.splits_kv)
+
+        # Only the runtime active prefix was published by producer CTAs.
         for split_idx_i in cutlass.range_constexpr(cfg.max_splits_kv):
             split_idx = Int32(split_idx_i)
             split_is_active = split_idx < active_splits_kv
             if cutlass.const_expr(static_full_split_prefix):
                 split_is_active = cutlass.const_expr(split_idx_i < cfg.splits_kv)
             if split_is_active:
-                # LSE layout: [logical_kv][configured split][row].
-                workspace_row = _separate_workspace_row_offset(
-                    logical_kv_idx,
-                    split_idx,
-                    reduce_row_idx,
-                    g_q_output_rows,
-                    cfg,
-                )
-                stats_offset = workspace_row * Int64(
-                    SEPARATE_REDUCTION_LSE_VALUES_PER_ROW * FP32_BYTES
-                )
-                stats_src = cutlass.inttoptr(
-                    g_partial_stats.toint() + stats_offset,
-                    mem_space=1,
-                    dtype=Float32,
-                )
-                partial_lse = stats_src.load()
-
-                partial_o_offset = workspace_row * Int64(
-                    cfg.headdim * PARTIAL_O_ELEMENT_BYTES
-                ) + Int64(reduce_col_idx) * Int64(PARTIAL_O_ELEMENT_BYTES)
-                partial_o_src = cutlass.inttoptr(
-                    g_partial_o.toint() + partial_o_offset,
-                    mem_space=1,
-                    dtype=Int32,
-                )
-                loaded_partial_regs = partial_o_src.load(
+                regs_base = split_idx_i * PACKED_OUTPUT_REGS_PER_THREAD
+                loaded_partial_regs = (
+                    partial_regs_all.data_ptr() + Int32(regs_base)
+                ).load(
                     count=PACKED_OUTPUT_REGS_PER_THREAD,
-                    alignment=PACKED_OUTPUT_REGS_PER_THREAD * PACKED_REGISTER_BYTES,
+                    alignment=PACKED_REGISTER_BYTES,
                 )
-
                 new_lse, old_weight, partial_weight = merge_log2_lse(
                     global_lse,
-                    partial_lse,
+                    partial_lse_all[split_idx_i],
                 )
                 partial_vals = unpack_normalized_vec8(
                     loaded_partial_regs, cfg.use_bf16_separate_partial_o
@@ -454,9 +492,12 @@ def decode_gen_parallel_separate_reduction_kernel(
     """Reduce split partials with a compact or clustered constexpr schedule.
 
     S2-S4 use one 512-thread CTA per 8 KiB output slice and reduce the exact
-    split count directly. Larger schedules use 128-thread CTAs over 2 KiB
-    slices. Each cluster rank owns 2, 4, or 8 split slots; G1 stores directly,
-    G16 uses a two-level 4x4 merge, and G2/G4/G8 finalize through rank zero.
+    split count directly. Larger schedules cover 2 KiB slices with 128 output
+    fragments per CTA. G1 (up to 16 split slots) spreads each fragment's slots
+    over ``PARALLEL_REDUCTION_SLOT_LANES`` adjacent lanes, merges them with
+    warp shuffles, and stores directly; clustered profiles keep one lane per
+    fragment, each cluster rank owns 2, 4, or 8 split slots, G16 uses a
+    two-level 4x4 merge, and G2/G4/G8 finalize through rank zero.
     """
 
     if cutlass.const_expr(cfg.use_compact_parallel_reduction):
@@ -483,13 +524,22 @@ def decode_gen_parallel_separate_reduction_kernel(
 
     bytes_per_output_row = Int32(cfg.headdim * PARTIAL_O_ELEMENT_BYTES)
     slice_idx = block_idx_x // Int32(cfg.parallel_reduction_cluster_size)
+    # ``slot_lanes`` adjacent lanes share one 16-byte output fragment and each
+    # own an interleaved subset of its split slots (lane ``l`` folds slots
+    # ``l, l + slot_lanes, ...`` so a short runtime prefix stays balanced).
+    slot_lanes = cfg.parallel_reduction_slot_lanes
+    fragment_idx = thread_idx // Int32(slot_lanes)
+    lane_slot = thread_idx % Int32(slot_lanes)
     reduce_base_offset = slice_idx * Int32(
         PARALLEL_REDUCTION_BYTES_PER_SLICE
-    ) + thread_idx * Int32(REDUCTION_BYTES_PER_THREAD)
+    ) + fragment_idx * Int32(REDUCTION_BYTES_PER_THREAD)
     reduce_row_idx = reduce_base_offset // bytes_per_output_row
     reduce_col_idx = (reduce_base_offset % bytes_per_output_row) // Int32(
         PARTIAL_O_ELEMENT_BYTES
     )
+    # Parameter-only bound for issuing speculative slot loads; see the compact
+    # body for the contract. Folding and storing still use valid_reduce_row.
+    reduce_row_in_workspace = reduce_row_idx < g_q_output_rows
     q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
     active_splits_kv = Int32(cfg.splits_kv)
     valid_reduce_row = _q_logical_output_row_is_valid_for_seq(
@@ -520,10 +570,11 @@ def decode_gen_parallel_separate_reduction_kernel(
         output_vals[elem_idx] = Float32(0.0)
     global_lse = Float32(-Float32.inf)
 
-    # Batch up to four independent GMEM loads before folding them. The final
-    # batch width is compile-time. Padded split slots stay neutral and never
-    # form GMEM pointers, including non-power-of-two split counts.
+    # Issue every owned slot's independent GMEM loads before folding them. The
+    # final batch width is compile-time. Padded split slots stay neutral and
+    # never form GMEM pointers, including non-power-of-two split counts.
     local_splits = cfg.parallel_reduction_splits_per_cta
+    lane_splits = local_splits // slot_lanes
     partial_lse = cutlass.Array(
         Float32, PARALLEL_REDUCTION_LOAD_BATCH, space=cutlass.AddressSpace.rmem
     )
@@ -553,30 +604,26 @@ def decode_gen_parallel_separate_reduction_kernel(
     if cutlass.const_expr(cfg.use_parallel_separate_reduction_pdl):
         prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
-    if cutlass.const_expr(not static_full_split_prefix):
-        active_splits_kv = _reduction_active_splits_kv(
-            cfg,
-            g_seqlens_kv,
-            b_idx,
-            g_q_output_rows,
-            reduce_row_idx,
-            seq_len_q,
-        )
-
     for split_base_i in cutlass.range_constexpr(
-        0, local_splits, PARALLEL_REDUCTION_LOAD_BATCH
+        0, lane_splits, PARALLEL_REDUCTION_LOAD_BATCH
     ):
-        batch_width = min(PARALLEL_REDUCTION_LOAD_BATCH, local_splits - split_base_i)
+        batch_width = min(PARALLEL_REDUCTION_LOAD_BATCH, lane_splits - split_base_i)
         split_base = Int32(split_base_i)
+        # Loads are issued for every configured split slot of this row before
+        # the runtime split prefix is known: the workspace always holds every
+        # configured slot, and slots beyond the active prefix are discarded at
+        # fold time. This overlaps the sequence-length read with the partial
+        # reads instead of serializing two dependent memory round trips.
         for jj in cutlass.range_constexpr(batch_width):
-            split_idx = cluster_rank * Int32(local_splits) + split_base + Int32(jj)
+            split_idx = (
+                cluster_rank * Int32(local_splits)
+                + (split_base + Int32(jj)) * Int32(slot_lanes)
+                + lane_slot
+            )
             valid_split_idx = cutlass.const_expr(
                 cfg.parallel_reduction_padded_splits == cfg.max_splits_kv
             ) or split_idx < Int32(cfg.max_splits_kv)
-            active_split_idx = split_idx < active_splits_kv
-            if cutlass.const_expr(static_full_split_prefix):
-                active_split_idx = cutlass.Boolean(True)
-            if valid_split_idx and active_split_idx and valid_reduce_row:
+            if valid_split_idx and reduce_row_in_workspace:
                 workspace_row = _separate_workspace_row_offset(
                     logical_kv_idx,
                     split_idx,
@@ -610,8 +657,25 @@ def decode_gen_parallel_separate_reduction_kernel(
                 for reg_idx in cutlass.range_constexpr(PACKED_OUTPUT_REGS_PER_THREAD):
                     partial_regs[regs_base + reg_idx] = loaded_partial_regs[reg_idx]
 
+        if cutlass.const_expr(split_base_i == 0):
+            if cutlass.const_expr(not static_full_split_prefix):
+                active_splits_kv = _reduction_active_splits_kv(
+                    cfg,
+                    g_seqlens_kv,
+                    b_idx,
+                    g_q_output_rows,
+                    reduce_row_idx,
+                    seq_len_q,
+                )
+            else:
+                active_splits_kv = Int32(cfg.splits_kv)
+
         for jj in cutlass.range_constexpr(batch_width):
-            split_idx = cluster_rank * Int32(local_splits) + split_base + Int32(jj)
+            split_idx = (
+                cluster_rank * Int32(local_splits)
+                + (split_base + Int32(jj)) * Int32(slot_lanes)
+                + lane_slot
+            )
             valid_split_idx = cutlass.const_expr(
                 cfg.parallel_reduction_padded_splits == cfg.max_splits_kv
             ) or split_idx < Int32(cfg.max_splits_kv)
@@ -638,11 +702,50 @@ def decode_gen_parallel_separate_reduction_kernel(
                     )
                 global_lse = new_lse
 
-    # G1 stores its register accumulator directly and compiles out SMEM
-    # publication, mapa, and cluster barriers. The branch is CTA-uniform and
-    # resolved at compile time.
+    # G1 merges the lanes sharing one fragment with a warp butterfly, then the
+    # first lane stores the register accumulator directly and compiles out
+    # SMEM publication, mapa, and cluster barriers. The branch is CTA-uniform
+    # and resolved at compile time.
     if cutlass.const_expr(cfg.parallel_reduction_cluster_size == 1):
-        if valid_reduce_row:
+        # Shuffles execute warp-uniformly outside every row/slot predicate;
+        # lanes of invalid fragments exchange neutral or unused state. Names
+        # stay distinct from the clustered finalize below so the DSL sees one
+        # stable type per variable across the compile-time branches.
+        if cutlass.const_expr(slot_lanes > 1):
+            for lane_level in cutlass.range_constexpr((slot_lanes - 1).bit_length()):
+                lane_xor = 1 << lane_level
+                lane_peer_lse = Float32(
+                    prims.shfl_sync(
+                        thread_mask=0xFFFFFFFF,
+                        val=global_lse,
+                        offset=lane_xor,
+                        mask_and_clamp=0x1F,
+                        kind=prims.Shfl.BFLY,
+                    )
+                )
+                lane_peer_vals = cutlass.Array(
+                    Float32, OUTPUT_VALUES_PER_THREAD, space=cutlass.AddressSpace.rmem
+                )
+                for elem_idx in cutlass.range_constexpr(OUTPUT_VALUES_PER_THREAD):
+                    lane_peer_vals[elem_idx] = Float32(
+                        prims.shfl_sync(
+                            thread_mask=0xFFFFFFFF,
+                            val=output_vals[elem_idx],
+                            offset=lane_xor,
+                            mask_and_clamp=0x1F,
+                            kind=prims.Shfl.BFLY,
+                        )
+                    )
+                lane_merged_lse, lane_own_weight, lane_peer_weight = merge_log2_lse(
+                    global_lse, lane_peer_lse
+                )
+                for elem_idx in cutlass.range_constexpr(OUTPUT_VALUES_PER_THREAD):
+                    output_vals[elem_idx] = (
+                        output_vals[elem_idx] * lane_own_weight
+                        + lane_peer_vals[elem_idx] * lane_peer_weight
+                    )
+                global_lse = lane_merged_lse
+        if valid_reduce_row and lane_slot == Int32(0):
             _store_parallel_reduction_output(
                 output_vals,
                 global_lse,

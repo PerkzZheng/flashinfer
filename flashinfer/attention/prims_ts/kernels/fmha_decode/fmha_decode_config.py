@@ -52,6 +52,7 @@ from .fmha_decode_constants import (
     MAX_WARP_GROUPS,
     MIN_LOOP_ITERS_PER_SPLIT,
     PARALLEL_REDUCTION_BYTES_PER_SLICE,
+    PARALLEL_REDUCTION_SLOT_LANES,
     PARALLEL_REDUCTION_THREADS_PER_CTA,
     PARTIAL_O_ELEMENT_BYTES,
     PARTIAL_STATS_VALUES_PER_ROW,
@@ -578,6 +579,13 @@ class FmhaDecodeConfig:
     # K/V TMA pipeline depth. Deeper KV staging hides the long
     # GMEM→SMEM latency in the BMM1↔BMM2 chain.
     kv_stages: int = 4
+    # Release the standalone PDL reducer grid right after this kernel acquires
+    # its own producer dependency instead of after the CTA tail. The reducer's
+    # wait still covers every attention CTA, but resident reducer CTAs waiting
+    # on the release slow the attention body more than the hidden reducer
+    # launch saves (GB300 QToken decode, B16/B32 MTP-4: +0.5 us / +2 us), so
+    # the tail release stays the default. Diagnostic A/B knob.
+    release_reducer_at_acquire: bool = False
 
     # ------------------------------------------------------------------
     # TMEM column counts
@@ -1119,9 +1127,12 @@ class FmhaDecodeConfig:
             or self.use_compact_parallel_reduction
         ):
             return 1
+        # Up to 16 split slots fold inside one 128-thread CTA: a 2-CTA cluster
+        # for S5-S16 spends more in its DSMEM merge and cluster barriers than it
+        # saves in per-thread loads (measured on GB300 QToken decode).
         return {
             8: 1,
-            16: 2,
+            16: 1,
             32: 4,
             64: 8,
             128: 16,
@@ -1138,11 +1149,22 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def parallel_reduction_slot_lanes(self) -> int:
+        """Return adjacent lanes sharing one fragment's split slots (G1 only)."""
+        if (
+            self.use_compact_parallel_reduction
+            or self.parallel_reduction_cluster_size != 1
+            or self.parallel_reduction_splits_per_cta % PARALLEL_REDUCTION_SLOT_LANES
+        ):
+            return 1
+        return PARALLEL_REDUCTION_SLOT_LANES
+
+    @property
     def parallel_reduction_threads_per_cta(self) -> int:
         """Return the thread count selected by the reducer schedule."""
         if self.use_compact_parallel_reduction:
             return REDUCTION_THREADS_PER_CTA
-        return PARALLEL_REDUCTION_THREADS_PER_CTA
+        return PARALLEL_REDUCTION_THREADS_PER_CTA * self.parallel_reduction_slot_lanes
 
     @property
     def parallel_reduction_bytes_per_slice(self) -> int:
@@ -3809,7 +3831,7 @@ def _validate_profile_support(
         padded_splits = cfg.parallel_reduction_padded_splits
         default_cluster_size = {
             8: 1,
-            16: 2,
+            16: 1,
             32: 4,
             64: 8,
             128: 16,
@@ -3822,7 +3844,7 @@ def _validate_profile_support(
         clustered_topology_supported = (
             not cfg.use_compact_parallel_reduction
             and default_cluster_size == cluster_size
-            and splits_per_cta in (2, 4, 8)
+            and splits_per_cta in (2, 4, 8, 16)
             and cluster_size * splits_per_cta == padded_splits
         )
         if not (
