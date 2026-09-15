@@ -49,6 +49,10 @@ work or temporary storage with the global cache capacity. Plain Int32 locators
 and packed membership words remain separate outputs; membership bits are never
 fused into a locator.
 
+The rationale and GB300 measurements behind the metadata builder and
+split-reducer changes are collected in
+[docs/design_docs/prims_ts_qsa_metadata_reducer_optimizations.md](../../../../../docs/design_docs/prims_ts_qsa_metadata_reducer_optimizations.md).
+
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
 (PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
 release at kernel entry: the release only lets the attention grid schedule
