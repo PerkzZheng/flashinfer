@@ -1003,7 +1003,9 @@ __global__ __launch_bounds__(
 
 // Per-device launch geometry for the union dispatch, cached per device.
 struct QTokenKvBlockSparseDeviceGeometry {
-  int max_dynamic_smem_bytes;  // opt-in limit per block; <= 0 when unknown
+  int max_dynamic_smem_bytes;   // opt-in limit per block; <= 0 when unknown
+  int smem_per_sm_bytes;        // shared memory per SM available to CTAs
+  int reserved_smem_per_block;  // system-reserved shared memory per CTA
   int sm_count;
 };
 
@@ -1011,13 +1013,21 @@ inline QTokenKvBlockSparseDeviceGeometry QTokenKvBlockSparseGetDeviceGeometry(in
   static QTokenKvBlockSparseDeviceGeometry cached[64] = {};
   static bool known[64] = {};
   if (device < 0 || device >= 64) {
-    return {0, 0};
+    return {0, 0, 0, 0};
   }
   if (!known[device]) {
-    QTokenKvBlockSparseDeviceGeometry geometry = {0, 0};
+    QTokenKvBlockSparseDeviceGeometry geometry = {0, 0, 0, 0};
     if (cudaDeviceGetAttribute(&geometry.max_dynamic_smem_bytes,
                                cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess) {
       geometry.max_dynamic_smem_bytes = -1;
+    }
+    if (cudaDeviceGetAttribute(&geometry.smem_per_sm_bytes,
+                               cudaDevAttrMaxSharedMemoryPerMultiprocessor, device) != cudaSuccess) {
+      geometry.smem_per_sm_bytes = 0;
+    }
+    if (cudaDeviceGetAttribute(&geometry.reserved_smem_per_block,
+                               cudaDevAttrReservedSharedMemoryPerBlock, device) != cudaSuccess) {
+      geometry.reserved_smem_per_block = 0;
     }
     if (cudaDeviceGetAttribute(&geometry.sm_count, cudaDevAttrMultiProcessorCount, device) !=
         cudaSuccess) {
@@ -1028,6 +1038,12 @@ inline QTokenKvBlockSparseDeviceGeometry QTokenKvBlockSparseGetDeviceGeometry(in
   }
   return cached[device];
 }
+
+// Occupancy model of the union dispatch. The sort kernel is assumed to place
+// three CTAs per SM; the map kernel is bounded by its 512 threads (four CTAs
+// per SM) and by how many copies of its dynamic shared memory fit an SM.
+constexpr int kQTokenKvBlockSparseSortCtasPerSm = 3;
+constexpr int kQTokenKvBlockSparseMapMaxCtasPerSm = 4;
 
 // Diagnostic (not public API): FLASHINFER_QSA_METADATA_DEBUG=1 prints the
 // union dispatch decision once per distinct (device, map size, routes).
@@ -1046,9 +1062,8 @@ inline bool QTokenKvBlockSparseDispatchDebug() {
 // CTAs per SM for long-context models (one CTA per SM near the limit), so
 // when the grid has more routes than one wave can hold the sort, with its
 // small static footprint, may finish in fewer waves. The dispatch therefore
-// compares the waves each kernel needs for this grid (occupancy from the
-// runtime, which accounts for registers, threads, and shared memory) and
-// takes the sort when the map would need more.
+// compares the waves each kernel needs for this grid under the simple
+// occupancy model above and takes the sort when the map would need more.
 template <typename PositionType, int GroupSize, bool PackedQuery>
 cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
     QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, cudaStream_t stream) {
@@ -1087,35 +1102,19 @@ cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
       }
     }
 
-    // Occupancy of both kernels, cached for the last (device, map size).
-    struct OccupancyCache {
-      int device;
-      size_t map_smem_bytes;
-      int map_blocks_per_sm;
-      int sort_blocks_per_sm;
-    };
-    static thread_local OccupancyCache cache = {-1, 0, 0, 0};
-    if (cache.device != device || cache.map_smem_bytes != map_smem_bytes) {
-      OccupancyCache fresh = {device, map_smem_bytes, 0, 0};
-      if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-              &fresh.map_blocks_per_sm, map_kernel, kQTokenKvBlockSparseBitmapBlockThreads,
-              map_smem_bytes) != cudaSuccess) {
-        fresh.map_blocks_per_sm = 0;
-        (void)cudaGetLastError();
-      }
-      if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&fresh.sort_blocks_per_sm, sort_kernel,
-                                                        kSortBlockThreads, 0) != cudaSuccess) {
-        fresh.sort_blocks_per_sm = 0;
-        (void)cudaGetLastError();
-      }
-      cache = fresh;
+    // Map CTAs per SM from shared-memory capacity, capped by its thread count.
+    int map_ctas_per_sm = kQTokenKvBlockSparseMapMaxCtasPerSm;
+    if (geometry.smem_per_sm_bytes > 0) {
+      const size_t per_cta = map_smem_bytes + static_cast<size_t>(geometry.reserved_smem_per_block);
+      const int by_smem = static_cast<int>(static_cast<size_t>(geometry.smem_per_sm_bytes) / per_cta);
+      map_ctas_per_sm = by_smem < map_ctas_per_sm ? by_smem : map_ctas_per_sm;
     }
-    if (cache.map_blocks_per_sm <= 0) {
+    if (map_ctas_per_sm <= 0) {
       use_map = false;
-    } else if (cache.sort_blocks_per_sm > 0 && geometry.sm_count > 0) {
-      const int64_t map_slots = static_cast<int64_t>(geometry.sm_count) * cache.map_blocks_per_sm;
+    } else if (geometry.sm_count > 0) {
+      const int64_t map_slots = static_cast<int64_t>(geometry.sm_count) * map_ctas_per_sm;
       const int64_t sort_slots =
-          static_cast<int64_t>(geometry.sm_count) * cache.sort_blocks_per_sm;
+          static_cast<int64_t>(geometry.sm_count) * kQTokenKvBlockSparseSortCtasPerSm;
       const int64_t map_waves = (params.groups + map_slots - 1) / map_slots;
       const int64_t sort_waves = (params.groups + sort_slots - 1) / sort_slots;
       use_map = map_waves <= sort_waves;
@@ -1127,8 +1126,8 @@ cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
         std::fprintf(stderr,
                      "[qsa-metadata] routes=%d model_blocks=%d map_smem=%zu B map_ctas/sm=%d "
                      "sort_ctas/sm=%d sms=%d -> %s\n",
-                     params.groups, params.model_block_bound, map_smem_bytes,
-                     cache.map_blocks_per_sm, cache.sort_blocks_per_sm, geometry.sm_count,
+                     params.groups, params.model_block_bound, map_smem_bytes, map_ctas_per_sm,
+                     kQTokenKvBlockSparseSortCtasPerSm, geometry.sm_count,
                      use_map ? "map" : "sort");
       }
     }
