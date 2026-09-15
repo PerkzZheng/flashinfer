@@ -33,14 +33,12 @@ constexpr int kQTokenKvBlockSparseSparseBlockSize = 4;
 constexpr int kQTokenKvBlockSparseMaxBlockTopK = 512;
 constexpr int kQTokenKvBlockSparseMembershipsPerWord = 4;
 constexpr int kQTokenKvBlockSparseQ1BlockThreads = 256;
-// Grouped routes whose logical model length fits this many sparse blocks
-// (128K tokens at block size four) build their union in a shared-memory byte
-// map instead of radix sorting; longer models keep the bounded sort path.
-constexpr int kQTokenKvBlockSparseBitmapMaxBlocks = 32768;
+// Grouped routes build their union in a shared-memory block map (bytes for
+// prefixes up to 32768 blocks, one bit per block beyond: 1M tokens at block
+// size four = 32 KiB) sized per launch from the model bound; models whose map
+// would exceed the device's opt-in dynamic shared-memory limit keep the bounded
+// sort path.
 constexpr int kQTokenKvBlockSparseBitmapBlockThreads = 512;
-// Block-table row entries staged in shared memory by the byte-map kernel. Wider
-// page tables fall back to direct global gathers in the emit phase.
-constexpr int kQTokenKvBlockSparseBitmapBlockTableStage = 1024;
 
 template <int GroupSize>
 struct QTokenKvBlockSparseTouchedMetadataKernelTraits;
@@ -100,8 +98,8 @@ struct QTokenKvBlockSparseTouchedMetadataParams {
   uint_fastdiv candidates_per_query;
   uint_fastdiv subpages_per_storage_page;
   bool release_pdl;
-  // Diagnostic: bypass the shared-memory byte-map union and use the bounded
-  // radix-sort path even when the model length fits the byte map.
+  // Diagnostic: bypass the shared-memory bit-map union and use the bounded
+  // radix-sort path even when the model length fits the bit map.
   bool force_sort_union;
   // Issue the PDL release at kernel entry (default) so the dependent attention
   // grid's launch and prologue overlap this kernel; false keeps the historical
@@ -570,30 +568,86 @@ __global__ __launch_bounds__(
 }
 
 // ---------------------------------------------------------------------------
-// Shared-memory byte-map union for grouped routes.
+// Shared-memory map union for grouped routes.
 //
-// One CTA per route. Every logical sparse block of the model's causal prefix
-// owns one byte holding the OR of the group's query-membership bits, so the
-// union is formed by scattering at most G * (topk + 1) candidates with
-// 32-bit shared-memory atomics, and the ascending compact list falls out of a
-// single block-wide prefix sum over non-zero bytes. This replaces the
+// One CTA per route. The route's visible causal prefix of logical sparse
+// blocks is mapped in dynamic shared memory sized per launch from the model
+// bound, so the union is formed by scattering at most G * (topk + 1)
+// candidates with shared-memory atomics, and the ascending compact list falls
+// out of a single block-wide prefix sum over per-word counts. Two granularities
+// share the same buffer and are chosen per route from its causal prefix:
+//
+//   * byte map (prefix <= kQTokenKvBlockSparseByteMapMaxBlocks): one byte per
+//     block holds the OR of the query-membership bits, so the compaction pass
+//     emits both the block and its membership directly. Four blocks per word
+//     keep the scatter atomics nearly conflict-free.
+//   * bit map (longer prefixes): one bit per block (1M tokens = 32 KiB), then
+//     each candidate recovers its block's compact rank from the prefix
+//     (popcount of the preceding words and lower bits) and ORs its query bit
+//     into the compact entry's membership byte.
+//
+// Per-thread word ranges are contiguous (so the compact list stays ascending)
+// but stored with an odd padded stride, keeping the clear/count/compaction
+// loops free of shared-memory bank conflicts at large maps. This replaces the
 // three-pass block radix sort and two collective scans of the bounded sort
-// path with work proportional to the visible logical prefix, which is at most
-// kQTokenKvBlockSparseBitmapMaxBlocks bytes of shared memory.
+// path with work proportional to the visible logical prefix; models whose map
+// would not fit the device's opt-in dynamic shared memory (about 6M tokens on
+// SM100) keep the sort path.
 // ---------------------------------------------------------------------------
+// Longest causal prefix (in sparse blocks) mapped at byte granularity.
+constexpr int kQTokenKvBlockSparseByteMapMaxBlocks = 32768;
+
 template <int GroupSize>
 struct QTokenKvBlockSparseBitmapSharedStorage {
   static constexpr int kMaxUnionPages = GroupSize * (kQTokenKvBlockSparseMaxBlockTopK + 1);
-  static constexpr int kMapWords = kQTokenKvBlockSparseBitmapMaxBlocks / 4;
 
   typename cub::BlockScan<int, kQTokenKvBlockSparseBitmapBlockThreads>::TempStorage scan;
-  // Four one-byte membership masks per word, indexed by logical block.
-  uint32_t membership_map[kMapWords];
-  // Ascending compact union: bits [0, 24) logical block, bits [24, 32) mask.
+  // Ascending compact union: bits [0, 24) logical block, bits [24, 32) query
+  // membership (written directly by the byte map, OR-reduced by the bit map).
   uint32_t compact_union[kMaxUnionPages];
+  // Compact rank of the first entry in each thread's contiguous word range.
+  int32_t thread_rank_begin[kQTokenKvBlockSparseBitmapBlockThreads];
   QTokenKvBlockSparseRouteState route;
   int32_t union_pages;
 };
+
+// Map words allocated for a model of `blocks` logical blocks: the larger of the
+// bit map and the byte map (capped at the byte-map prefix limit), never below
+// the full byte-map capacity so every launch carries the same 32 KiB map and
+// shared-memory configuration regardless of the model bound.
+__host__ __device__ constexpr int QTokenKvBlockSparseMapWords(int32_t blocks) {
+  const int bit_words = (blocks + 31) / 32;
+  const int byte_blocks =
+      blocks < kQTokenKvBlockSparseByteMapMaxBlocks ? blocks : kQTokenKvBlockSparseByteMapMaxBlocks;
+  const int byte_words = (byte_blocks + 3) / 4;
+  return bit_words > byte_words ? bit_words : byte_words;
+}
+
+// Words each thread owns for a map of `map_words`, and the padded storage
+// stride between consecutive threads' ranges (odd, so lanes touch distinct
+// banks when they walk their ranges in lockstep).
+__host__ __device__ constexpr int QTokenKvBlockSparseWordsPerThread(int map_words) {
+  return (map_words + kQTokenKvBlockSparseBitmapBlockThreads - 1) /
+         kQTokenKvBlockSparseBitmapBlockThreads;
+}
+__host__ __device__ constexpr int QTokenKvBlockSparseMapStride(int words_per_thread) {
+  return words_per_thread + ((words_per_thread & 1) == 0 ? 1 : 0);
+}
+
+template <int GroupSize>
+__host__ __device__ constexpr size_t QTokenKvBlockSparseBitmapFixedSmemBytes() {
+  return (sizeof(QTokenKvBlockSparseBitmapSharedStorage<GroupSize>) + 15) / 16 * 16;
+}
+
+// Dynamic shared memory of the map kernel: the fixed storage followed by the
+// padded map sized for the model's full logical prefix.
+template <int GroupSize>
+__host__ __device__ constexpr size_t QTokenKvBlockSparseBitmapSmemBytes(int32_t model_block_bound) {
+  const int stride = QTokenKvBlockSparseMapStride(
+      QTokenKvBlockSparseWordsPerThread(QTokenKvBlockSparseMapWords(model_block_bound)));
+  return QTokenKvBlockSparseBitmapFixedSmemBytes<GroupSize>() +
+         static_cast<size_t>(kQTokenKvBlockSparseBitmapBlockThreads) * stride * sizeof(uint32_t);
+}
 
 template <typename PositionType, int GroupSize, bool PackedQuery>
 __global__ __launch_bounds__(
@@ -606,10 +660,14 @@ __global__ __launch_bounds__(
   constexpr int kMaximumCandidates = GroupSize * (kQTokenKvBlockSparseMaxBlockTopK + 1);
   constexpr int kItemsPerThread = (kMaximumCandidates + kBlockThreads - 1) / kBlockThreads;
   static_assert(GroupSize <= 8, "query membership is stored in one byte");
-  static_assert(kQTokenKvBlockSparseBitmapMaxBlocks < (1 << 24),
-                "compact entries keep the logical block in 24 bits");
+  static_assert(kQTokenKvBlockSparseBitmapBlockThreads * 32 * 128 <= (1 << 24),
+                "bit-map prefixes up to the shared-memory limit keep the block in 24 bits");
+  using SharedStorage = QTokenKvBlockSparseBitmapSharedStorage<GroupSize>;
 
-  __shared__ QTokenKvBlockSparseBitmapSharedStorage<GroupSize> shared;
+  extern __shared__ __align__(16) unsigned char q_token_kv_block_sparse_map_smem[];
+  SharedStorage& shared = *reinterpret_cast<SharedStorage*>(q_token_kv_block_sparse_map_smem);
+  uint32_t* block_map = reinterpret_cast<uint32_t*>(q_token_kv_block_sparse_map_smem +
+                                                    QTokenKvBlockSparseBitmapFixedSmemBytes<GroupSize>());
 
   if (threadIdx.x == 0) {
     shared.route = {0, -1, 0, 0, -1, -1};
@@ -656,16 +714,39 @@ __global__ __launch_bounds__(
       reinterpret_cast<uint8_t*>(params.q_token_kv_block_sparse_page_memberships +
                                  static_cast<int64_t>(blockIdx.x) * params.membership_words);
 
-  // Only the visible prefix of the byte map is cleared, scattered, and scanned.
-  const int map_words = static_cast<int>((active_logical_capacity + 3u) / 4u);
-  for (int word = threadIdx.x; word < map_words; word += kBlockThreads) {
-    shared.membership_map[word] = 0u;
+  // Granularity and geometry of this route's map (CTA-uniform). Only the
+  // visible prefix is cleared, scattered, and scanned.
+  const bool use_byte_map =
+      active_logical_capacity <= static_cast<uint32_t>(kQTokenKvBlockSparseByteMapMaxBlocks);
+  const int blocks_per_word = use_byte_map ? 4 : 32;
+  const int map_words = static_cast<int>((active_logical_capacity + blocks_per_word - 1) /
+                                         static_cast<uint32_t>(blocks_per_word));
+  const int words_per_thread = QTokenKvBlockSparseWordsPerThread(map_words);
+  const int map_stride = QTokenKvBlockSparseMapStride(words_per_thread);
+  // Storage index of logical map word `word` (owner thread range + offset).
+  auto map_index = [&](int word) -> int {
+    if (words_per_thread == 1) {
+      return word;
+    }
+    const int owner = word / words_per_thread;
+    return owner * map_stride + (word - owner * words_per_thread);
+  };
+  const int word_begin = threadIdx.x * words_per_thread;
+  const int word_end = word_begin + words_per_thread < map_words ? word_begin + words_per_thread
+                                                                   : map_words;
+  const int storage_begin = threadIdx.x * map_stride;
+
+  for (int word = word_begin; word < word_end; ++word) {
+    block_map[storage_begin + (word - word_begin)] = 0u;
   }
   __syncthreads();
 
-  // Scatter every live candidate's query bit into its logical block's byte.
-  // The candidate enumeration matches the sort path exactly: selected complete
-  // blocks first, then the synthesized partial causal tail per query.
+  // Scatter every live candidate. The candidate enumeration matches the sort
+  // path exactly: selected complete blocks first, then the synthesized partial
+  // causal tail per query. Accepted candidates stay in registers for the
+  // bit-map membership pass.
+  int32_t candidate_blocks[kItemsPerThread];
+  uint32_t candidate_queries[kItemsPerThread];
 #pragma unroll
   for (int item = 0; item < kItemsPerThread; ++item) {
     const uint32_t candidate_rank = item * kBlockThreads + threadIdx.x;
@@ -698,39 +779,54 @@ __global__ __launch_bounds__(
         logical_block = visible_tokens / kQTokenKvBlockSparseSparseBlockSize;
       }
     }
+    candidate_blocks[item] = -1;
+    candidate_queries[item] = query;
     if (logical_block >= 0 && logical_block < static_cast<int64_t>(active_logical_capacity)) {
       const uint32_t block = static_cast<uint32_t>(logical_block);
-      atomicOr(&shared.membership_map[block >> 2], (uint32_t{1} << query) << ((block & 3u) * 8u));
+      candidate_blocks[item] = static_cast<int32_t>(block);
+      if (use_byte_map) {
+        atomicOr(&block_map[map_index(block >> 2)], (uint32_t{1} << query) << ((block & 3u) * 8u));
+      } else {
+        atomicOr(&block_map[map_index(block >> 5)], uint32_t{1} << (block & 31u));
+      }
     }
   }
   __syncthreads();
 
   // Each thread owns a contiguous word range so the compact list stays in
   // ascending logical order; a block-wide exclusive sum ranks its entries.
-  const int words_per_thread = (map_words + kBlockThreads - 1) / kBlockThreads;
-  const int word_begin = threadIdx.x * words_per_thread;
-  const int word_end = word_begin + words_per_thread < map_words ? word_begin + words_per_thread
-                                                                   : map_words;
   int local_unique_count = 0;
   for (int word = word_begin; word < word_end; ++word) {
-    local_unique_count += __popc(__vsetne4(shared.membership_map[word], 0u));
+    const uint32_t value = block_map[storage_begin + (word - word_begin)];
+    local_unique_count += use_byte_map ? __popc(__vsetne4(value, 0u)) : __popc(value);
   }
   int thread_output_begin = 0;
   int union_pages = 0;
   cub::BlockScan<int, kBlockThreads>(shared.scan)
       .ExclusiveSum(local_unique_count, thread_output_begin, union_pages);
+  shared.thread_rank_begin[threadIdx.x] = thread_output_begin;
 
   int output_rank = thread_output_begin;
   for (int word = word_begin; word < word_end; ++word) {
-    const uint32_t masks = shared.membership_map[word];
-    if (masks != 0u) {
+    const uint32_t value = block_map[storage_begin + (word - word_begin)];
+    if (value == 0u) {
+      continue;
+    }
+    if (use_byte_map) {
 #pragma unroll
       for (int byte = 0; byte < 4; ++byte) {
-        const uint32_t membership = (masks >> (byte * 8)) & 0xFFu;
+        const uint32_t membership = (value >> (byte * 8)) & 0xFFu;
         if (membership != 0u) {
           shared.compact_union[output_rank++] =
               static_cast<uint32_t>(word * 4 + byte) | (membership << 24);
         }
+      }
+    } else {
+      uint32_t bits = value;
+      while (bits != 0u) {
+        const int bit = __ffs(static_cast<int>(bits)) - 1;
+        shared.compact_union[output_rank++] = static_cast<uint32_t>(word * 32 + bit);
+        bits &= bits - 1u;
       }
     }
   }
@@ -739,25 +835,48 @@ __global__ __launch_bounds__(
   }
   __syncthreads();
 
+  if (!use_byte_map) {
+    // Bit-map membership pass: each accepted candidate recovers its block's
+    // compact rank (owner thread's rank prefix + popcount of the preceding
+    // words and lower bits) and ORs its query bit into that entry's high byte.
+#pragma unroll
+    for (int item = 0; item < kItemsPerThread; ++item) {
+      const int32_t block = candidate_blocks[item];
+      if (block >= 0) {
+        const int word = block >> 5;
+        const int owner = word / words_per_thread;
+        int rank = shared.thread_rank_begin[owner];
+        const int owner_storage = owner * map_stride;
+        for (int preceding = owner * words_per_thread; preceding < word; ++preceding) {
+          rank += __popc(block_map[owner_storage + (preceding - owner * words_per_thread)]);
+        }
+        rank += __popc(block_map[owner_storage + (word - owner * words_per_thread)] &
+                       ((uint32_t{1} << (block & 31)) - 1u));
+        atomicOr(&shared.compact_union[rank], (uint32_t{1} << candidate_queries[item]) << 24);
+      }
+    }
+    __syncthreads();
+  }
+
   // Balanced emit: every thread translates a strided share of the compact
   // union through the request's dense block table. Gather the page IDs of a
   // batch first so their global loads overlap.
   constexpr int kEmitBatch = 4;
   for (int rank_base = 0; rank_base < union_pages; rank_base += kEmitBatch * kBlockThreads) {
-    uint32_t entries[kEmitBatch];
+    uint32_t memberships[kEmitBatch];
     int32_t physical_pages[kEmitBatch];
     uint32_t subpages[kEmitBatch];
 #pragma unroll
     for (int j = 0; j < kEmitBatch; ++j) {
       const int rank = rank_base + j * kBlockThreads + threadIdx.x;
-      entries[j] = 0u;
+      memberships[j] = 0u;
       physical_pages[j] = -1;
       subpages[j] = 0u;
       if (rank < union_pages) {
-        entries[j] = shared.compact_union[rank];
+        const uint32_t entry = shared.compact_union[rank];
+        memberships[j] = entry >> 24;
         uint32_t storage_page;
-        params.subpages_per_storage_page.divmod(entries[j] & 0xFFFFFFu, storage_page,
-                                                subpages[j]);
+        params.subpages_per_storage_page.divmod(entry & 0xFFFFFFu, storage_page, subpages[j]);
         if (storage_page < static_cast<uint32_t>(params.page_table_width)) {
           physical_pages[j] =
               params.block_table[static_cast<int64_t>(shared.route.request) *
@@ -776,7 +895,7 @@ __global__ __launch_bounds__(
           locator = static_cast<int32_t>(static_cast<uint32_t>(physical_pages[j]) *
                                              static_cast<uint32_t>(params.subpages_per_storage_page) +
                                          subpages[j]);
-          output_membership = static_cast<uint8_t>(entries[j] >> 24);
+          output_membership = static_cast<uint8_t>(memberships[j]);
         }
         group_indices[rank] = locator;
         group_memberships[rank] = output_membership;
@@ -807,13 +926,54 @@ __global__ __launch_bounds__(
   ReleasePdlDependents(params, /*at_entry=*/false);
 }
 
+// Opt-in dynamic shared-memory limit of the current device, cached per device.
+inline int QTokenKvBlockSparseMaxDynamicSmemBytes(int device) {
+  static int cached[64] = {};
+  if (device < 0 || device >= 64) {
+    return 0;
+  }
+  if (cached[device] == 0) {
+    int value = 0;
+    if (cudaDeviceGetAttribute(&value, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) !=
+        cudaSuccess) {
+      value = -1;
+    }
+    cached[device] = value;
+  }
+  return cached[device];
+}
+
 template <typename PositionType, int GroupSize, bool PackedQuery>
 cudaError_t LaunchQTokenKvBlockSparseTouchedMetadataTyped(
     QTokenKvBlockSparseTouchedMetadataParams<PositionType> params, cudaStream_t stream) {
-  if (params.model_block_bound <= kQTokenKvBlockSparseBitmapMaxBlocks &&
-      !params.force_sort_union) {
+  const size_t bitmap_smem_bytes =
+      QTokenKvBlockSparseBitmapSmemBytes<GroupSize>(params.model_block_bound);
+  int device = 0;
+  cudaError_t status = cudaGetDevice(&device);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  const int max_dynamic_smem_bytes = QTokenKvBlockSparseMaxDynamicSmemBytes(device);
+  if (!params.force_sort_union && max_dynamic_smem_bytes > 0 &&
+      bitmap_smem_bytes <= static_cast<size_t>(max_dynamic_smem_bytes)) {
     auto kernel = QTokenKvBlockSparseBitmapMetadataKernel<PositionType, GroupSize, PackedQuery>;
-    kernel<<<params.groups, kQTokenKvBlockSparseBitmapBlockThreads, 0, stream>>>(params);
+    // The dependent attention grid needs the maximum shared-memory carveout;
+    // pin this kernel to the same carveout so SMs that hosted a metadata CTA
+    // do not reconfigure (and drain) before accepting attention CTAs.
+    status = cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                  cudaSharedmemCarveoutMaxShared);
+    if (status != cudaSuccess) {
+      return status;
+    }
+    if (bitmap_smem_bytes > 48 * 1024) {
+      status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(bitmap_smem_bytes));
+      if (status != cudaSuccess) {
+        return status;
+      }
+    }
+    kernel<<<params.groups, kQTokenKvBlockSparseBitmapBlockThreads, bitmap_smem_bytes, stream>>>(
+        params);
     return cudaGetLastError();
   }
   constexpr int kBlockThreads =

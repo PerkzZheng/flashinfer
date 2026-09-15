@@ -898,6 +898,12 @@ def test_q_token_kv_block_sparse_sort_union_matches_reference(
         (2, False, 32 * 1024),
         (4, True, 64 * 1024),
         (5, False, 128 * 1024),
+        # Bit-map union past one million tokens (static-sized shared memory).
+        (4, False, 1024 * 1024 + 1),
+        # Bit-map union with opt-in dynamic shared memory (128 KiB map).
+        (2, True, 4 * 1024 * 1024),
+        # Map would exceed the opt-in limit: bounded radix-sort fallback.
+        (5, False, 8 * 1024 * 1024),
     ),
 )
 def test_q_token_kv_block_sparse_sort_union_wide_context_matches_reference(

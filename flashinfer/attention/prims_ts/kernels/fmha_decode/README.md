@@ -20,18 +20,28 @@ direct static launch.
 QToken-KvBlock-Sparse-Attention metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
 blocks and causal tail directly through the dense page table. Q2/Q4/Q5 build
 the union of at most ``group_size * (block_topk + 1)`` tagged selected/tail
-candidates in shared memory. When the model's logical block bound fits the
-32 KiB shared-memory byte map (32768 blocks, 131072 tokens at block size 4),
-each candidate ORs its query bit into its logical block's byte, a block-wide
-count/scan over the visible prefix compacts the non-zero bytes in ascending
-order, and only that compact union is mapped through the dense page table.
-Dense routes issue their selected-block loads before the route is resolved so
-those loads overlap the route reads. Longer models fall back to the bounded
-shared-memory radix sort (also selectable with
-``FLASHINFER_QSA_METADATA_UNION=sort``), which uniques equal logical IDs while
-OR-reducing membership bits. Neither path scales its work or temporary storage
-with the global cache capacity. Plain Int32 locators and packed membership
-words remain separate outputs; membership bits are never fused into a locator.
+candidates in a shared-memory block map over the route's visible causal prefix.
+The map is dynamic shared memory sized per launch from ``max_seq_len_kv`` (one
+bit per logical sparse block: 1M tokens = 32 KiB; the launcher opts in above
+48 KiB, so models up to roughly 6M tokens fit on SM100) and is pinned to the
+maximum shared-memory carveout so SMs need no reconfiguration before hosting
+the dependent attention CTAs. Each route picks its granularity: prefixes up to
+32768 blocks use one byte per block that directly accumulates the query
+membership bits (four blocks per word keep the scatter atomics nearly
+conflict-free); longer prefixes use one bit per block and each candidate then
+recovers its block's compact rank from the prefix popcounts to OR its query bit
+into the compact entry. In both cases a block-wide count/scan over contiguous
+per-thread word ranges (stored with an odd padded stride, so the loops stay
+bank-conflict-free at large maps) compacts the union in ascending order, and
+only that compact union is mapped through the dense page table. Dense routes
+issue their selected-block loads before the route is resolved so those loads
+overlap the route reads. Models whose map would exceed the device's opt-in
+shared-memory limit fall back to the bounded shared-memory radix sort (also
+selectable with ``FLASHINFER_QSA_METADATA_UNION=sort``), which uniques equal
+logical IDs while OR-reducing membership bits. Neither path scales its work or
+temporary storage with the global cache capacity. Plain Int32 locators and
+packed membership words remain separate outputs; membership bits are never
+fused into a locator.
 
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
 (PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers

@@ -58,7 +58,7 @@ void CheckSameDevice(const TensorView& reference, const TensorView& tensor, cons
 }
 
 // Diagnostic switch (not public API): FLASHINFER_QSA_METADATA_UNION=sort keeps the
-// radix-sort union even when the model length fits the shared-memory byte map.
+// radix-sort union even when the model length fits the shared-memory bit map.
 bool ForceSortUnion() {
   static const bool force_sort = [] {
     const char* mode = std::getenv("FLASHINFER_QSA_METADATA_UNION");
