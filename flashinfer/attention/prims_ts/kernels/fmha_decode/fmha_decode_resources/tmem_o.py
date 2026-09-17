@@ -470,7 +470,9 @@ class TmemOResource(DecodeGenResourceBase):
                         # Advance V and P to the next MMA-K slice inside the
                         # staged head-dim tile.
                         v_desc = v_desc + Int32(
-                            (cfg.head_dim_kv_stage * 2) if cfg.use_fp8_qkv else 128
+                            (min(cfg.head_dim_kv_stage, 128) * 2)
+                            if cfg.use_fp8_qkv
+                            else 128
                         )
                         if cutlass.const_expr(not cfg.uses_tmem_p):
                             if cutlass.const_expr(
