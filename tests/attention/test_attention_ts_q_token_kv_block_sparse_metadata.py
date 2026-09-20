@@ -1863,6 +1863,7 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
 
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
+        _flat_locator_heads = 1
 
         def _run_unchecked(
             self,
@@ -2013,6 +2014,7 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
 
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
+        _flat_locator_heads = 1
 
         def _run_unchecked(
             self,
@@ -2115,6 +2117,7 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
 
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
+        _flat_locator_heads = 1
 
         def _run_unchecked(
             self,
@@ -2497,6 +2500,7 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
 
     class FakeAttentionPlan:
         _direct_q1_inputs = ()
+        _flat_locator_heads = 1
 
         def _run_unchecked(
             self,
