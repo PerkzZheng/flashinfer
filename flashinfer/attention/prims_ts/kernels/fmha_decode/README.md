@@ -39,6 +39,15 @@ stay in the existing immutable metadata buffer; Softmax reads packed words for
 the current KV tile directly from GMEM. This does not change query grouping or
 the caller's split-KV permission.
 
+Packed QToken-KvBlock-Sparse-Attention uses an ordinary rank-3 Q TensorMap
+over `[D, Hq, total_q_tokens]`. A grouped box loads the configured query group,
+not spare token slots in `tileSizeQ`; the Q barrier credits rows outside that
+box separately. `qo_indptr` still supplies sequence starts and valid lengths.
+Loads across an internal sequence boundary occupy only inactive query rows:
+existing row masks and guarded stores discard those rows, and QK/softmax/PV
+do not mix different queries. TMA zero-fills beyond the packed allocation.
+Other packed attention paths retain their ragged Q descriptors.
+
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
 (PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
 release at entry to overlap the attention prologue; the dependency wait still

@@ -3671,8 +3671,8 @@ def fmha_decode_launch(
     q_box_dims: tuple[object, ...]
     if cutlass.const_expr(cfg.use_variable_seqlens_q):
         # Packed Q is physically [sum_q_tokens, num_heads_q, head_dim]. Flatten
-        # the two head modes into Hq so the ragged token axis still fits in a
-        # rank-5 tensor map after the helper inserts its two synthetic modes.
+        # the head modes into Hq. Sparse Q uses this rank-3 map directly;
+        # other packed paths retain per-sequence ragged zero fill.
         q_tma = cute.make_tensor(
             q_iter,
             cute.make_layout(
@@ -3684,7 +3684,7 @@ def fmha_decode_launch(
             q_box_dims = (
                 tma_box0_q,
                 cfg.heads_q_per_kv,
-                cfg.q_tokens_per_cta,
+                cfg.q_tma_tokens_per_cta,
             )
             q_groups = Int32(
                 (cfg.max_seq_len_q + cfg.q_tokens_per_cta - 1) // cfg.q_tokens_per_cta
@@ -3695,13 +3695,24 @@ def fmha_decode_launch(
                 (cfg.heads_q_per_kv + cfg.tile_size_q - 1) // cfg.tile_size_q
             )
             q_groups = Int32(cfg.max_seq_len_q) * head_ctas_per_token
-        tma_desc_q = create_tensor_map_ragged_from_tensor(
-            q_tma,
-            box_dims=q_box_dims,
-            ragged_dim=2,
-            stride_order=(0, 1, 2),
-            swizzle=tma_swizzle_q,
-        )
+        if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_route):
+            # A partial group may read the next sequence into inactive Q rows.
+            # QK/softmax/PV rows are independent; row masks and guarded stores
+            # discard them. Physical allocation bounds still get TMA zero fill.
+            tma_desc_q = create_tensor_map_tiled_from_view(
+                q_tma,
+                box_dims=q_box_dims,
+                stride_order=(0, 1, 2),
+                swizzle=tma_swizzle_q,
+            )
+        else:
+            tma_desc_q = create_tensor_map_ragged_from_tensor(
+                q_tma,
+                box_dims=q_box_dims,
+                ragged_dim=2,
+                stride_order=(0, 1, 2),
+                swizzle=tma_swizzle_q,
+            )
     else:
         q_tma = cute.make_tensor(
             q_iter,

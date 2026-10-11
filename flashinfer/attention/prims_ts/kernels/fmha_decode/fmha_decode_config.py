@@ -994,6 +994,13 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def q_tma_tokens_per_cta(self) -> int:
+        """Q tokens copied by a box, excluding spare sparse-group slots."""
+        if self.use_variable_seqlens_q and self.uses_q_token_kv_block_sparse_page_route:
+            return min(self.max_seq_len_q, self.q_tokens_per_cta)
+        return self.q_tokens_per_cta
+
+    @property
     def num_q_ctas(self) -> int:
         """Return Q-CTA groups per ``(batch, KV head)`` launch tile.
 
@@ -1020,15 +1027,13 @@ class FmhaDecodeConfig:
     @property
     def q_tma_rows_per_cta(self) -> int:
         """Q rows represented by the configured tensor-map box."""
-        return _q_tma_rows_per_cta(
-            self.tile_size_q,
-            self.heads_q_per_kv,
-            self.groups_tokens_heads_q,
-        )
+        if self.groups_tokens_heads_q:
+            return self.q_tma_tokens_per_cta * self.heads_q_per_kv
+        return self.tile_size_q
 
     @property
     def q_manual_padding_rows(self) -> int:
-        """Grouped structural Q rows completed without a TMA instruction."""
+        """Grouped Q rows whose transaction bytes are completed without TMA."""
         if self.groups_tokens_heads_q:
             return self.tile_size_q - self.q_tma_rows_per_cta
         return 0

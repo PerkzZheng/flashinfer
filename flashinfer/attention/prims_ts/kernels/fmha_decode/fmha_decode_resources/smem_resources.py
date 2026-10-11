@@ -522,7 +522,7 @@ class SmemQResource(DecodeGenResourceBase):
         logical_h_k_idx: Int32,
         logical_b_idx: Int32,
         head_dim_offset: Int32,
-    ) -> tuple[Int32, Int32, Int32, Int32, Int32]:
+    ) -> tuple[Int32, ...]:
         """Map a logical Q CTA to token-major tensor-map coordinates."""
         cfg = self.cfg
         if cutlass.const_expr(cfg.use_variable_seqlens_q):
@@ -540,6 +540,12 @@ class SmemQResource(DecodeGenResourceBase):
                     cfg.heads_q_per_kv
                 ) + head_cta_idx * Int32(cfg.tile_size_q)
                 tokens_per_box = 1
+            if cutlass.const_expr(cfg.uses_q_token_kv_block_sparse_page_route):
+                return (
+                    head_dim_offset,
+                    global_head_idx,
+                    self.q_token_offset + token_idx,
+                )
             packed_coords = transform_ragged_coords(
                 (
                     head_dim_offset,
@@ -592,7 +598,7 @@ class SmemQResource(DecodeGenResourceBase):
 
     @cute.jit
     def _complete_grouped_q_padding(self, stage_info: StageInfo) -> None:
-        """Account structural grouped rows that have no corresponding TMA."""
+        """Credit the Q tile rows not covered by the configured TMA box."""
         cfg = self.cfg
         if cutlass.const_expr(
             cfg.groups_tokens_heads_q and cfg.q_manual_padding_rows > 0

@@ -8367,6 +8367,179 @@ def test_q_token_sparse_geometry_graph(
 @pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
+    ("group", "dim", "ratio", "dtype", "split_kv"),
+    (
+        (3, 64, 3, torch.bfloat16, True),
+        (8, 256, 12, torch.bfloat16, False),
+        (3, 128, 12, _FP8, True),
+        (8, 256, 12, _FP8, False),
+    ),
+)
+def test_q_token_sparse_packed_query_boundaries(group, dim, ratio, dtype, split_kv):
+    """Query overfetch must not leak across partial packed groups or graph replays."""
+    torch.manual_seed(73621 + group)
+    lengths = [group - 1, group, 1, group - 2] * (1 if split_kv else 64)
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    batch, rows, hkv = len(lengths), offsets[-1], 2
+    hq = hkv * ratio
+    context, page, topk = (4099, 128, 512) if split_kv else (259, 16, 3)
+    width = (context + page - 1) // page
+    q = (0.25 * torch.randn(rows, hq, dim, device="cuda", dtype=torch.bfloat16)).to(
+        dtype
+    )
+    k = (
+        0.25
+        * torch.randn(
+            batch * width, hkv, page, dim, device="cuda", dtype=torch.bfloat16
+        )
+    ).to(dtype)
+    v = (0.25 * torch.randn_like(k.float())).to(dtype)
+    table = torch.randperm(batch * width, device="cuda", dtype=torch.int32).view(
+        batch, width
+    )
+    k[table[:, -1].long(), :, context % page :] = 0
+    v[table[:, -1].long(), :, context % page :] = 0
+    qo_indptr = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    requests = torch.repeat_interleave(
+        torch.arange(batch, device="cuda", dtype=torch.int32),
+        torch.tensor(lengths, device="cuda"),
+    )
+    positions = torch.tensor(
+        [p for length in lengths for p in range(context - length, context)],
+        device="cuda",
+        dtype=torch.int64,
+    )
+    candidates = (context - group - 4) // 4
+    ids = (
+        torch.rand(rows, candidates, device="cuda")
+        .argsort(-1)[:, :topk]
+        .to(torch.int32)
+        .contiguous()
+    )
+    output_storage = torch.full(
+        (rows + 2, hq, dim), -37.0, device="cuda", dtype=torch.bfloat16
+    )
+    out = output_storage[:rows]
+    workspace = torch.empty(
+        get_q_token_kv_block_sparse_workspace_size(
+            q,
+            k,
+            table,
+            block_topk=topk,
+            max_seq_len_kv=context,
+            qo_indptr=qo_indptr,
+            seq_len_q=group,
+            o_data_type=out.dtype,
+            split_kv=split_kv,
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        batch,
+        group,
+        hq,
+        hkv,
+        dim,
+        4,
+        page,
+        topk,
+        context,
+        device=q.device,
+        workspace_buffer=workspace,
+        use_packed_q=True,
+        split_kv=split_kv,
+        q_data_type=dtype,
+        o_data_type=out.dtype,
+    )
+
+    def run():
+        wrapper.run(
+            q, (k, v), table, ids, requests, positions, qo_indptr=qo_indptr, out=out
+        )
+
+    def check():
+        # Include both sides of the internal boundary and the true packed end.
+        for row in sorted({0, offsets[1] - 1, offsets[1], offsets[1] + 1, rows - 1}):
+            selected = (
+                ids[row].long()[:, None] * 4 + torch.arange(4, device="cuda")
+            ).flatten()
+            position = int(positions[row])
+            tail = torch.arange((position + 1) // 4 * 4, position + 1, device="cuda")
+            selected = torch.cat((selected, tail))
+            physical = table[int(requests[row]), selected // page].long()
+            keys = (
+                k[physical, :, selected % page].float().repeat_interleave(ratio, dim=1)
+            )
+            values = (
+                v[physical, :, selected % page].float().repeat_interleave(ratio, dim=1)
+            )
+            scores = torch.einsum("hd,khd->hk", q[row].float(), keys) * dim**-0.5
+            expected = torch.einsum("hk,khd->hd", scores.softmax(-1), values)
+            torch.testing.assert_close(out[row].float(), expected, rtol=0.03, atol=0.01)
+        torch.testing.assert_close(
+            output_storage[rows:],
+            torch.full_like(output_storage[rows:], -37.0),
+            rtol=0,
+            atol=0,
+        )
+
+    run()
+    check()
+    original = out.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    out.fill_(torch.nan)
+    graph.replay()
+    torch.testing.assert_close(out, original, rtol=0, atol=0)
+
+    # Repartition the first two sequences without changing captured storage.
+    saved_requests, saved_positions = requests.clone(), positions.clone()
+    shifted_lengths = [group, group - 1, *lengths[2:]]
+    qo_indptr[1] += 1
+    requests.copy_(
+        torch.repeat_interleave(
+            torch.arange(batch, device="cuda", dtype=torch.int32),
+            torch.tensor(shifted_lengths, device="cuda"),
+        )
+    )
+    positions.copy_(
+        torch.tensor(
+            [p for length in shifted_lengths for p in range(context - length, context)],
+            device="cuda",
+            dtype=positions.dtype,
+        )
+    )
+    out.fill_(torch.nan)
+    graph.replay()
+    check()
+    qo_indptr[1] -= 1
+    requests.copy_(saved_requests)
+    positions.copy_(saved_positions)
+
+    # A partial group may fetch the following sequence into inactive Q rows.
+    # Even NaNs there must not contaminate any other query's output.
+    begin, end = offsets[1], offsets[2]
+    q[begin:end].fill_(float("nan"))
+    out.fill_(torch.nan)
+    graph.replay()
+    torch.testing.assert_close(out[:begin], original[:begin], rtol=0, atol=0)
+    torch.testing.assert_close(out[end:], original[end:], rtol=0, atol=0)
+    torch.testing.assert_close(
+        output_storage[rows:],
+        torch.full_like(output_storage[rows:], -37.0),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
     (
         "dim",
         "dtype",
