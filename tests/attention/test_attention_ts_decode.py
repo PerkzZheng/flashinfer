@@ -8153,23 +8153,44 @@ def test_attention_ts_decode_page_cache_sliding_product(
 @pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
-    ("group", "dim", "ratio", "block", "page", "packed", "shared", "batch", "dtype"),
     (
-        (1, 64, 3, 4, 16, False, False, 256, torch.bfloat16),
-        (3, 128, 4, 8, 16, True, False, 2, torch.bfloat16),
-        (5, 128, 6, 16, 128, False, True, 2, torch.bfloat16),
-        (4, 256, 12, 32, 16, True, False, 256, torch.bfloat16),
-        (8, 64, 3, 64, 128, False, True, 2, torch.bfloat16),
-        (8, 128, 12, 128, 20, True, False, 256, torch.bfloat16),
+        "group",
+        "dim",
+        "ratio",
+        "block",
+        "page",
+        "packed",
+        "shared",
+        "batch",
+        "dtype",
+        "seed",
+    ),
+    (
+        (1, 64, 3, 4, 16, False, False, 256, torch.bfloat16, 71845),
+        (3, 128, 4, 8, 16, True, False, 2, torch.bfloat16, 71845),
+        (5, 128, 6, 16, 128, False, True, 2, torch.bfloat16, 71845),
+        (4, 256, 12, 32, 16, True, False, 256, torch.bfloat16, 71845),
+        (8, 64, 3, 64, 128, False, True, 2, torch.bfloat16, 71845),
+        (8, 128, 12, 128, 20, True, False, 256, torch.bfloat16, 71845),
         # FP8 page fragments with padded Q rows and non-power-of-two storage.
-        (8, 256, 12, 4, 20, True, False, 256, torch.float8_e4m3fn),
+        (8, 256, 12, 4, 20, True, False, 256, torch.float8_e4m3fn, 71845),
+        # On graph replay, one P value is at the 160/176 FP8 rounding boundary.
+        pytest.param(
+            8, 256, 12, 4, 20, True, False, 256, _FP8, 71850, id="fp8-fused-max-bias"
+        ),
         # Query-oriented memberships across one/two-instance and Q64/Q128 profiles.
-        pytest.param(2, 64, 32, 4, 20, False, True, 2, _FP8, id="fp8-query-g2"),
-        pytest.param(3, 128, 12, 4, 20, True, False, 2, _FP8, id="fp8-query-g3"),
-        pytest.param(4, 256, 12, 4, 20, False, True, 256, _FP8, id="fp8-query-g4"),
-        pytest.param(5, 256, 12, 4, 20, True, False, 2, _FP8, id="fp8-query-g5"),
-        pytest.param(6, 128, 12, 4, 20, False, False, 2, _FP8, id="fp8-query-g6"),
-        pytest.param(7, 256, 12, 4, 20, True, True, 256, _FP8, id="fp8-query-g7"),
+        pytest.param(2, 64, 32, 4, 20, False, True, 2, _FP8, 71845, id="fp8-query-g2"),
+        pytest.param(3, 128, 12, 4, 20, True, False, 2, _FP8, 71845, id="fp8-query-g3"),
+        pytest.param(
+            4, 256, 12, 4, 20, False, True, 256, _FP8, 71845, id="fp8-query-g4"
+        ),
+        pytest.param(5, 256, 12, 4, 20, True, False, 2, _FP8, 71845, id="fp8-query-g5"),
+        pytest.param(
+            6, 128, 12, 4, 20, False, False, 2, _FP8, 71845, id="fp8-query-g6"
+        ),
+        pytest.param(
+            7, 256, 12, 4, 20, True, True, 256, _FP8, 71845, id="fp8-query-g7"
+        ),
         pytest.param(
             8,
             64,
@@ -8180,6 +8201,7 @@ def test_attention_ts_decode_page_cache_sliding_product(
             False,
             2,
             _FP8,
+            71845,
             id="fp8-query-layout-d64-r6",
         ),
         pytest.param(
@@ -8192,6 +8214,7 @@ def test_attention_ts_decode_page_cache_sliding_product(
             False,
             256,
             _FP8,
+            71845,
             id="fp8-query-layout-d128-r6",
         ),
         pytest.param(
@@ -8204,6 +8227,7 @@ def test_attention_ts_decode_page_cache_sliding_product(
             False,
             2,
             _FP8,
+            71845,
             id="fp8-query-layout-d128-r12",
         ),
         pytest.param(
@@ -8216,15 +8240,16 @@ def test_attention_ts_decode_page_cache_sliding_product(
             False,
             2,
             _FP8,
+            71845,
             id="fp8-query-layout-d256-r6",
         ),
     ),
 )
 def test_q_token_sparse_geometry_graph(
-    group, dim, ratio, block, page, packed, shared, batch, dtype
+    group, dim, ratio, block, page, packed, shared, batch, dtype, seed
 ):
     """Check sparse geometry and persistent reuse against an independent mask."""
-    torch.manual_seed(71845)
+    torch.manual_seed(seed)
     context, topk, hkv = 1024, 3, 2
     q = torch.randn(
         batch, group, hkv * ratio, dim, device="cuda", dtype=torch.bfloat16
@@ -8330,14 +8355,18 @@ def test_q_token_sparse_geometry_graph(
         scores.masked_fill_(~visible[..., None, :], -torch.inf)
         if dtype == _FP8:
             # This union fits one KV tile. Match FP8 P and its FP32 denominator.
-            # The kernel incorporates P's scale into the log2 exponent before
-            # the FMA. exp(score-max)*448 can round to a different FP8 bin.
+            # Both the max bias and score affine transform contract to FP32
+            # FMAs. Rounding -max*scale separately can select another FP8 bin.
             assert group * (topk + 1) * block <= _FP8_KV_TILE_SIZE
             scale = torch.tensor(
                 dim**-0.5 * math.log2(math.e), device="cuda", dtype=torch.float32
             )
-            bias = -scores.amax(-1, keepdim=True) * scale
-            bias = bias + math.log2(_FP8_PROBABILITY_SCALE)
+            maximum = scores.amax(-1, keepdim=True)
+            bias = torch.addcmul(
+                torch.full_like(maximum, math.log2(_FP8_PROBABILITY_SCALE)),
+                maximum,
+                -scale,
+            )
             probabilities = torch.addcmul(bias, scores, scale).exp2()
             weights = probabilities.to(_FP8).float() / probabilities.sum(
                 -1, keepdim=True
