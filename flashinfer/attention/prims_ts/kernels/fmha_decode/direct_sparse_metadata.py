@@ -59,6 +59,7 @@ class DirectSparseMetadataView:
         lengths,
         sparse_block_size=4,
         fragment_size=4,
+        locator_head_multiplier=1,
         head=0,
     ):
         self.values = (*inputs, qo_indptr, head)
@@ -69,6 +70,7 @@ class DirectSparseMetadataView:
         self.lengths = lengths
         self.sparse_block_size = sparse_block_size
         self.fragment_size = fragment_size
+        self.locator_head_multiplier = locator_head_multiplier
         self.fragments_per_block = sparse_block_size // fragment_size
 
     def __extract_mlir_values__(self):
@@ -86,6 +88,7 @@ class DirectSparseMetadataView:
             lengths=self.lengths,
             sparse_block_size=self.sparse_block_size,
             fragment_size=self.fragment_size,
+            locator_head_multiplier=self.locator_head_multiplier,
             head=new[5],
         )
 
@@ -100,6 +103,7 @@ class DirectSparseMetadataView:
             lengths=self.lengths,
             sparse_block_size=self.sparse_block_size,
             fragment_size=self.fragment_size,
+            locator_head_multiplier=self.locator_head_multiplier,
             head=head,
         )
 
@@ -178,7 +182,14 @@ class DirectSparseMetadataView:
             if storage_page < Int32(table.shape[1]):
                 physical = Int32(table[request, storage_page])
                 if physical >= Int32(0):
-                    result = physical * fragments_per_page + subpage
+                    # The flat HND map reserves every head's page rows. Emit
+                    # the head-zero origin; the TMA consumer adds its KV head.
+                    result = (
+                        physical
+                        * fragments_per_page
+                        * Int32(self.locator_head_multiplier)
+                        + subpage
+                    )
         return result
 
     @cute.jit

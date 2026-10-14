@@ -1615,9 +1615,11 @@ def create_page_offsets_task_one_inst_qkv(
         if membership_lifetime is not None:
             membership_lifetime.commit()
         with domain_loop(0, domain, 1, unroll=1):
-            for label in ("load_k0", "load_v0"):
+            labels = ("load_k0",) if cfg.reuse_shared_kv else ("load_k0", "load_v0")
+            for label in labels:
                 _page_offsets_produce(smem_page_offsets, label, FmhaStage.Loop)
-        _page_offsets_produce(smem_page_offsets, "load_v0", FmhaStage.Tail)
+        if not cfg.reuse_shared_kv:
+            _page_offsets_produce(smem_page_offsets, "load_v0", FmhaStage.Tail)
 
     @_schedule_with_optional_resources
     def page_offsets_schedule(
@@ -2070,13 +2072,33 @@ def create_load_task_one_inst_qkv(
         smem_q.commit()
         if hold_page_window:
             _page_offsets_consume(smem_page_offsets)
-        load_tile(smem_k, "load_k0", FmhaStage.Head)
+        if cfg.reuse_shared_kv:
+            # Acquiring V first gates reuse on PV's asynchronous completion.
+            # QK's earlier K release alone must not allow an overwrite.
+            def load_shared(section):
+                if not hold_page_window:
+                    _page_offsets_consume(smem_page_offsets, "read_offsets_k0")
+                for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+                    smem_v.acquire()
+                    smem_k.acquire()
+                    smem_k.load_k0(
+                        section=section, head_dim_stage_idx=head_dim_stage_idx
+                    )
+                    smem_k.commit()
+                    smem_v.publish_shared()
+                    smem_v.commit()
+                if not hold_page_window:
+                    _page_offsets_release(smem_page_offsets)
 
-        with domain_loop(0, domain, 1, unroll=1):
-            load_tile(smem_k, "load_k0", FmhaStage.Loop)
-            load_tile(smem_v, "load_v0", FmhaStage.Loop)
-
-        load_tile(smem_v, "load_v0", FmhaStage.Tail)
+            load_shared(FmhaStage.Head)
+            with domain_loop(0, domain, 1, unroll=1):
+                load_shared(FmhaStage.Loop)
+        else:
+            load_tile(smem_k, "load_k0", FmhaStage.Head)
+            with domain_loop(0, domain, 1, unroll=1):
+                load_tile(smem_k, "load_k0", FmhaStage.Loop)
+                load_tile(smem_v, "load_v0", FmhaStage.Loop)
+            load_tile(smem_v, "load_v0", FmhaStage.Tail)
         if hold_page_window:
             _page_offsets_release(smem_page_offsets)
 

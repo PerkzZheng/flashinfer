@@ -555,6 +555,12 @@ def _build_decode_gen_schedule(
         if use_one_inst_qkv
         else 1
     )
+    if cfg.reuse_shared_kv:
+        assert use_one_inst_qkv and cfg.use_bf16_qkv
+        assert cfg.use_q_token_kv_block_sparse_route and cfg.num_tokens_per_page == 1
+        # Same physical budget: two former operand rings become one ring with
+        # enough lifetime for both QK and PV. Producer sequences stay aligned.
+        one_inst_kv_stages *= 2
     use_distributed_split_kv_stages = not use_one_inst_qkv
     if cfg.tile_size_q == 128 and use_distributed_split_kv_stages:
         # Q128's four instruction-local K0/K1/V0/V1 rings need equal depth.
@@ -719,6 +725,16 @@ def _build_decode_gen_schedule(
     smem_k1_cfg = _make_raw_kv_cfg(split_k1_stages, cfg.smem_k_tile_bytes)
     smem_v0_cfg = _make_raw_kv_cfg(split_v0_stages, cfg.smem_v_tile_bytes)
     smem_v1_cfg = _make_raw_kv_cfg(split_v1_stages, cfg.smem_v_tile_bytes)
+    if cfg.reuse_shared_kv:
+        # QK already waits on the TMA-completed K token before this MMA task
+        # reaches PV. V's token protects lifetime and never initiates a copy.
+        smem_v0_cfg = PipelineConfig.create_async_umma_pipeline_cfg(
+            num_stages=split_v0_stages,
+            producer_group=load_grp,
+            consumer_group=umma_hw,
+            cta_layout_vmnk=cta_layout,
+            advance_on_wait=True,
+        )
 
     def _make_page_offsets_cfg(num_stages: int | None = None) -> PipelineConfig:
         """Create the async page-offsets pipeline for the selected stage count."""
@@ -1156,6 +1172,8 @@ def _build_decode_gen_schedule(
             kv_kind=KV_KIND_V,
             name="smemV0",
         )
+        if cfg.reuse_shared_kv:
+            smem_v0._alloc = smem_k0.get_smem_requirements()[0]
         if not use_shared_inst_kv_rings:
             smem_v1 = SmemKvTileResource(
                 pipeline_config=smem_v1_cfg,
@@ -1785,9 +1803,9 @@ def _build_decode_gen_schedule(
                 warp_idx=page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
                 membership_lifetime=membership_lifetime,
-                block_table_capacity=page_table_capacity
-                if use_native_paged_kv
-                else None,
+                block_table_capacity=(
+                    page_table_capacity if use_native_paged_kv else None
+                ),
                 **task_runtime_kwargs,
             )
         else:
@@ -1805,9 +1823,9 @@ def _build_decode_gen_schedule(
                 warp_idx=page_offsets_warp_idx,
                 num_warps=cfg.page_offsets_num_warps,
                 membership_lifetime=membership_lifetime,
-                block_table_capacity=page_table_capacity
-                if use_native_paged_kv
-                else None,
+                block_table_capacity=(
+                    page_table_capacity if use_native_paged_kv else None
+                ),
                 **task_runtime_kwargs,
             )
     if use_one_inst_qkv:
@@ -2092,9 +2110,11 @@ def _build_decode_gen_schedule(
             tmem_softmax_local1: [tmem_s1],
             tmem_softmax_global0: [tmem_s0],
             tmem_softmax_global1: [tmem_s1],
-            tmem_o: [smem_p0, smem_p1, smem_v0]
-            if smem_v1 is None
-            else [smem_p0, smem_p1, smem_v0, smem_v1],
+            tmem_o: (
+                [smem_p0, smem_p1, smem_v0]
+                if smem_v1 is None
+                else [smem_p0, smem_p1, smem_v0, smem_v1]
+            ),
             tmem_corr0: [tmem_softmax_local0, tmem_o],
             tmem_corr1: [tmem_softmax_local0, tmem_softmax_local1, tmem_o],
         }

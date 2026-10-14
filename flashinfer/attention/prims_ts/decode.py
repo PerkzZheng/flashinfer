@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
 
 _SUPPORTED_HEAD_DIMS = (64, 128, 256)
-_SUPPORTED_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
+_SUPPORTED_PAGE_SIZES = (1, 4, 8, 16, 32, 64, 128)
 _MAX_INT32 = 2**31 - 1
 # Decode K/V masks form an exclusive tile endpoint as
 # ``tile_offset_k + tile_size_kv`` in signed Int32.  Public policies use at
@@ -215,9 +215,11 @@ def _decode_policy_from_config(
         ("output_layout", query_layout),
         (
             "window_left",
-            int(config.attention_window_size) - 1
-            if config.use_sliding_window_causal
-            else -1,
+            (
+                int(config.attention_window_size) - 1
+                if config.use_sliding_window_causal
+                else -1
+            ),
         ),
         (
             "mma_variant",
@@ -1489,12 +1491,14 @@ def _make_decode_compile_spec(
     kv_lengths_mode: Literal["dynamic", "planned_uniform_max"],
     direct_q1_spec: Optional[_DirectQ1CompileSpec] = None,
     flat_native_kv_tma: bool = False,
+    reuse_shared_kv: bool = False,
 ) -> _DecodeCompileSpec:
     """Freeze the resolved topology while leaving batch in runtime tensors."""
 
     config_items = dict(launch_spec.config.compile_signature())
     config_items["use_flat_native_kv_tma"] = flat_native_kv_tma
     config_items["flat_native_kv_num_heads"] = num_kv_heads if flat_native_kv_tma else 1
+    config_items["reuse_shared_kv"] = reuse_shared_kv
     return _DecodeCompileSpec(
         device_index=device_index,
         config_items=tuple(config_items.items()),
@@ -1640,6 +1644,7 @@ def _get_compiled_decode(
                 page_capacity=direct_q1_spec.page_capacity,
                 sparse_block_size=direct_q1_spec.kv_block_size,
                 fragment_size=static_cfg.num_tokens_per_page,
+                locator_head_multiplier=static_cfg.flat_native_kv_num_heads,
                 lengths=True,
             )
             pages_iter = DirectSparseMetadataView(
@@ -1651,6 +1656,7 @@ def _get_compiled_decode(
                 page_capacity=direct_q1_spec.page_capacity,
                 sparse_block_size=direct_q1_spec.kv_block_size,
                 fragment_size=static_cfg.num_tokens_per_page,
+                locator_head_multiplier=static_cfg.flat_native_kv_num_heads,
                 lengths=False,
             )
 
@@ -1746,6 +1752,7 @@ def _get_compiled_decode(
                     page_capacity=direct_q1_spec.page_capacity,
                     sparse_block_size=direct_q1_spec.kv_block_size,
                     fragment_size=static_cfg.num_tokens_per_page,
+                    locator_head_multiplier=static_cfg.flat_native_kv_num_heads,
                     lengths=True,
                 )
             fmha_decode_separate_reduction_launch(
@@ -3544,11 +3551,45 @@ def _prepare_prims_ts_batch_decode_plan(
         and spec.config.uses_staged_one_inst_tmem_p
         and (spec.config.use_bf16_qkv or spec.config.use_fp8_qkv)
         and spec.config.has_storage_subpages
-        and (num_kv_heads == 1 or (allow_head_aware_locators and not direct_q1_inputs))
+        and (
+            num_kv_heads == 1
+            or (allow_head_aware_locators and not direct_q1_inputs)
+            or (direct_q1_inputs and direct_q1_sparse_block_size == 1)
+        )
         and k_cache.is_contiguous()
         and normalized_cache.v_cache.is_contiguous()
         and int(k_cache.shape[0]) * storage_page_size * num_kv_heads < (1 << 31)
     )
+    if direct_q1_inputs and direct_q1_sparse_block_size == 1 and not flat_native_kv_tma:
+        raise ValueError(
+            "per-token sparse attention requires contiguous HND K/V caches"
+        )
+    identical_kv = (
+        k_cache.data_ptr() == v_cache.data_ptr()
+        and k_cache.stride() == v_cache.stride()
+    )
+    # The shared ring requires matching full-head K and V stage layouts.
+    # Cache rebinding changes the prepared ABI key, so an independent
+    # V tensor selects the ordinary schedule even after a shared-KV run.
+    shared_kv_eligible = (
+        identical_kv
+        and flat_native_kv_tma
+        and bool(direct_q1_inputs)
+        and direct_q1_sparse_block_size == 1
+        and seq_len_q == 1
+        and spec.config.use_bf16_qkv
+        and head_dim == 256
+        and spec.config.tile_size_q == 128
+        and spec.config.tile_size_kv == 128
+        and spec.config.heads_q_per_kv == 128
+        and spec.config.head_dim_per_stage_kv == 128
+        and spec.config.num_insts_kv == 1
+        and spec.config.o_stages == 1
+    )
+    if spec.config.reuse_shared_kv and not shared_kv_eligible:
+        raise ValueError(
+            "shared-KV specialization requires identical BF16 D256 token-sparse K/V"
+        )
     compile_spec = _make_decode_compile_spec(
         spec,
         device_index=device_index,
@@ -3567,6 +3608,7 @@ def _prepare_prims_ts_batch_decode_plan(
         kv_lengths_mode="dynamic",
         direct_q1_spec=direct_q1_spec,
         flat_native_kv_tma=flat_native_kv_tma,
+        reuse_shared_kv=shared_kv_eligible,
     )
     compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
     workspace = _bind_decode_workspace(workspace_buffer, layout)

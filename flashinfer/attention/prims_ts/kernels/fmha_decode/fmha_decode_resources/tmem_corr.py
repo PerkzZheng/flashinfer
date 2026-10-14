@@ -3405,6 +3405,60 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
         dst_col_offset = Int64(col_base) * Int64(cfg.o_dtype_bytes)
         if cutlass.const_expr(
+            cfg.reuse_shared_kv
+            and cfg.use_bf16_output
+            and cfg.num_insts_kv == 1
+            and cfg.tile_size_q == 128
+        ):
+            # Keep one completed TMEM fragment and one in flight. Full-sector
+            # stores amortize global transactions; the narrow fallback retains
+            # the output API's 16-byte alignment contract.
+            sector_aligned = (self.o_ptr.toint() & Int64(31)) == Int64(0)
+            chunks = output_pair_regs // 8
+            values = _keeps_tcgen05_ld(
+                cfg,
+                prims.make_tmem_ptr(base_addr0, Float32),
+                num=16,
+                offset=keeps_o_ldst_offset,
+            )
+            prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+            for chunk in cutlass.range_constexpr(chunks):
+                if cutlass.const_expr(chunk + 1 < chunks):
+                    next_values = _keeps_tcgen05_ld(
+                        cfg,
+                        prims.make_tmem_ptr(
+                            base_addr0 + Int32((chunk + 1) * 16), Float32
+                        ),
+                        num=16,
+                        offset=keeps_o_ldst_offset,
+                    )
+                output_values = cutlass.Array(
+                    Float32, 16, space=cutlass.AddressSpace.rmem
+                )
+                for i in cutlass.range_constexpr(16):
+                    output_values[i] = values[i]
+                dst_ptr = cutlass.inttoptr(
+                    self.o_ptr.toint()
+                    + dst_row_base
+                    + dst_col_offset
+                    + Int64(chunk * 32),
+                    mem_space=1,
+                    dtype=Int32,
+                )
+                if valid_output_row:
+                    self._store_final_o_columns(
+                        dst_ptr,
+                        output_values,
+                        final_scale0_0,
+                        count=16,
+                        sector_aligned=sector_aligned,
+                    )
+                if cutlass.const_expr(chunk + 1 < chunks):
+                    prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
+                    values = next_values
+            return
+
+        if cutlass.const_expr(
             cfg.use_fp8_output and cfg.tile_size_q == 128 and cfg.headdim == 128
         ):
             regs_o_chunk = cutlass.Array(Int32, 4, space=cutlass.AddressSpace.rmem)

@@ -271,6 +271,26 @@ def _local_kv_tile_idx_for_section(
 
 
 @cute.jit
+def _tma_gather4_token_rows(dst, descriptor, column, r0, r1, r2, r3, barrier):
+    """Gather four independent token rows; TensorMap boxDim[1] stays one."""
+    prims.inline_ptx_hl(
+        "cp.async.bulk.tensor.2d.shared::cta.global.tile::gather4"
+        ".mbarrier::complete_tx::bytes"
+        " [{$r0}], [{$r1}, {{$r2}, {$r3}, {$r4}, {$r5}, {$r6}}], [{$r7}];",
+        read_only_args=[
+            dst.data_ptr(),
+            descriptor,
+            column,
+            r0,
+            r1,
+            r2,
+            r3,
+            barrier.data_ptr(),
+        ],
+    )
+
+
+@cute.jit
 def _issue_sparse_page_copies(
     cfg: Constexpr[FmhaDecodeConfig],
     page_offsets: Constexpr,
@@ -291,6 +311,39 @@ def _issue_sparse_page_copies(
     chunk_hd = min(head_dim_stage, 128 if cfg.use_fp8_qkv else 64)
     chunks = head_dim_stage // chunk_hd
     fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
+    if cutlass.const_expr(cfg.num_tokens_per_page == 1):
+        assert cfg.uses_2d_flat_kv_tma
+        assert cfg.k_dtype == cfg.v_dtype == cutlass.BFloat16
+        # Four unrelated token IDs per instruction; no KV materialization and
+        # no expansion to four-token sparse blocks. Reuse the row coordinates
+        # across the BF16 head-dimension slabs in the existing SMEM layout.
+        gathers_per_warp = (cfg.tile_size_kv // 4) // cfg.load_num_warps
+        warp = _load_task_warp_rank(cfg)
+        if prims.elect_sync():
+            rows = cutlass.Array(
+                Int32, (gathers_per_warp * 4,), space=cutlass.AddressSpace.rmem
+            )
+            for i in cutlass.range_constexpr(gathers_per_warp * 4):
+                fragment = warp * Int32(gathers_per_warp * 4) + Int32(i)
+                locator = page_offsets.page_id(tile_idx, local_tile_idx, fragment)
+                rows[i], _ = _decode_native_page_locator(cfg, locator, kv_head)
+            for gather in cutlass.range_constexpr(gathers_per_warp):
+                first = (warp * Int32(gathers_per_warp) + Int32(gather)) * Int32(4)
+                for chunk in cutlass.range_constexpr(chunks):
+                    offset = Int32(chunk * chunk_hd * cfg.tile_size_kv) + first * Int32(
+                        chunk_hd
+                    )
+                    _tma_gather4_token_rows(
+                        stage_base.subview(offset),
+                        tma_desc,
+                        Int32(head_dim_stage_offset + chunk * chunk_hd),
+                        rows[gather * 4],
+                        rows[gather * 4 + 1],
+                        rows[gather * 4 + 2],
+                        rows[gather * 4 + 3],
+                        barrier,
+                    )
+        return
     if cutlass.const_expr(
         cfg.uses_2d_flat_kv_tma and cfg.k_dtype == cfg.v_dtype == cutlass.BFloat16
     ):
@@ -384,9 +437,11 @@ def _issue_sparse_page_copies(
                 (
                     Int32(head_dim_stage_offset) + chunk * Int32(chunk_hd),
                     token_offset,
-                    Int32(0)
-                    if cutlass.const_expr(cfg.use_flat_native_kv_tma)
-                    else kv_head,
+                    (
+                        Int32(0)
+                        if cutlass.const_expr(cfg.use_flat_native_kv_tma)
+                        else kv_head
+                    ),
                     physical_page,
                 ),
                 barrier,
@@ -804,6 +859,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
         """Allocate this split K or V resource's staged tile ring."""
+        if self.cfg.reuse_shared_kv and self.kv_kind == KV_KIND_V:
+            assert self._alloc is not None
+            return []  # The K resource registers the one physical allocation.
         num_stages = (
             self.pipeline_config.num_stages if self.pipeline_config is not None else 1
         )
@@ -833,6 +891,12 @@ class SmemKvTileResource(DecodeGenResourceBase):
         """Split K/V staging uses SMEM only."""
         return []
 
+    @producer_work
+    @cute.jit
+    def publish_shared(self, stage_info: StageInfo) -> None:
+        """Publish V's lifetime token for the aliased K tile without a copy."""
+        _ = stage_info
+
     @cute.jit
     def _create_initial_task_locals(
         self, context: ResourceContext | None = None
@@ -847,10 +911,14 @@ class SmemKvTileResource(DecodeGenResourceBase):
             inst_dtype_bytes = _kv_dtype_bytes_for_kind(self.cfg, self.kv_kind)
             self._smem_base_kv = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
-                dtype=Uint8
-                if self.cfg.use_nvfp4_kv
-                else (
-                    self.cfg.v_dtype if self.kv_kind == KV_KIND_V else self.cfg.k_dtype
+                dtype=(
+                    Uint8
+                    if self.cfg.use_nvfp4_kv
+                    else (
+                        self.cfg.v_dtype
+                        if self.kv_kind == KV_KIND_V
+                        else self.cfg.k_dtype
+                    )
                 ),
                 shape=(
                     (

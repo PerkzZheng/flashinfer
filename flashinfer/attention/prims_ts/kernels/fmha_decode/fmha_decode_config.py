@@ -673,6 +673,8 @@ class FmhaDecodeConfig:
     # K/V TMA pipeline depth. Deeper KV staging hides the long
     # GMEM→SMEM latency in the BMM1↔BMM2 chain.
     kv_stages: int = 4
+    # Retain identical K/V storage until both QK and PV finish consuming it.
+    reuse_shared_kv: bool = False
     # Transformed K/V pipeline depth for mixed Q/KV modes. Raw K/V is loaded
     # into SmemKv, converted to the Q-side MMA input type, then consumed by MMA.
     # Zero selects the profile-derived stage count.
@@ -822,7 +824,7 @@ class FmhaDecodeConfig:
             self.use_paged_kv
             and not self.use_block_sparse
             and self.uses_scattered_page_route
-            and self.num_tokens_per_page in (4, 8, 16, 32, 64, 128)
+            and self.num_tokens_per_page in (1, 4, 8, 16, 32, 64, 128)
             and self.groups_tokens_heads_q
             and self.use_q_token_kv_block_sparse_route
             and 0 < self.max_seq_len_q <= Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS
@@ -1997,10 +1999,16 @@ class FmhaDecodeConfig:
             )
         if self.uses_scattered_page_route and self.tile_size_kv != 128:
             raise ValueError("scattered page routes currently require tile_size_kv=128")
+        if self.num_tokens_per_page == 1 and not (
+            self.uses_q_token_kv_block_sparse_page_route
+            and self.max_seq_len_q == 1
+            and self.k_dtype == self.v_dtype == BFloat16
+        ):
+            raise ValueError("token locators require direct G1 BF16 sparse attention")
         pages_per_tile = self.tile_size_kv // self.num_tokens_per_page
-        if pages_per_tile not in (1, 2, 4, 8, 16, 32):
+        if pages_per_tile not in (1, 2, 4, 8, 16, 32, 128):
             raise ValueError(
-                "paged-KV staging supports 1, 2, 4, 8, 16, or 32 pages per KV tile"
+                "paged-KV staging supports 1, 2, 4, 8, 16, 32, or 128 pages per KV tile"
             )
         max_page_producers = 2 if self.uses_q_token_kv_block_sparse_page_route else 1
         if not 1 <= self.page_offsets_num_warps <= max_page_producers:
@@ -3191,9 +3199,11 @@ def _finalize_static_decode_config(
             _set_if_implicit(
                 cfg,
                 "kv_stages",
-                KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
-                if cfg.k_dtype.width == 8 and cfg.v_dtype.width == 8
-                else KV_TILE_256_SHARED_FIFO_STAGES,
+                (
+                    KV_TILE_256_BYTE_WIDE_SHARED_FIFO_STAGES
+                    if cfg.k_dtype.width == 8 and cfg.v_dtype.width == 8
+                    else KV_TILE_256_SHARED_FIFO_STAGES
+                ),
                 explicit_fields,
             )
             for field_name, value in _KV_TILE_256_TASK_TOPOLOGY_DEFAULTS.items():
@@ -5125,8 +5135,10 @@ def normalize_qkv_layout(qkv_layout: str) -> str:
 
 def validate_page_size(num_tokens_per_page: int) -> None:
     """Validate a paged-KV page size against supported tile shapes."""
-    if num_tokens_per_page not in (4, 8, 16, 32, 64, 128):
-        raise ValueError("num_tokens_per_page must be one of 4, 8, 16, 32, 64, or 128")
+    if num_tokens_per_page not in (1, 4, 8, 16, 32, 64, 128):
+        raise ValueError(
+            "num_tokens_per_page must be one of 1, 4, 8, 16, 32, 64, or 128"
+        )
     if 128 % num_tokens_per_page != 0:
         raise ValueError("num_tokens_per_page must divide the 128-token KV tile")
 

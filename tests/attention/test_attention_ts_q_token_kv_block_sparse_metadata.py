@@ -307,7 +307,7 @@ def test_q_token_kv_block_sparse_block_size_must_be_integer(
         )
 
 
-@pytest.mark.parametrize("sparse_block_size", (1, 2, 256))
+@pytest.mark.parametrize("sparse_block_size", (2, 256))
 def test_q_token_kv_block_sparse_unsupported_power_of_two_block_sizes(
     sparse_block_size: int,
 ) -> None:
@@ -4454,3 +4454,107 @@ def test_grouped_metadata_cuda_graph_reloads_positions(
         blocks, table, requests, positions, storage_page_size, group_size
     )
     _assert_metadata_matches(outputs, expected)
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize(
+    ("topk", "kv_heads", "split_kv", "offset_output"),
+    ((512, 2, False, True), (2048, 2, False, False), (512, 1, True, False)),
+)
+def test_token_sparse_shared_kv_graph(topk, kv_heads, split_kv, offset_output):
+    """Shared-KV lifetime, live token indices, and separate-V rebinding."""
+    torch.manual_seed(937)
+    batch, queries, context, page, dim = 2, 4, 2305, 64, 256
+    heads = 128 * kv_heads
+    rows = batch * queries
+    pages = (context + page - 1) // page
+    q = torch.randn(batch, queries, 1, heads, dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch * pages, kv_heads, page, dim, device="cuda", dtype=q.dtype)
+    v = torch.randn_like(k)
+    table = torch.randperm(batch * pages, device="cuda", dtype=torch.int32).view(
+        batch, pages
+    )
+    requests = torch.arange(batch, device="cuda", dtype=torch.int32).repeat_interleave(
+        queries
+    )
+    positions = torch.tensor(
+        [0, 63, 128, context - 1], device="cuda", dtype=torch.int32
+    ).repeat(batch)
+    indices = torch.full((rows, topk), -1, device="cuda", dtype=torch.int32)
+
+    def update_indices():
+        for row, pos in enumerate(positions.tolist()):
+            count = min(topk, pos + 1)
+            indices[row, :count] = torch.randperm(
+                pos + 1, device="cuda", dtype=torch.int32
+            )[:count]
+
+    update_indices()
+    output_storage = torch.empty(q.numel() + 8, device="cuda", dtype=q.dtype)
+    offset = 8 if offset_output else 0
+    out = output_storage[offset : offset + q.numel()].view_as(q)
+    workspace = torch.empty(
+        get_q_token_kv_block_sparse_workspace_size(
+            q,
+            k,
+            table,
+            block_topk=topk,
+            max_seq_len_kv=context,
+            kv_block_size=1,
+            split_kv=split_kv,
+        ),
+        device="cuda",
+        dtype=torch.uint8,
+    )
+    wrapper = QTokenKvBlockSparsePagedTSWrapper()
+    wrapper.plan(
+        rows,
+        1,
+        heads,
+        kv_heads,
+        dim,
+        1,
+        page,
+        topk,
+        context,
+        device=q.device,
+        workspace_buffer=workspace,
+        split_kv=split_kv,
+        q_data_type=q.dtype,
+        kv_data_type=q.dtype,
+        o_data_type=q.dtype,
+    )
+
+    def run(value_cache):
+        wrapper.run(q, (k, value_cache), table, indices, requests, positions, out=out)
+
+    def check(value_cache):
+        for row in range(rows):
+            ids = indices[row].long()
+            ids = ids[ids >= 0]
+            physical = table[requests[row].long(), ids // page].long()
+            selected_k = k[physical, :, ids % page].permute(1, 0, 2).float()
+            selected_v = value_cache[physical, :, ids % page].permute(1, 0, 2).float()
+            query = q.view(rows, kv_heads, 128, dim)[row].float()
+            scores = torch.matmul(query, selected_k.transpose(-1, -2)) * dim**-0.5
+            ref = torch.matmul(scores.softmax(-1), selected_v).reshape(heads, dim)
+            torch.testing.assert_close(
+                out.view(rows, heads, dim)[row].float(), ref, rtol=0.02, atol=0.02
+            )
+
+    run(k)
+    check(k)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(k)
+    for _ in range(2):
+        update_indices()
+        q.normal_()
+        out.fill_(torch.nan)
+        for _ in range(20):
+            graph.replay()
+        check(k)
+    # The same wrapper must select independent K/V loads after rebinding.
+    run(v)
+    check(v)
