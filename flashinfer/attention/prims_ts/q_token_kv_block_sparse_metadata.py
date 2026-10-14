@@ -407,7 +407,7 @@ class _QTokenKvBlockSparsePlanConfig:
     """Capacity and dtype contract published by the public wrapper."""
 
     batch_size: int
-    seq_len_q: int
+    group_size: int
     num_qo_heads: int
     num_kv_heads: int
     head_dim: int
@@ -472,7 +472,6 @@ class QTokenKvBlockSparsePagedTSWrapper:
     def plan(
         self,
         batch_size: int,
-        seq_len_q: int,
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
@@ -483,6 +482,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         *,
         device: torch.device | str | int,
         workspace_buffer: torch.Tensor,
+        group_size: int = 1,
         use_packed_q: bool = False,
         split_kv: bool = True,
         share_pattern_across_kv_heads: bool = True,
@@ -495,8 +495,9 @@ class QTokenKvBlockSparsePagedTSWrapper:
 
         ``batch_size`` is the number of query routes: ``len(qo_indptr)-1`` for
         packed Q, or ``B * Nq`` for fixed ``[B, Nq, G, Hq, D]`` Q. The planned
-        ``seq_len_q`` is the maximum packed route length or fixed group size
-        ``G``. ``kv_block_size`` is the indexer's sparse K/V atom and currently
+        ``group_size`` is the maximum packed route length or fixed group size
+        ``G``, defaulting to one (no grouping), not the request sequence length.
+        ``kv_block_size`` is the indexer's sparse K/V atom and currently
         supports 4/8/16/32/64/128 tokens; ``page_size`` is the physical cache
         page. Blocks may cross cache pages. The loader uses fragments of size
         gcd(kv_block_size, page_size), resolving every fragment independently.
@@ -520,7 +521,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         )
 
         batch_size = _validate_positive_int(batch_size, "batch_size")
-        seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
+        group_size = _validate_positive_int(group_size, "group_size")
         block_topk = _validate_positive_int(block_topk, "block_topk")
         max_seq_len_kv = _validate_positive_int(max_seq_len_kv, "max_seq_len_kv")
         page_size = _validate_positive_int(page_size, "page_size")
@@ -528,7 +529,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         _validate_head_geometry(num_qo_heads, num_kv_heads)
         kv_block_size = _validate_sparse_block_size(kv_block_size)
         _validate_storage_page_size(page_size)
-        _validate_shape_parameters(batch_size * seq_len_q, block_topk, seq_len_q)
+        _validate_shape_parameters(batch_size * group_size, block_topk, group_size)
         if mask_type != "causal":
             raise ValueError(
                 "QToken-KvBlock-Sparse-Attention requires mask_type='causal'"
@@ -555,11 +556,11 @@ class QTokenKvBlockSparsePagedTSWrapper:
 
         max_num_storage_pages = (max_seq_len_kv + page_size - 1) // page_size
         layout = _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
-            batch_size * seq_len_q,
+            batch_size * group_size,
             block_topk,
             max_num_storage_pages,
             page_size,
-            seq_len_q,
+            group_size,
             max_seq_len_kv=max_seq_len_kv,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
@@ -585,7 +586,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
                 )
         candidate = _QTokenKvBlockSparsePlanConfig(
             batch_size=batch_size,
-            seq_len_q=seq_len_q,
+            group_size=group_size,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
@@ -680,7 +681,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         qo_indptr : torch.Tensor, optional
             CUDA Int32 packed-route offsets. Required for packed Q and omitted
             for fixed Q; each route must stay within one request and contain
-            at most the planned ``seq_len_q`` tokens.
+            at most the planned ``group_size`` tokens.
         sm_scale : float, optional
             Softmax scale, defaulting to ``head_dim**-0.5``. Include Q/K
             dequantization scales here when using FP8 inputs.
@@ -711,7 +712,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             )
             if qo_indptr.numel() != config.batch_size + 1:
                 raise ValueError("qo_indptr length must match the planned route count")
-            if q.shape[0] <= 0 or q.shape[0] > config.batch_size * config.seq_len_q:
+            if q.shape[0] <= 0 or q.shape[0] > config.batch_size * config.group_size:
                 raise ValueError("packed q exceeds the planned query-token capacity")
         else:
             if qo_indptr is not None:
@@ -719,7 +720,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             if (
                 q.ndim != 5
                 or q.shape[0] * q.shape[1] != config.batch_size
-                or q.shape[2] != config.seq_len_q
+                or q.shape[2] != config.group_size
             ):
                 raise ValueError(
                     "fixed q must be [B,Nq,G,Hq,D] with B*Nq and G matching plan"
@@ -729,7 +730,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         num_query_tokens = (
             int(q.shape[0])
             if config.use_packed_q
-            else (config.batch_size * config.seq_len_q)
+            else (config.batch_size * config.group_size)
         )
         expected_ids_shape = (
             (num_query_tokens, config.block_topk)
@@ -822,9 +823,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
                         max_seq_len_kv=config.max_seq_len_kv,
                         bmm1_scale=sm_scale,
                         qo_indptr=qo_indptr,
-                        max_seq_len_q=(
-                            config.seq_len_q if config.use_packed_q else None
-                        ),
+                        group_size=config.group_size,
                         sparse_block_size=config.kv_block_size,
                         split_kv=config.split_kv,
                         share_pattern_across_kv_heads=config.share_pattern_across_kv_heads,
@@ -1112,7 +1111,7 @@ def get_q_token_kv_block_sparse_workspace_size(
     max_seq_len_kv: int,
     o_data_type: Optional[torch.dtype] = None,
     qo_indptr: Optional[torch.Tensor] = None,
-    seq_len_q: Optional[int] = None,
+    group_size: int = 1,
     kv_block_size: int = 4,
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
@@ -1121,7 +1120,7 @@ def get_q_token_kv_block_sparse_workspace_size(
 
     Packed queries use ``[num_query_tokens, num_qo_heads, head_dim]`` and
     Int32 ``qo_indptr`` partitions their rows into request-safe routes of
-    length at most ``seq_len_q``. Fixed queries use
+    length at most ``group_size``. Fixed queries use
     ``[batch, num_query_groups, group_size, num_qo_heads, head_dim]`` and do
     not require query-offset metadata. The first two fixed axes are flattened
     into the attention route axis without copying tensor storage.
@@ -1160,9 +1159,9 @@ def get_q_token_kv_block_sparse_workspace_size(
         dtype.
     qo_indptr : torch.Tensor, optional
         Contiguous CUDA Int32 cumulative offsets for packed query routes.
-    seq_len_q : int, optional
-        Maximum packed-route length and QToken-KvBlock-Sparse-Attention group size. It is required when
-        ``qo_indptr`` is supplied.
+    group_size : int, optional
+        Maximum query tokens per group, default one (no grouping). For fixed
+        Q, this must match its ``G`` dimension; packed final groups may be shorter.
     kv_block_size : int
         Logical sparse-block size in tokens: 4, 8, 16, 32, 64, or 128.
     split_kv : bool
@@ -1190,7 +1189,7 @@ def get_q_token_kv_block_sparse_workspace_size(
         max_seq_len_kv=max_seq_len_kv,
         out_dtype=o_data_type,
         qo_indptr=qo_indptr,
-        max_seq_len_q=seq_len_q,
+        group_size=group_size,
         sparse_block_size=kv_block_size,
         split_kv=split_kv,
         share_pattern_across_kv_heads=share_pattern_across_kv_heads,
@@ -1206,7 +1205,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
     max_seq_len_kv: int,
     out_dtype: Optional[torch.dtype],
     qo_indptr: Optional[torch.Tensor] = None,
-    max_seq_len_q: Optional[int] = None,
+    group_size: int = 1,
     sparse_block_size: int = 4,
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
@@ -1221,25 +1220,20 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
     if not isinstance(block_table, torch.Tensor):
         raise TypeError("block_table must be a torch.Tensor")
     use_packed_q = qo_indptr is not None
-    if not use_packed_q and max_seq_len_q is not None:
-        raise ValueError(
-            "max_seq_len_q is only valid with packed QToken-KvBlock-Sparse-Attention qo_indptr"
-        )
     if use_packed_q:
         if query.ndim != 3:
             raise ValueError(
                 "packed QToken-KvBlock-Sparse-Attention query must have shape [total_q,Hq,D]"
             )
-        if max_seq_len_q is None:
-            raise ValueError(
-                "max_seq_len_q is required with QToken-KvBlock-Sparse-Attention qo_indptr"
-            )
         _validate_q_token_kv_block_sparse_qo_indptr_layout_tensor(qo_indptr)
-        group_size = int(max_seq_len_q)
         groups = int(qo_indptr.numel()) - 1
         num_query_tokens, num_qo_heads, head_dim = query.shape
     elif query.ndim == 5:
-        batch_size, groups_per_request, group_size, num_qo_heads, head_dim = query.shape
+        batch_size, groups_per_request, query_group_size, num_qo_heads, head_dim = (
+            query.shape
+        )
+        if group_size != query_group_size:
+            raise ValueError("fixed group_size must match query.shape[2]")
         if batch_size <= 0 or groups_per_request <= 0:
             raise ValueError(
                 "fixed QToken-KvBlock-Sparse-Attention batch and query-group counts must be positive"
@@ -1610,7 +1604,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     bmm1_scale: Optional[float] = None,
     bmm2_scale: float = 1.0,
     qo_indptr: Optional[torch.Tensor] = None,
-    max_seq_len_q: Optional[int] = None,
+    group_size: int = 1,
     sparse_block_size: int = 4,
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
@@ -1618,7 +1612,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     """Prepare one graph-stable metadata-plus-attention QToken-KvBlock-Sparse-Attention launch.
 
     Packed Q/output use ``[num_query_tokens, Hq, D]`` and describe Q1--Q8
-    routes with ``qo_indptr`` and ``max_seq_len_q``. A request's final route
+    routes with ``qo_indptr`` and ``group_size``. A request's final route
     may be shorter than the maximum group size. Fixed Q/output use
     ``[B, Nq, G, Hq, D]`` and omit ``qo_indptr``; ``B * Nq`` becomes the
     internal attention route count through a zero-copy view.
@@ -1680,9 +1674,9 @@ def _prepare_q_token_kv_block_sparse_attention(
     qo_indptr : torch.Tensor, optional
         Contiguous CUDA Int32 cumulative route offsets selecting packed-query
         mode.
-    max_seq_len_q : int, optional
-        Maximum packed-route length and QToken-KvBlock-Sparse-Attention group size. It is required when
-        ``qo_indptr`` is supplied.
+    group_size : int, optional
+        Maximum query tokens per group, default one (no grouping). For fixed
+        Q, this must match its ``G`` dimension; packed final groups may be shorter.
     sparse_block_size : int
         Logical sparse-block size in tokens: 4, 8, 16, 32, 64, or 128.
 
@@ -1712,11 +1706,6 @@ def _prepare_q_token_kv_block_sparse_attention(
             raise ValueError(
                 "packed QToken-KvBlock-Sparse-Attention query must have shape [total_q,Hq,D]"
             )
-        if max_seq_len_q is None:
-            raise ValueError(
-                "max_seq_len_q is required with QToken-KvBlock-Sparse-Attention qo_indptr"
-            )
-        group_size = int(max_seq_len_q)
         num_query_tokens = int(query.shape[0])
         _validate_q_token_kv_block_sparse_qo_indptr_tensor(
             qo_indptr,
@@ -1733,7 +1722,8 @@ def _prepare_q_token_kv_block_sparse_attention(
             raise ValueError(
                 "fixed QToken-KvBlock-Sparse-Attention query and output must be contiguous"
             )
-        group_size = int(query.shape[2])
+        if group_size != query.shape[2]:
+            raise ValueError("fixed group_size must match query.shape[2]")
         num_query_tokens = int(query.shape[0] * query.shape[1]) * group_size
         attention_query = _flatten_fixed_q_token_kv_block_sparse_groups(
             query, group_size
@@ -1770,7 +1760,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         max_seq_len_kv=max_seq_len_kv,
         out_dtype=out.dtype,
         qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q,
+        group_size=group_size,
         sparse_block_size=sparse_block_size,
         split_kv=split_kv,
         share_pattern_across_kv_heads=share_pattern_across_kv_heads,
@@ -1783,6 +1773,8 @@ def _prepare_q_token_kv_block_sparse_attention(
         "bmm1_scale",
     )
     scale_v = _validate_scale(bmm2_scale, "bmm2_scale")
+    # Generic FMHA sees one query group as a route, so its route-local
+    # sequence-length parameters receive G, not the full request length.
     attention_plan, _ = _prepare_prims_ts_batch_decode_plan(
         attention_query,
         paged_kv_cache,
@@ -1860,7 +1852,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     workspace_buffer: torch.Tensor,
     *,
     max_seq_len_kv: int,
-    seq_len_q: Optional[int] = None,
+    group_size: int = 1,
     kv_block_size: int = 4,
     mask_type: Literal["causal"] = "causal",
     sm_scale: Optional[float] = None,
@@ -1879,9 +1871,10 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     wrapper, call :meth:`QTokenKvBlockSparsePagedTSWrapper.plan` outside
     capture, run once eagerly, and capture only :meth:`~QTokenKvBlockSparsePagedTSWrapper.run`.
 
-    Packed Q is ``[total_q, Hq, D]`` with ``qo_indptr``; ``seq_len_q``
+    Packed Q is ``[total_q, Hq, D]`` with ``qo_indptr``; ``group_size``
     is its maximum route length. Fixed Q is ``[B, Nq, G, Hq, D]`` without
-    ``qo_indptr``, and ``G`` determines ``seq_len_q``. The indexer
+    ``qo_indptr``, and ``group_size`` must match ``G``. The default is one
+    (no grouping) for both layouts. The indexer
     output is named ``indexer_block_ids`` to distinguish it from BSR
     ``block_indices``. ``kv_block_size`` is the semantic indexer atom
     (4/8/16/32/64/128), while the physical cache extent is inferred from
@@ -1914,8 +1907,9 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         :func:`get_q_token_kv_block_sparse_workspace_size`.
     max_seq_len_kv : int
         Static maximum logical K/V length in tokens.
-    seq_len_q : int, optional
-        Maximum packed route length. Fixed Q derives it from ``G``.
+    group_size : int, optional
+        Maximum query tokens per group, default one (no grouping). Must match
+        ``G`` for fixed Q; packed final groups may contain fewer tokens.
     kv_block_size : int
         Semantic sparse K/V block size: 4/8/16/32/64/128, default four.
     mask_type : {"causal"}
@@ -1970,24 +1964,19 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
             raise ValueError(
                 "fixed q must be [B,Nq,G,Hq,D], or supply qo_indptr for packed q"
             )
-        fixed_seq_len_q = int(q.shape[2])
-        if seq_len_q is not None and seq_len_q != fixed_seq_len_q:
-            raise ValueError("fixed seq_len_q must match q.shape[2]")
-        seq_len_q = fixed_seq_len_q
+        if group_size != q.shape[2]:
+            raise ValueError("fixed group_size must match q.shape[2]")
         batch_size = int(q.shape[0] * q.shape[1])
         use_packed_q = False
     else:
         if q.ndim != 3:
             raise ValueError("packed q must have shape [total_q,Hq,D]")
-        if seq_len_q is None:
-            raise ValueError("seq_len_q is required with packed qo_indptr")
         batch_size = int(qo_indptr.numel()) - 1
         use_packed_q = True
 
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         batch_size,
-        seq_len_q,
         int(q.shape[-2]),
         int(k_cache.shape[1]),
         int(q.shape[-1]),
@@ -1997,6 +1986,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         max_seq_len_kv,
         device=q.device,
         workspace_buffer=workspace_buffer,
+        group_size=group_size,
         use_packed_q=use_packed_q,
         mask_type=mask_type,
         split_kv=split_kv,

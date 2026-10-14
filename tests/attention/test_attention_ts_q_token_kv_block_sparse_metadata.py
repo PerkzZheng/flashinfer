@@ -33,6 +33,7 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
 from flashinfer.decode import (
     make_q_token_kv_block_sparse_qo_indptr as make_prims_ts_q_token_kv_block_sparse_qo_indptr,
     suggest_q_token_kv_block_sparse_group_size as suggest_prims_ts_q_token_kv_block_sparse_group_size,
+    validate_q_token_kv_block_sparse_group_size,
 )
 
 
@@ -54,7 +55,7 @@ def get_prims_ts_q_token_kv_block_sparse_workspace_size(
     max_seq_len_kv: int,
     out_dtype: torch.dtype | None = None,
     qo_indptr: torch.Tensor | None = None,
-    max_seq_len_q: int | None = None,
+    group_size: int = 1,
     sparse_block_size: int = 4,
     split_kv: bool = True,
 ) -> int:
@@ -68,7 +69,7 @@ def get_prims_ts_q_token_kv_block_sparse_workspace_size(
         max_seq_len_kv=max_seq_len_kv,
         o_data_type=out_dtype,
         qo_indptr=qo_indptr,
-        seq_len_q=max_seq_len_q,
+        group_size=group_size,
         kv_block_size=sparse_block_size,
         split_kv=split_kv,
     )
@@ -89,7 +90,7 @@ def prims_ts_q_token_kv_block_sparse_attention(
     out: torch.Tensor | None = None,
     out_dtype: torch.dtype | None = None,
     qo_indptr: torch.Tensor | None = None,
-    max_seq_len_q: int | None = None,
+    group_size: int = 1,
     sparse_block_size: int = 4,
     split_kv: bool = True,
 ) -> torch.Tensor:
@@ -104,7 +105,7 @@ def prims_ts_q_token_kv_block_sparse_attention(
         query_positions,
         workspace_buffer,
         max_seq_len_kv=max_seq_len_kv,
-        seq_len_q=max_seq_len_q,
+        group_size=group_size,
         kv_block_size=sparse_block_size,
         sm_scale=bmm1_scale,
         v_scale=bmm2_scale,
@@ -147,7 +148,6 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
     assert tuple(plan_parameters) == (
         "self",
         "batch_size",
-        "seq_len_q",
         "num_qo_heads",
         "num_kv_heads",
         "head_dim",
@@ -157,6 +157,7 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "max_seq_len_kv",
         "device",
         "workspace_buffer",
+        "group_size",
         "use_packed_q",
         "split_kv",
         "share_pattern_across_kv_heads",
@@ -192,6 +193,31 @@ def test_q_token_kv_block_sparse_public_apis_expose_kv_block_size(api: object) -
     parameter = inspect.signature(api).parameters["kv_block_size"]
     assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
     assert parameter.default == 4
+
+
+@pytest.mark.parametrize(
+    "api",
+    (
+        QTokenKvBlockSparsePagedTSWrapper.plan,
+        get_q_token_kv_block_sparse_workspace_size,
+        q_token_kv_block_sparse_attention_with_paged_kv_cache,
+        make_prims_ts_q_token_kv_block_sparse_qo_indptr,
+        validate_q_token_kv_block_sparse_group_size,
+    ),
+)
+def test_q_token_kv_block_sparse_group_size_defaults_to_one(api: object) -> None:
+    parameters = inspect.signature(api).parameters
+    assert parameters["group_size"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["group_size"].default == 1
+    assert "seq_len_q" not in parameters
+    assert "max_seq_len_q" not in parameters
+
+
+def test_q_token_kv_block_sparse_default_routes_do_not_group_queries() -> None:
+    offsets = make_prims_ts_q_token_kv_block_sparse_qo_indptr(
+        torch.tensor((0, 3, 5), dtype=torch.int32), 8, device="cpu"
+    )
+    torch.testing.assert_close(offsets, torch.arange(9, dtype=torch.int32))
 
 
 @pytest.mark.parametrize(
@@ -383,6 +409,7 @@ def test_q_token_kv_block_sparse_workspace_size_rejects_signed_locator_overflow(
             query,
             oversized_cache,
             block_table,
+            group_size=query.shape[2],
             block_topk=1,
             max_seq_len_kv=block_table.shape[1] * storage_page_size,
         )
@@ -489,7 +516,7 @@ def test_packed_q_token_kv_block_sparse_workspace_size_accepts_cpu_route_offsets
         block_topk=8,
         max_seq_len_kv=block_table.shape[1] * k_cache.shape[2],
         qo_indptr=cpu_qo_indptr,
-        max_seq_len_q=4,
+        group_size=4,
     )
 
     assert workspace_bytes > 0
@@ -511,7 +538,7 @@ def test_packed_q_token_kv_block_sparse_workspace_size_rejects_int64_route_offse
             block_topk=8,
             max_seq_len_kv=block_table.shape[1] * k_cache.shape[2],
             qo_indptr=torch.tensor((0, 4, 5, 8), dtype=torch.int64),
-            max_seq_len_q=4,
+            group_size=4,
         )
 
 
@@ -529,27 +556,28 @@ def test_q_token_kv_block_sparse_workspace_size_rejects_legacy_fixed_layouts(
             query,
             k_cache,
             block_table,
+            group_size=query.shape[2],
             block_topk=8,
             max_seq_len_kv=block_table.shape[1] * k_cache.shape[2],
         )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_fixed_q_token_kv_block_sparse_workspace_size_rejects_packed_route_bound() -> (
+def test_fixed_q_token_kv_block_sparse_workspace_size_rejects_mismatched_group_size() -> (
     None
 ):
     query = torch.empty((2, 1, 4, 12, 256), dtype=torch.bfloat16, device="cuda")
     k_cache = torch.empty((64, 1, 16, 256), dtype=torch.bfloat16, device="cuda")
     block_table = torch.empty((2, 64), dtype=torch.int32, device="cuda")
 
-    with pytest.raises(ValueError, match="only valid with packed"):
+    with pytest.raises(ValueError, match="group_size must match"):
         get_prims_ts_q_token_kv_block_sparse_workspace_size(
             query,
             k_cache,
             block_table,
             block_topk=8,
             max_seq_len_kv=block_table.shape[1] * k_cache.shape[2],
-            max_seq_len_q=4,
+            group_size=2,
         )
 
 
@@ -568,7 +596,7 @@ def test_q_token_kv_block_sparse_workspace_size_enforces_q128_group_capacity(
         )
         q_kwargs = {
             "qo_indptr": torch.tensor((0, group_size), dtype=torch.int32),
-            "max_seq_len_q": group_size,
+            "group_size": group_size,
         }
     else:
         query = torch.empty(
@@ -576,7 +604,7 @@ def test_q_token_kv_block_sparse_workspace_size_enforces_q128_group_capacity(
             dtype=torch.bfloat16,
             device="cuda",
         )
-        q_kwargs = {}
+        q_kwargs = {"group_size": group_size}
     k_cache = torch.empty((64, 1, 16, 256), dtype=torch.bfloat16, device="cuda")
     block_table = torch.empty((1, 64), dtype=torch.int32, device="cuda")
 
@@ -794,6 +822,7 @@ def test_q1_page_prefix_and_causal_tail_graph(dtype):
             query,
             k,
             table,
+            group_size=query.shape[2],
             block_topk=topk,
             max_seq_len_kv=context,
             out_dtype=out.dtype,
@@ -804,7 +833,6 @@ def test_q1_page_prefix_and_causal_tail_graph(dtype):
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         rows,
-        1,
         12,
         1,
         dim,
@@ -1915,6 +1943,7 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
         query,
         k_cache,
         table,
+        group_size=query.shape[2],
         block_topk=blocks.shape[1],
         max_seq_len_kv=table.shape[1] * storage_page_size,
         out_dtype=torch.bfloat16,
@@ -2017,6 +2046,7 @@ def test_q_token_kv_block_sparse_attention_hides_workspace_metadata(
             requests,
             positions,
             workspace,
+            group_size=query.shape[2],
             out=output,
             max_seq_len_kv=table.shape[1] * storage_page_size,
         )
@@ -2081,6 +2111,7 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
             query,
             k_cache,
             table,
+            group_size=query.shape[2],
             block_topk=blocks.shape[1],
             max_seq_len_kv=table.shape[1] * storage_page_size,
             out_dtype=output.dtype,
@@ -2150,6 +2181,7 @@ def test_q_token_kv_block_sparse_fixed_5d_layout_flattens_route_axes_without_cop
         requests,
         positions,
         workspace,
+        group_size=query.shape[2],
         bmm2_scale=0.25,
         out=output,
         max_seq_len_kv=table.shape[1] * storage_page_size,
@@ -2184,6 +2216,7 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
             query,
             k_cache,
             table,
+            group_size=query.shape[2],
             block_topk=blocks.shape[1],
             max_seq_len_kv=table.shape[1] * storage_page_size,
             out_dtype=output.dtype,
@@ -2243,6 +2276,7 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
         requests,
         positions,
         workspace,
+        group_size=query.shape[2],
         out=output,
         max_seq_len_kv=table.shape[1] * storage_page_size,
     )
@@ -2262,10 +2296,12 @@ def test_prepared_q_token_kv_block_sparse_fixed_5d_plan_flattens_runtime_views(
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-@pytest.mark.parametrize("group_size", (1, 3, 8))
+@pytest.mark.parametrize("requested_group_size", (None, 1, 3, 8))
 def test_q_token_kv_block_sparse_fixed_decode_matches_packed_prefill_layout(
-    group_size: int,
+    requested_group_size: int | None,
 ) -> None:
+    group_size = 1 if requested_group_size is None else requested_group_size
+    group_kwargs = {} if requested_group_size is None else {"group_size": group_size}
     blocks, table, requests, positions, storage_page_size = _make_case(group_size, 8)
     routes = table.shape[0]
     torch.manual_seed(42)
@@ -2307,7 +2343,7 @@ def test_q_token_kv_block_sparse_fixed_decode_matches_packed_prefill_layout(
                 max_seq_len_kv=table.shape[1] * storage_page_size,
                 out_dtype=output.dtype,
                 qo_indptr=packed_qo_indptr,
-                max_seq_len_q=group_size if packed_qo_indptr is not None else None,
+                **group_kwargs,
             ),
             dtype=torch.uint8,
             device="cuda",
@@ -2323,7 +2359,7 @@ def test_q_token_kv_block_sparse_fixed_decode_matches_packed_prefill_layout(
             out=output,
             max_seq_len_kv=table.shape[1] * storage_page_size,
             qo_indptr=packed_qo_indptr,
-            max_seq_len_q=group_size if packed_qo_indptr is not None else None,
+            **group_kwargs,
         )
 
     fixed_output = run(fixed_query)
@@ -2391,7 +2427,7 @@ def test_q_token_kv_block_sparse_fixed_decode_supports_padded_final_route(
                 max_seq_len_kv=table.shape[1] * storage_page_size,
                 out_dtype=output.dtype,
                 qo_indptr=packed_qo_indptr,
-                max_seq_len_q=(group_size if packed_qo_indptr is not None else None),
+                group_size=group_size,
             ),
             dtype=torch.uint8,
             device="cuda",
@@ -2407,7 +2443,7 @@ def test_q_token_kv_block_sparse_fixed_decode_supports_padded_final_route(
             out=output,
             max_seq_len_kv=table.shape[1] * storage_page_size,
             qo_indptr=packed_qo_indptr,
-            max_seq_len_q=(group_size if packed_qo_indptr is not None else None),
+            group_size=group_size,
         )
 
     fixed_output = run(fixed_query, blocks, requests, positions)
@@ -2499,7 +2535,7 @@ def test_q_token_kv_block_sparse_fixed_multiple_query_groups_match_packed_layout
                 max_seq_len_kv=table.shape[1] * storage_page_size,
                 out_dtype=output.dtype,
                 qo_indptr=packed_qo_indptr,
-                max_seq_len_q=(group_size if packed_qo_indptr is not None else None),
+                group_size=group_size,
             ),
             dtype=torch.uint8,
             device="cuda",
@@ -2515,7 +2551,7 @@ def test_q_token_kv_block_sparse_fixed_multiple_query_groups_match_packed_layout
             out=output,
             max_seq_len_kv=table.shape[1] * storage_page_size,
             qo_indptr=packed_qo_indptr,
-            max_seq_len_q=group_size if packed_qo_indptr is not None else None,
+            group_size=group_size,
         )
 
     fixed_output = run(fixed_query)
@@ -2632,6 +2668,7 @@ def test_prepared_q_token_kv_block_sparse_plan_keeps_metadata_and_attention_scra
         requests,
         positions,
         workspace,
+        group_size=query.shape[2],
         out=output,
         max_seq_len_kv=table.shape[1] * storage_page_size,
     )
@@ -2818,7 +2855,7 @@ def test_prepared_packed_q_token_kv_block_sparse_does_not_materialize_route_offs
             block_topk=blocks.shape[1],
             max_seq_len_kv=table.shape[1] * storage_page_size,
             qo_indptr=qo_indptr,
-            max_seq_len_q=group_size,
+            group_size=group_size,
         ),
         dtype=torch.uint8,
         device="cuda",
@@ -2875,7 +2912,7 @@ def test_prepared_packed_q_token_kv_block_sparse_does_not_materialize_route_offs
         out=output,
         max_seq_len_kv=table.shape[1] * storage_page_size,
         qo_indptr=qo_indptr,
-        max_seq_len_q=group_size,
+        group_size=group_size,
     )
 
 
@@ -2930,6 +2967,7 @@ def test_prepared_q_token_kv_block_sparse_plan_replays_without_counter_reset(
         requests,
         positions,
         workspace,
+        group_size=query.shape[2],
         out=output,
         max_seq_len_kv=table.shape[1] * storage_page_size,
     )
@@ -3089,6 +3127,7 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
             query,
             k_cache,
             block_table,
+            group_size=query.shape[2],
             block_topk=block_topk,
             max_seq_len_kv=block_table.shape[1] * storage_page_size,
             out_dtype=output.dtype,
@@ -3104,6 +3143,7 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
         token_to_request,
         query_positions,
         workspace,
+        group_size=query.shape[2],
         out=output,
         max_seq_len_kv=block_table.shape[1] * storage_page_size,
     )
@@ -3220,6 +3260,7 @@ def test_prepared_q_token_kv_block_sparse_fp8_q1_small_cuda_graph(
             query,
             k_cache,
             table,
+            group_size=query.shape[2],
             block_topk=block_topk,
             max_seq_len_kv=table.shape[1] * storage_page_size,
             out_dtype=output.dtype,
@@ -3235,6 +3276,7 @@ def test_prepared_q_token_kv_block_sparse_fp8_q1_small_cuda_graph(
         requests,
         positions,
         workspace,
+        group_size=query.shape[2],
         out=output,
         max_seq_len_kv=table.shape[1] * storage_page_size,
     )
@@ -3387,6 +3429,7 @@ def test_prepared_q_token_kv_block_sparse_fp8_grouped_tp4_bs256_cuda_graph(
         query,
         k_cache,
         block_table,
+        group_size=query.shape[2],
         block_topk=block_topk,
         max_seq_len_kv=max_storage_pages * storage_page_size,
         out_dtype=torch.bfloat16,
@@ -3401,6 +3444,7 @@ def test_prepared_q_token_kv_block_sparse_fp8_grouped_tp4_bs256_cuda_graph(
         token_to_request,
         query_positions,
         combined_workspace,
+        group_size=query.shape[2],
         out=prepared_output,
         max_seq_len_kv=max_storage_pages * storage_page_size,
     )
@@ -3520,6 +3564,7 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
         query,
         k_cache,
         table,
+        group_size=query.shape[2],
         block_topk=block_topk,
         max_seq_len_kv=table.shape[1] * storage_page_size,
         out_dtype=torch.bfloat16,
@@ -3555,6 +3600,7 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
         requests,
         positions,
         unified_workspace,
+        group_size=query.shape[2],
         out=unified_output,
         max_seq_len_kv=table.shape[1] * storage_page_size,
     )
@@ -3619,7 +3665,6 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
     graph_wrapper = QTokenKvBlockSparsePagedTSWrapper()
     graph_wrapper.plan(
         num_routes,
-        group_size,
         num_qo_heads,
         1,
         head_dim,
@@ -3627,6 +3672,7 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
         storage_page_size,
         block_topk,
         table.shape[1] * storage_page_size,
+        group_size=group_size,
         device=query.device,
         workspace_buffer=unified_workspace,
         q_data_type=query.dtype,
@@ -3741,6 +3787,7 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
                 query,
                 k_cache,
                 table,
+                group_size=query.shape[2],
                 block_topk=block_topk,
                 max_seq_len_kv=table.shape[1] * k_cache.shape[2],
                 out_dtype=output.dtype,
@@ -3758,6 +3805,7 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
         requests,
         positions,
         workspace,
+        group_size=query.shape[2],
         out=output,
         max_seq_len_kv=table.shape[1] * k_cache.shape[2],
     )
@@ -3886,7 +3934,7 @@ def test_grouped_cache_stride_rebinding_graph(
             max_seq_len_kv=context,
             o_data_type=output.dtype,
             qo_indptr=qo_indptr,
-            seq_len_q=group,
+            group_size=group,
             split_kv=False,
             share_pattern_across_kv_heads=share_pattern,
         ),
@@ -3896,7 +3944,6 @@ def test_grouped_cache_stride_rebinding_graph(
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         qo_indptr.numel() - 1,
-        group,
         heads,
         kv_heads,
         dim,
@@ -3904,6 +3951,7 @@ def test_grouped_cache_stride_rebinding_graph(
         page,
         topk,
         context,
+        group_size=group,
         device=query.device,
         workspace_buffer=workspace,
         use_packed_q=True,
@@ -4123,7 +4171,7 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
             max_seq_len_kv=table.shape[1] * storage_page_size,
             out_dtype=query.dtype,
             qo_indptr=qo_indptr,
-            max_seq_len_q=group_size,
+            group_size=group_size,
         ),
         dtype=torch.uint8,
         device="cuda",
@@ -4137,7 +4185,7 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
             max_seq_len_kv=table.shape[1] * storage_page_size,
             out_dtype=query.dtype,
             qo_indptr=q1_qo_indptr,
-            max_seq_len_q=1,
+            group_size=1,
         ),
         dtype=torch.uint8,
         device="cuda",
@@ -4152,7 +4200,7 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
         packed_workspace,
         max_seq_len_kv=table.shape[1] * storage_page_size,
         qo_indptr=qo_indptr,
-        max_seq_len_q=group_size,
+        group_size=group_size,
         out=packed_output,
     )
     prims_ts_q_token_kv_block_sparse_attention(
@@ -4165,7 +4213,7 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
         q1_workspace,
         max_seq_len_kv=table.shape[1] * storage_page_size,
         qo_indptr=q1_qo_indptr,
-        max_seq_len_q=1,
+        group_size=1,
         out=q1_output,
     )
     prepared_output = torch.empty_like(query)
@@ -4180,7 +4228,7 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
         prepared_workspace,
         max_seq_len_kv=table.shape[1] * storage_page_size,
         qo_indptr=qo_indptr,
-        max_seq_len_q=group_size,
+        group_size=group_size,
         out=prepared_output,
     )
 
@@ -4226,7 +4274,7 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
             q1_workspace,
             max_seq_len_kv=table.shape[1] * storage_page_size,
             qo_indptr=q1_qo_indptr,
-            max_seq_len_q=1,
+            group_size=1,
             out=q1_output,
         )
         prepared_output.fill_(torch.nan)

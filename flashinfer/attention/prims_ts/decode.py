@@ -1358,7 +1358,7 @@ def _resolve_decode_launch_spec(
                 head_dim=head_dim,
                 page_size=page_size,
                 max_kv_len=max_kv_len,
-                seq_len_q=seq_len_q,
+                group_size=seq_len_q,
                 q_dtype_key=q_dtype_key,
                 k_dtype_key=k_dtype_key,
                 v_dtype_key=v_dtype_key,
@@ -2860,7 +2860,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
     head_dim: int,
     page_size: int,
     max_kv_len: int,
-    seq_len_q: int,
+    group_size: int,
     q_dtype_key: str,
     k_dtype_key: str,
     v_dtype_key: str,
@@ -2881,7 +2881,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
 
     heads_q_per_kv = num_qo_heads // num_kv_heads
     _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
-        seq_len_q,
+        group_size,
         num_qo_heads,
         num_kv_heads,
     )
@@ -2911,7 +2911,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         )
 
     launch = _sparse_policy.select_sparse_launch(
-        group_size=seq_len_q,
+        group_size=group_size,
         heads_q_per_kv=heads_q_per_kv,
         head_dim=head_dim,
         q_dtype_key=q_dtype_key,
@@ -2941,14 +2941,14 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         "scheduler_warp_idx": 13,
         "clc_load_warp_idx": 16,
         "page_offsets_warp_idx": 14,
-        "page_offsets_num_warps": 2 if seq_len_q == 1 else 1,
+        "page_offsets_num_warps": 2 if group_size == 1 else 1,
         "load_warp_idx": 16,
         # FP8's predicated TMA helper constructs coordinates in every load
         # lane, so Q1 needs only one producer warpgroup. BF16 distributes page
         # fragments across two producer warpgroups. Grouped routes keep
         # their qualified two-warpgroup schedule for both dtypes.
         "load_num_warps": (
-            4 if seq_len_q == 1 and q_dtype_key == "float8_e4m3fn" else 8
+            4 if group_size == 1 and q_dtype_key == "float8_e4m3fn" else 8
         ),
     }
     if launch.use_keeps_mma_ab:
@@ -2962,7 +2962,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         ),
         splits_kv=launch.splits_kv,
         max_splits_kv=launch.splits_kv,
-        min_loop_iters_per_split=(1 if seq_len_q == 1 else MIN_LOOP_ITERS_PER_SPLIT),
+        min_loop_iters_per_split=(1 if group_size == 1 else MIN_LOOP_ITERS_PER_SPLIT),
     )
 
 
@@ -3175,7 +3175,7 @@ def validate_q_token_kv_block_sparse_group_size(
     num_qo_heads: int,
     num_kv_heads: int,
     *,
-    group_size: int,
+    group_size: int = 1,
 ) -> int:
     """Validate a QToken-KvBlock-Sparse-Attention Q1--Q8 group.
 
@@ -3206,7 +3206,8 @@ def validate_q_token_kv_block_sparse_group_size(
         Number of key/value heads.
     group_size : int
         Caller-selected number of query rows per QToken-KvBlock-Sparse-Attention route. Supported values
-        are Q1--Q8, subject to the TileQ128 head-capacity bound.
+        are Q1--Q8, subject to the TileQ128 head-capacity bound. Defaults to
+        one (no grouping).
 
     Returns
     -------
@@ -3228,16 +3229,17 @@ def make_q_token_kv_block_sparse_qo_indptr(
     query_start_loc_cpu: torch.Tensor,
     num_query_tokens: int,
     *,
-    group_size: int,
+    group_size: int = 1,
     device: Optional[Union[int, str, torch.device]] = None,
 ) -> torch.Tensor:
     """Build request-safe QToken-KvBlock-Sparse-Attention route offsets.
 
     ``query_start_loc_cpu`` contains cumulative offsets for real requests.
     Every request is chunked independently, so its final route may contain
-    fewer than ``group_size`` rows. Any inert CUDA-graph padding suffix is
-    partitioned separately. The returned Int32 ``qo_indptr`` can be passed to
-    the packed-Q wrapper together with planned ``seq_len_q=group_size``.
+    fewer than ``group_size`` rows. The default is one (no query grouping).
+    Any inert CUDA-graph padding suffix is partitioned separately. Pass the
+    returned Int32 ``qo_indptr`` to a packed-Q wrapper planned with the same
+    ``group_size``.
 
     Parameters
     ----------
@@ -3249,7 +3251,7 @@ def make_q_token_kv_block_sparse_qo_indptr(
         Total flattened query-row count, including any inert CUDA-graph
         padding suffix.
     group_size : int
-        Maximum number of rows in each request-safe QToken-KvBlock-Sparse-Attention route.
+        Maximum rows per request-safe query group, default one (no grouping).
     device : int, str, torch.device, or None
         Destination device for the returned offsets. By default, PyTorch's
         default tensor device is used.

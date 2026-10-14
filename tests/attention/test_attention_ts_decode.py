@@ -8297,7 +8297,7 @@ def test_q_token_sparse_geometry_graph(
             block_topk=topk,
             max_seq_len_kv=context,
             qo_indptr=qo_indptr,
-            seq_len_q=group if packed else None,
+            group_size=group,
             kv_block_size=block,
             o_data_type=out.dtype,
             split_kv=False,
@@ -8309,7 +8309,6 @@ def test_q_token_sparse_geometry_graph(
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         batch,
-        group,
         hkv * ratio,
         hkv,
         dim,
@@ -8317,6 +8316,7 @@ def test_q_token_sparse_geometry_graph(
         page,
         topk,
         context,
+        group_size=group,
         device=q.device,
         workspace_buffer=workspace,
         use_packed_q=packed,
@@ -8459,7 +8459,7 @@ def test_q_token_sparse_packed_query_boundaries(group, dim, ratio, dtype, split_
             block_topk=topk,
             max_seq_len_kv=context,
             qo_indptr=qo_indptr,
-            seq_len_q=group,
+            group_size=group,
             o_data_type=out.dtype,
             split_kv=split_kv,
         ),
@@ -8469,7 +8469,6 @@ def test_q_token_sparse_packed_query_boundaries(group, dim, ratio, dtype, split_
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         batch,
-        group,
         hq,
         hkv,
         dim,
@@ -8477,6 +8476,7 @@ def test_q_token_sparse_packed_query_boundaries(group, dim, ratio, dtype, split_
         page,
         topk,
         context,
+        group_size=group,
         device=q.device,
         workspace_buffer=workspace,
         use_packed_q=True,
@@ -8657,7 +8657,7 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
             block_topk=topk,
             max_seq_len_kv=context,
             qo_indptr=qo_indptr,
-            seq_len_q=group if packed else None,
+            group_size=group,
             kv_block_size=block,
             o_data_type=out.dtype,
             share_pattern_across_kv_heads=shared,
@@ -8669,7 +8669,6 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         batch,
-        group,
         hkv * ratio,
         hkv,
         dim,
@@ -8677,6 +8676,7 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
         page,
         topk,
         context,
+        group_size=group,
         device=q.device,
         workspace_buffer=workspace,
         use_packed_q=packed,
