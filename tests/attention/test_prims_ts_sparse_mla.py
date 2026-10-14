@@ -859,6 +859,14 @@ def test_native_graph(
         assert empty.numel() == empty_lse.numel() == 0
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_large_query_native_graph(dtype):
+    # A long Q grid exercises persistent work-tile advancement, including
+    # BF16's static scheduler and FP8's CLC scheduler on the same public inputs.
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    test_native_graph(dtype, 1, 8 * sms, 32, 513, True, False, False, True)
+
+
 def test_caller_workspace_single_source_and_eager_api():
     q = torch.zeros(1, 1, 16, 512, device="cuda", dtype=torch.bfloat16)
     kv = torch.ones(2, 1, 512, device="cuda", dtype=torch.bfloat16)

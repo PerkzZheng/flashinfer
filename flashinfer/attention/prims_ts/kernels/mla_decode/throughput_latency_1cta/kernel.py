@@ -36,7 +36,6 @@ from ...tensor_map import (
 )
 from cutlass.experimental import cuda
 from cutlass.experimental import primitives as prims
-from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
 from cutlass.experimental.task_scheduling.enums import PipelineType, SignalingThreads
 from cutlass.experimental.task_scheduling.memory import (
@@ -49,6 +48,7 @@ from cutlass.experimental.task_scheduling.resources import (
     PipelineConfig,
     TileSchedulerConfig,
     WorkQueue,
+    WorkTileInfo,
 )
 from cutlass.experimental.task_scheduling.task_manager import TaskManager
 
