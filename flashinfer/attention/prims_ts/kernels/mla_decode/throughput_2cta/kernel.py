@@ -1374,14 +1374,29 @@ class MlaDecodeTs:
         if cutlass.const_expr(cfg.use_tma_output):
             flat_o = output_quant_args[0]
             output_rows = cute.size(flat_o) // (128 * 512)
+            # Group-major [G, T, (H/G) * 512] output viewed as (channel, head in
+            # group, token, group). A box spans whole groups, or half of the
+            # single H128 group, retaining the same 64 shared-memory rows.
+            heads_per_group = (
+                self.output_quant.num_heads // self.output_quant.num_groups
+            )
+            box_heads = cutlass.const_expr(min(heads_per_group, 64))
             output_view = cute.make_tensor(
                 flat_o.iterator,
-                cute.make_layout((512, 128, output_rows), stride=(1, 512, 128 * 512)),
+                cute.make_layout(
+                    (512, heads_per_group, output_rows, self.output_quant.num_groups),
+                    stride=(
+                        1,
+                        512,
+                        heads_per_group * 512,
+                        output_rows * heads_per_group * 512,
+                    ),
+                ),
             )
             tma_desc_o = create_tensor_map_tiled_from_view(
                 output_view,
-                box_dims=(128, 64, 1),
-                stride_order=(0, 1, 2),
+                box_dims=(128, box_heads, 1, 64 // box_heads),
+                stride_order=(0, 1, 2, 3),
                 swizzle=cuda.TensorMapSwizzle.s128b,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )

@@ -3712,6 +3712,13 @@ class GmemOResource(HighThroughputMlaResource):
     ):
         # Sparse launch flattens queries into batch rows; each CTA owns 64 heads.
         head_tile_idx, _, token, _ = stage_info.work_tile.tile_idx
+        # A tile can span groups or lie inside the single H128 group.
+        heads_per_group = cutlass.const_expr(
+            self.output_quant.num_heads // self.output_quant.num_groups
+        )
+        head_start = head_tile_idx * Int32(64)
+        group = head_start // heads_per_group
+        head_in_group = head_start % heads_per_group
         if prims.elect_sync():
             for half in cutlass.range_constexpr(2):
                 prims.cp_async_bulk_tensor_global_shared_cta(
@@ -3719,7 +3726,7 @@ class GmemOResource(HighThroughputMlaResource):
                     self.smem_o.subview(
                         stage_info.stage_idx * OUTPUT_TMA_STAGE_BYTES + half * 8192
                     ),
-                    (iter_n * 256 + half * 128, head_tile_idx * 64, token),
+                    (iter_n * 256 + half * 128, head_in_group, token, group),
                 )
         prims.cp_async_bulk_commit_group()
         # Release the stage only after TMA has consumed its shared source.

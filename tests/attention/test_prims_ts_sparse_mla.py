@@ -371,13 +371,27 @@ def _dequant_output(output, scales, block_size):
         (2, 2, 24, 513, 32, "ue8m0", True, True),
         (1, 3, 64, 129, 128, "ue8m0", False, False),
         (1, 1, 128, 2049, 128, "fp32", False, False),
+        # T == G and T != G, T > 1: token-major and group-major differ here.
+        (16, 1, 128, 513, 128, "ue8m0", False, False),
+        (5, 1, 128, 513, 32, "fp32", False, False),
+        (5, 1, 16, 513, 128, "ue8m0", False, False),
         (1, 161, 64, 513, 32, "ue8m0", False, False),
         # Packed multiwave queries reuse the quantized output's shared stages.
         (2, 81, 128, 513, 32, "fp32", True, False),
     ],
 )
 def test_rope_quant_graph(
-    dtype, batch, queries, heads, topk, block, fmt, packed, independent
+    dtype,
+    batch,
+    queries,
+    heads,
+    topk,
+    block,
+    fmt,
+    packed,
+    independent,
+    groups=None,
+    output_padding=0,
 ):
     """Exercise final stores and reductions through public automatic dispatch."""
     torch.manual_seed(317)
@@ -411,7 +425,7 @@ def test_rope_quant_graph(
     storage = torch.empty(theta.numel() * 2 + 4, device="cuda")
     cos_sin = storage[4:].view(-1, 64)
     cos_sin.copy_(torch.cat((theta.cos(), theta.sin()), -1))
-    groups = max(1, heads // 8)
+    groups = max(1, heads // 8) if groups is None else groups
     wrapper = BatchSparseMLADecodePagedTSWrapper()
     wrapper.plan(
         "cuda",
@@ -453,17 +467,29 @@ def test_rope_quant_graph(
         **descales,
     )
     output, scales, lse = wrapper.run(q, kv, metadata, extra, **kwargs)
-    assert output.shape == (rows, groups, heads // groups * 512)
+    channels = heads // groups * 512
+    assert output.shape == (rows, groups, channels)
     assert output.dtype == torch.float8_e4m3fn
+    # Physical storage is group-major [G, T, C]; the public view is token-major.
+    assert output.stride() == (channels, rows * channels, 1)
+    assert output.transpose(0, 1).is_contiguous()
     padded = (rows + 3) // 4 * 4
     columns = heads // groups * 512 // block // (4 if fmt == "ue8m0" else 1)
     assert scales.shape == (rows, groups, columns)
     assert scales.stride() == (1, columns * padded, padded)
     # Graph replay also exercises caller-owned output aligned to 16, not 32.
     output_storage = torch.empty(
-        output.numel() + 16, device=output.device, dtype=output.dtype
+        groups * (rows + output_padding) * channels + 16,
+        device=output.device,
+        dtype=output.dtype,
     )
-    output = output_storage[16:].view_as(output)
+    output_backing = (
+        output_storage[16:]
+        .view(groups, rows + output_padding, channels)
+        .transpose(0, 1)
+    )
+    output_backing.view(torch.uint8).fill_(123)
+    output = output_backing[:rows]
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         wrapper.run(
@@ -480,6 +506,8 @@ def test_rope_quant_graph(
     # Query positions are graph-live, including packed/chunked query batches.
     positions.add_(7)
     graph.replay()
+    if output_padding:
+        assert torch.all(output_backing[rows:].view(torch.uint8) == 123)
     ref, ref_lse, bound = _reference(
         q,
         kv,
@@ -502,7 +530,7 @@ def test_rope_quant_graph(
     bound[..., 448::2] = bx * c + by * s
     bound[..., 449::2] = by * c + bx * s
     actual, dequant_scales = _dequant_output(output, scales, block)
-    actual = actual.view(rows, heads, 512)
+    actual = actual.reshape(rows, heads, 512)
     # E4M3 RN adds at most 1/16 relative error plus half a subnormal step.
     rounding = dequant_scales.repeat_interleave(block, dim=-1).view_as(actual) / 1024
     allowed = bound + (ref.abs() + bound) / 16 + rounding + 1e-6
@@ -571,9 +599,11 @@ def test_rope_quant_scales_and_contract(block, fmt):
         )
         torch.testing.assert_close(eager_out.float(), output.float(), atol=0, rtol=0)
         torch.testing.assert_close(eager_scales, scales, atol=0, rtol=0)
-        misaligned = torch.empty(output.numel() + 1, dtype=output.dtype, device="cuda")[
-            1:
-        ].view_as(output)
+        misaligned = (
+            torch.empty(output.numel() + 1, dtype=output.dtype, device="cuda")[1:]
+            .view(2, 1, 2048)
+            .transpose(0, 1)
+        )
         with pytest.raises(ValueError, match="aligned"):
             wrapper.run(
                 q,
@@ -635,6 +665,77 @@ def test_rope_quant_scales_and_contract(block, fmt):
     )
     assert empty_out.shape == (0, 2, 2048)
     assert empty_scales.shape == (0, 2, 2048 // block // (4 if fmt == "ue8m0" else 1))
+
+
+@pytest.mark.parametrize("rows,groups", [(3, 2), (1, 2), (3, 1)])
+def test_rope_quant_output_layout_contract(rows, groups):
+    """Require physical [G,T,C] storage while ignoring singleton-axis strides."""
+    heads = 8
+    q = torch.zeros((rows, 1, heads, 512), device="cuda", dtype=torch.bfloat16)
+    kv = torch.randn(4, 1, 512, device="cuda").to(torch.bfloat16)
+    indices = torch.zeros((rows, 1), device="cuda", dtype=torch.int32)
+    positions = torch.ones((rows, 1), device="cuda", dtype=torch.int32)
+    cos_sin = torch.zeros(4, 64, device="cuda")
+    cos_sin[:, :32] = 1
+    wrapper = BatchSparseMLADecodePagedTSWrapper()
+    wrapper.plan(
+        "cuda",
+        rows,
+        heads,
+        max_topk=1,
+        output_quant_block_size=128,
+        out_scale_format="fp32",
+        num_output_groups=groups,
+    )
+    metadata = prepare_sparse_mla_metadata(wrapper, q, kv, indices)
+    token_major = torch.empty(
+        (rows, groups, heads // groups * 512), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+
+    def run(out):
+        return wrapper.run(
+            q, kv, metadata, token_positions=positions, cos_sin_cache=cos_sin, out=out
+        )
+
+    if rows > 1 and groups > 1:
+        with pytest.raises(ValueError, match="group-major"):
+            run(token_major)
+    else:
+        out, _ = run(token_major)
+        assert out.data_ptr() == token_major.data_ptr()
+    if rows == 1 and groups > 1:
+        overlapping = token_major.as_strided(
+            token_major.shape, (heads // groups * 512, 0, 1)
+        )
+        with pytest.raises(ValueError, match="group-major"):
+            run(overlapping)
+    group_major = token_major.view(groups, rows, -1).transpose(0, 1)
+    out, _ = run(group_major)
+    assert out.data_ptr() == group_major.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "heads,groups,block,fmt",
+    [(128, 1, 128, "fp32"), (128, 2, 32, "ue8m0"), (24, 8, 128, "fp32")],
+)
+def test_rope_quant_group_layout(heads, groups, block, fmt):
+    """Cover partial/whole-group TMA boxes and non-power-of-two head groups."""
+    rows = (
+        torch.cuda.get_device_properties(0).multi_processor_count if heads == 128 else 3
+    )
+    test_rope_quant_graph(
+        torch.float8_e4m3fn,
+        rows,
+        1,
+        heads,
+        513,
+        block,
+        fmt,
+        False,
+        False,
+        groups=groups,
+        output_padding=3,
+    )
 
 
 def test_rope_quant_plan_options():
