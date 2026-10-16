@@ -2527,13 +2527,25 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def uses_warp_uniform_softmax_anchor(self) -> bool:
+        """Whether shared BF16 uses FlashMLA's warp-wide anchor update rule."""
+        return (
+            self.use_keeps_mma_ab
+            and not self.use_block_sparse
+            and self.reuse_shared_kv
+            and self.use_bf16_qkv
+            and self.use_bf16_output
+            and self.uses_staged_one_inst_tmem_p
+        )
+
+    @property
     def defers_softmax_anchor_updates(self) -> bool:
         """Whether small row-max increases keep the previous exponent anchor.
 
         Keeps correction skips the in-place O rescale whenever the anchor is
-        unchanged, so keeping the prior anchor within
-        ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` trades a bounded 16-bit P range
-        (2**8) for fewer TMEM rescales. The profiles listed here are the ones
+        unchanged. Shared BF16 uses FlashMLA's warp-wide six-log2 policy
+        (P <= 2**6); other deferred profiles retain the per-row eight-log2
+        policy (P <= 2**8). The profiles listed here are the ones
         where that trade was measured to pay: KV256, block-sparse routes, and
         shared-BF16 token gathers. Their maxima move often but rarely by much.
         FP8 P uses
@@ -2546,12 +2558,7 @@ class FmhaDecodeConfig:
             and (
                 self.tile_size_kv == 256
                 or self.use_block_sparse
-                or (
-                    self.reuse_shared_kv
-                    and self.use_bf16_qkv
-                    and self.use_bf16_output
-                    and self.uses_staged_one_inst_tmem_p
-                )
+                or self.uses_warp_uniform_softmax_anchor
             )
         )
 

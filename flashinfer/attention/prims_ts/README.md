@@ -194,9 +194,14 @@ Cache-resident, static, split, packed-Q, non-shared, other-precision and other-
 architecture launches retain the existing KV128 path. This residency decision
 is a footprint heuristic, not an inspection of live sparse indices.
 
-Both shared-BF16 tile sizes defer softmax-anchor updates smaller than eight
-log2 units. P remains bounded by 256; numerator and denominator keep the same
-anchor. Larger score jumps rebase normally. This skips identity O rescales
+Both shared-BF16 tile sizes use FlashMLA's six-log2, warp-wide anchor rule.
+If any lane's maximum exceeds its retained anchor by more than six log2
+units, every row in that warp updates to its own maximum; otherwise all keep
+their anchors. P remains bounded by 64; numerator and denominator keep the
+same anchor. Other deferred profiles retain their per-row eight-log2 policy.
+First-live rows explicitly initialize their anchors even at tiny positive
+softmax scales; fully masked rows do not force a warp-wide update.
+This skips identity O rescales
 without changing dtype, mask semantics, synchronization, or the public API.
 Rebinding an independent V cache selects the ordinary non-shared path.
 
@@ -204,6 +209,7 @@ Qualification and fallbacks for this tuning:
 
 - Pitfalls: K/V must truly alias; KV64 requires eight stages and its corrected
   descriptor-plane stride. Keep the existing P and shared-KV lifetime barriers.
+  Anchor votes must be warp-converged and preserve first-live initialization.
   As before, valid Q1 routes require a complete distinct index prefix: arbitrary
   `-1` holes are not compacted. Test empty routes through invalid query metadata.
 - Regressions: None observed in the four B200 workloads below or the shared-
@@ -220,19 +226,27 @@ has Hq128/Hkv1, with equal useful QK+PV FLOPs. This compares full implementation
 not only head dimension. Two independent process repeats each interleave three
 rounds of >=500 ms warmup and 15 samples of 50 CUDA graph replays:
 
-| Phase/top-k | Original D256 ms | Tuned D256 ms | D512 ms | Tuned slowdown |
-| --- | ---: | ---: | ---: | ---: |
-| Decode/512 | 0.389194 | 0.368939 | 0.355407 | +3.81% |
-| Prefill/512 | 2.402889 | 2.334106 | 2.270916 | +2.78% |
-| Decode/2048 | 1.352590 | 1.199586 | 1.286574 | -6.76% |
-| Prefill/2048 | 7.642968 | 7.326559 | 7.516598 | -2.53% |
+The previous optimized per-row8 profile and the FlashMLA-style warp-wide6
+profile below differ only in their anchor policy, not launch geometry:
 
-Positive slowdown means D256 is slower. Each independent repeat is below 5%;
-timed workers retain sampled FP32 checks, with maximum RMS-relative error
-0.002193 (limit 0.01). The local `paired-investigation.py` harness preserves
+| Phase/top-k | Previous per-row8 D256 ms | Warp-wide6 D256 ms | D512 ms | D256 slowdown |
+| --- | ---: | ---: | ---: | ---: |
+| Decode/512 | 0.368959 | 0.369018 | 0.353518 | +4.38% |
+| Prefill/512 | 2.335933 | 2.336469 | 2.271101 | +2.88% |
+| Decode/2048 | 1.199119 | 1.200492 | 1.284891 | -6.57% |
+| Prefill/2048 | 7.324676 | 7.335040 | 7.499160 | -2.19% |
+
+Positive slowdown means D256 is slower. Each independent repeat and every
+individual interleaved round is below 5% (worst round 4.92%). The policy
+change adds only 0.02%-0.14% latency in the aggregate. Timed workers retain
+sampled FP32 checks (RMS-relative <0.01, cosine error <1e-5).
+The local `paired-investigation.py` harness preserves
 the original workload and checks every head of 71 decode/73 prefill rows.
 `test_attention_ts_token_sparse_tuning.py` covers policy boundaries, graph
-rebinding, finite large-score jumps, tails and empty routes. The existing
+rebinding, finite large-score jumps, tails and empty routes. Its direct device
+test checks the strict 6 boundary, warp-wide rebase from one triggering lane,
+first-live initialization at normal/tiny positive scales, and masked rows.
+All 48 qualification tests pass. The existing
 `test_token_sparse_shared_kv_graph` additionally covers split/static and
 offset-output fallback behavior. Full BF16 value-range, other architectures,
 and performance outside the four listed workloads are not exhaustively qualified.

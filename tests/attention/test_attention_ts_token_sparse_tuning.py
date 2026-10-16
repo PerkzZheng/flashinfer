@@ -22,6 +22,8 @@ import torch
 pytest.importorskip("cutlass", minversion="4.7.0")
 
 from cutlass import BFloat16, Float16
+import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
 
 from flashinfer.attention.prims_ts import _q_token_kv_block_sparse_policy as policy
 from flashinfer.attention.prims_ts import decode
@@ -29,6 +31,9 @@ from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import
     CAUSAL,
     FmhaDecodeConfig,
     _validate_profile_support,
+)
+from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.tmem_s import (
+    TmemSResource,
 )
 from flashinfer.decode import (
     QTokenKvBlockSparsePagedTSWrapper,
@@ -106,6 +111,7 @@ def test_shared_bf16_small_tile_layout_and_original_fallback():
     assert original.tile_size_kv == 128
     assert tuned.uses_token_sparse_kv64 and tuned.unroll_staged_qk
     assert tuned.defers_softmax_anchor_updates
+    assert tuned.uses_warp_uniform_softmax_anchor
     assert (tuned.tmem_s_cols, tuned.tmem_p_cols, tuned.kv_stages) == (64, 32, 8)
     assert (tuned.mma_warp_idx, tuned.scheduler_warp_idx) == (8, 9)
     assert (tuned.page_offsets_warp_idx, tuned.load_warp_idx) == (10, 12)
@@ -123,7 +129,10 @@ def test_shared_bf16_small_tile_layout_and_original_fallback():
     assert FmhaDecodeConfig(**dict(tuned.compile_signature())).uses_token_sparse_kv64
     assert not original.unroll_staged_qk
     assert original.defers_softmax_anchor_updates
+    assert original.uses_warp_uniform_softmax_anchor
     assert not replace(original, reuse_shared_kv=False).defers_softmax_anchor_updates
+    assert not replace(original, reuse_shared_kv=False).uses_warp_uniform_softmax_anchor
+    assert not replace(original, use_block_sparse=True).uses_warp_uniform_softmax_anchor
 
 
 @pytest.mark.parametrize(
@@ -162,6 +171,43 @@ _REQUIRES_SM100 = pytest.mark.skipif(
 
 
 @_REQUIRES_SM100
+@pytest.mark.parametrize("scale", (1.0, 1e-39))
+def test_shared_bf16_flashmla_anchor_vote(scale):
+    """Check the actual device rule: strict >6, ANY vote and empty/first rows."""
+    from cutlass import Float32
+
+    sentinel = -torch.finfo(torch.float32).max
+    old = torch.full((128,), 10.0, device="cuda")
+    tile = torch.full_like(old, 11.0)
+    tile[0] = 16.0  # Equality must not trigger a rebase.
+    tile[32] = 16.25  # One lane triggers every increasing row in this warp.
+    tile[33] = 9.0  # A triggered warp must never lower an individual anchor.
+    old[64:] = sentinel
+    tile[64:] = sentinel
+    tile[64] = -100.0  # First live row, alongside still-empty rows.
+    expected = old.clone()
+    if scale == 1.0:
+        expected[32:64] = torch.maximum(old[32:64], tile[32:64])
+    expected[64] = -100.0
+    output = torch.empty_like(old)
+    resource = TmemSResource(
+        name="anchor_rule", cfg=_shared_config(), scale_softmax_log2=Float32(scale)
+    )
+
+    @cute.kernel
+    def anchor_rule(old: cute.Tensor, tile: cute.Tensor, output: cute.Tensor):
+        lane = cute.arch.thread_idx()[0]
+        output[lane] = resource._softmax_anchor(old[lane], tile[lane])
+
+    @cute.jit
+    def launch(old: cute.Tensor, tile: cute.Tensor, output: cute.Tensor):
+        anchor_rule(old, tile, output).launch(grid=(1, 1, 1), block=(128, 1, 1))
+
+    launch(from_dlpack(old), from_dlpack(tile), from_dlpack(output))
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+
+@_REQUIRES_SM100
 @pytest.mark.parametrize("topk", (65, 257, 512, 2048))
 @torch.no_grad()
 def test_shared_bf16_small_tile_rescale_and_live_graph(topk, monkeypatch):
@@ -177,10 +223,10 @@ def test_shared_bf16_small_tile_rescale_and_live_graph(topk, monkeypatch):
     table = torch.randperm(batch * pages, device="cuda", dtype=torch.int32).view(
         batch, pages
     )
-    # These tile maxima defer a 7.5-log2 rise, cross the 8-log2 threshold,
+    # These tile maxima defer a 5.5-log2 rise, cross the 6-log2 threshold,
     # then force a much larger rebase. Head-dependent scales exercise partial
     # warp votes in correction as well as uniformly unchanged anchors.
-    maxima = (torch.tensor((0.0, 7.5, 9.0, 80.0), device="cuda") * math.log(2.0)).to(
+    maxima = (torch.tensor((0.0, 5.5, 7.0, 80.0), device="cuda") * math.log(2.0)).to(
         cache.dtype
     )
     cache[table.long(), :, :, 0] = maxima[torch.arange(pages, device="cuda") % 4].view(

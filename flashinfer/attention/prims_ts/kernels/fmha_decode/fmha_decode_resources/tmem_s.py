@@ -49,6 +49,7 @@ from ..fmha_decode_constants import (
     INT32_SCORE_SEED_TILE_LBO,
     INT32_SCORE_SEED_TILE_SBO,
     INT32_SCORE_SEED_TILE_WORDS,
+    SHARED_BF16_SOFTMAX_RESCALE_THRESHOLD_LOG2,
     SOFTMAX_RESCALE_THRESHOLD_LOG2,
 )
 from ...tcgen05_compat import tcgen05_mma_ws
@@ -1032,19 +1033,38 @@ class TmemSResource(DecodeGenResourceBase):
 
         Online softmax only requires a common finite reference for P, the
         running sum, and O; it does not require the exact row maximum.
-        Profiles that defer anchor updates keep the previous reference while
-        the tile raises it by less than ``SOFTMAX_RESCALE_THRESHOLD_LOG2``
-        log2 units, so correction can skip the in-place TMEM O rescale. The
+        Shared BF16 matches FlashMLA: if any lane exceeds six log2 units,
+        every row in the warp updates to its own maximum. Other deferred
+        profiles retain their per-row eight-log2 rule. Unchanged anchors
+        let correction skip the in-place TMEM O rescale. The
         16-bit P path represents the bounded values above one, and the
         numerator and denominator stay in the same scale frame. Larger jumps
         still rebase to keep P comfortably in range.
         """
         new_max = cute.math.max(old_max, tile_max, ftz=True)
         if cutlass.const_expr(self.cfg.defers_softmax_anchor_updates):
-            if old_max != _neg_max_f32():
-                max_delta_log2 = self.scale_softmax_log2 * (old_max - new_max)
-                if max_delta_log2 >= Float32(-SOFTMAX_RESCALE_THRESHOLD_LOG2):
+            if cutlass.const_expr(self.cfg.uses_warp_uniform_softmax_anchor):
+                # Keep the vote converged, including first-live and masked
+                # rows. Explicitly initialize first-live rows even when a
+                # tiny positive scale suppresses their sentinel delta.
+                max_delta_log2 = self.scale_softmax_log2 * (new_max - old_max)
+                first_live = (old_max == _neg_max_f32()) & (new_max != _neg_max_f32())
+                should_rebase = prims.vote_sync(
+                    cute.arch.FULL_MASK,
+                    first_live
+                    | (
+                        max_delta_log2
+                        > Float32(SHARED_BF16_SOFTMAX_RESCALE_THRESHOLD_LOG2)
+                    ),
+                    prims.VoteSync.ANY,
+                )
+                if not should_rebase:
                     new_max = old_max
+            else:
+                if old_max != _neg_max_f32():
+                    max_delta_log2 = self.scale_softmax_log2 * (old_max - new_max)
+                    if max_delta_log2 >= Float32(-SOFTMAX_RESCALE_THRESHOLD_LOG2):
+                        new_max = old_max
         return new_max
 
     @cute.jit

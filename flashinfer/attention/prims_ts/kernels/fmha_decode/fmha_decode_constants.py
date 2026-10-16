@@ -63,6 +63,11 @@ KV_TILE_256_K_SLOT_FOR_SEMANTIC_ATOM = (0, 2, 1, 3)
 # ``FmhaDecodeConfig.defers_softmax_anchor_updates``.
 SOFTMAX_RESCALE_THRESHOLD_LOG2 = 8.0
 
+# Match FlashMLA's SM100 sparse BF16 kernels: a warp-wide ANY vote on a
+# greater-than-six log2 rise gates updating every row's exponent anchor.
+# The shared-BF16 path therefore bounds unnormalized P by 2**6, not 2**8.
+SHARED_BF16_SOFTMAX_RESCALE_THRESHOLD_LOG2 = 6.0
+
 # A launch bound makes ptxas honor warpgroup ``setmaxnreg`` allocations, but
 # the resulting register hand-off has a fixed cost. Paired B200 measurements
 # show that it is amortized once a Q64/KV256 CTA processes at least 32 tiles
