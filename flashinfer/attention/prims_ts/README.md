@@ -179,9 +179,64 @@ groups. `split_kv=False` disables splitting, not persistent scheduling.
 
 The production specialization supports D64/D128/D256, matching FP16/BF16
 Q/K/V/output, or FP8 E4M3 Q/K/V with FP16/BF16 output. It is causal and
-non-windowed, uses KV128 for Q1--Q8, and requires
+non-windowed, normally uses KV128 for Q1--Q8, and requires
 `seq_len_q * (Hq / Hkv) <= TileQ128`. Groups exceeding 64 token/head rows
 use TileQ128; per-fragment query membership still occupies one byte.
+
+Shared BF16 K=V token gathers with D256, Hq/Hkv=128 and G1 have a smaller
+SM100 profile. After binding confirms K/V aliasing, persistent direct launches
+with at most 2048 selected tokens use KV64 when the physical cache exceeds the
+device's L2 capacity. The eight D128-band KV stages hold four token tiles in
+the same data budget as KV128's two tiles. All eight TMA-issuing warps remain;
+the unused warp-group is removed. The staged QK descriptor loop is fully
+unrolled, with its K-plane stride derived from the actual token-tile width.
+Cache-resident, static, split, packed-Q, non-shared, other-precision and other-
+architecture launches retain the existing KV128 path. This residency decision
+is a footprint heuristic, not an inspection of live sparse indices.
+
+Both shared-BF16 tile sizes defer softmax-anchor updates smaller than eight
+log2 units. P remains bounded by 256; numerator and denominator keep the same
+anchor. Larger score jumps rebase normally. This skips identity O rescales
+without changing dtype, mask semantics, synchronization, or the public API.
+Rebinding an independent V cache selects the ordinary non-shared path.
+
+Qualification and fallbacks for this tuning:
+
+- Pitfalls: K/V must truly alias; KV64 requires eight stages and its corrected
+  descriptor-plane stride. Keep the existing P and shared-KV lifetime barriers.
+  As before, valid Q1 routes require a complete distinct index prefix: arbitrary
+  `-1` holes are not compacted. Test empty routes through invalid query metadata.
+- Regressions: None observed in the four B200 workloads below or the shared-
+  KV graph qualification tests. Retest before changing residency/capacity bounds.
+- Limitations: KV64 tuning is SM100-only, fixed G1, BF16 D256/Hq-per-KV128,
+  direct persistent output, no window/sinks, and selected-token capacity <=2048.
+  Physical-cache size can overestimate the live working set.
+- Fallbacks: unqualified or cache-resident bindings retain KV128, including
+  separate-V rebinding. No unrelated backend or reference kernel is selected.
+
+Local B200 qualification (BF16, shared K=V, FP32 accumulation): prefill uses
+B1/Q16384/KV16384; decode uses B512/Q4/KV16384. D256 has Hq256/Hkv2 and D512
+has Hq128/Hkv1, with equal useful QK+PV FLOPs. This compares full implementations,
+not only head dimension. Two independent process repeats each interleave three
+rounds of >=500 ms warmup and 15 samples of 50 CUDA graph replays:
+
+| Phase/top-k | Original D256 ms | Tuned D256 ms | D512 ms | Tuned slowdown |
+| --- | ---: | ---: | ---: | ---: |
+| Decode/512 | 0.389194 | 0.368939 | 0.355407 | +3.81% |
+| Prefill/512 | 2.402889 | 2.334106 | 2.270916 | +2.78% |
+| Decode/2048 | 1.352590 | 1.199586 | 1.286574 | -6.76% |
+| Prefill/2048 | 7.642968 | 7.326559 | 7.516598 | -2.53% |
+
+Positive slowdown means D256 is slower. Each independent repeat is below 5%;
+timed workers retain sampled FP32 checks, with maximum RMS-relative error
+0.002193 (limit 0.01). The local `paired-investigation.py` harness preserves
+the original workload and checks every head of 71 decode/73 prefill rows.
+`test_attention_ts_token_sparse_tuning.py` covers policy boundaries, graph
+rebinding, finite large-score jumps, tails and empty routes. The existing
+`test_token_sparse_shared_kv_graph` additionally covers split/static and
+offset-output fallback behavior. Full BF16 value-range, other architectures,
+and performance outside the four listed workloads are not exhaustively qualified.
+
 The pure-host
 `suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM
 count and prefers the largest legal group that can fill one service wave using

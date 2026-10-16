@@ -1472,6 +1472,46 @@ def _resolve_decode_launch_spec(
     )
 
 
+def _specialize_shared_bf16_token_config(
+    config: "FmhaDecodeConfig",
+    *,
+    block_topk: int,
+    cache_bytes: int,
+    l2_cache_bytes: int,
+    compute_capability: tuple[int, int],
+) -> "FmhaDecodeConfig":
+    """Tune a confirmed shared-KV binding, leaving other profiles unchanged."""
+    tile = _sparse_policy.select_shared_bf16_kv_tile(
+        block_topk=block_topk,
+        cache_bytes=cache_bytes,
+        l2_cache_bytes=l2_cache_bytes,
+        compute_capability=compute_capability,
+    )
+    if tile == 128:
+        return config
+    candidate = replace(
+        config,
+        tile_size_kv=64,
+        tmem_s_cols=64,
+        tmem_p_cols=32,
+        mma_tile_n_bmm1=64,
+        # Four complete KV64 tiles share the old KV128 two-tile budget.
+        kv_stages=8,
+    )
+    if not candidate.uses_token_sparse_kv64:
+        return config
+    from .kernels.fmha_decode.fmha_decode_config import _finalize_warp_roles
+
+    # Retain all eight TMA issuers, but do not schedule an unused warp-group.
+    candidate.mma_warp_idx = 8
+    candidate.scheduler_warp_idx = 9
+    candidate.page_offsets_warp_idx = 10
+    candidate.load_warp_idx = candidate.clc_load_warp_idx = 12
+    _finalize_warp_roles(candidate)
+    candidate.validate_paged_kv_staging_config()
+    return candidate
+
+
 def _make_decode_compile_spec(
     launch_spec: _DecodeLaunchSpec,
     *,
@@ -3590,6 +3630,36 @@ def _prepare_prims_ts_batch_decode_plan(
         raise ValueError(
             "shared-KV specialization requires identical BF16 D256 token-sparse K/V"
         )
+    if shared_kv_eligible:
+        assert direct_q1_spec is not None
+        properties = torch.cuda.get_device_properties(query.device)
+        shared_config = replace(
+            spec.config,
+            reuse_shared_kv=True,
+            use_flat_native_kv_tma=True,
+            flat_native_kv_num_heads=num_kv_heads,
+        )
+        tuned_config = _specialize_shared_bf16_token_config(
+            shared_config,
+            block_topk=direct_q1_spec.block_topk,
+            cache_bytes=k_cache.numel() * k_cache.element_size(),
+            l2_cache_bytes=getattr(properties, "L2_cache_size", 0),
+            compute_capability=(properties.major, properties.minor),
+        )
+        if tuned_config is not shared_config:
+            tuned_spec = _decode_launch_spec_from_config(
+                tuned_config,
+                batch_size=batch_size,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                seq_len_q=seq_len_q,
+                max_active_clusters=spec.max_active_clusters,
+            )
+            # Only direct nonsplit layouts qualify: caller-owned workspace
+            # sized before the live K/V alias was known remains sufficient.
+            assert tuned_spec.scratch_shapes == spec.scratch_shapes
+            spec = tuned_spec
     compile_spec = _make_decode_compile_spec(
         spec,
         device_index=device_index,

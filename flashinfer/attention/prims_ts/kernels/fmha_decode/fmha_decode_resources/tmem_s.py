@@ -879,10 +879,16 @@ class TmemSResource(DecodeGenResourceBase):
 
             # Derive every remaining descriptor from the immutable roots. At
             # each 64-column boundary the recurrence replaces its ordinary +2
-            # step with +1018 for K and +(8 * TileQ - 6), or +58, for Q; the
-            # closed form therefore adds each boundary jump minus that +2.
+            # step with +(8 * TileKV - 6) for K and +(8 * TileQ - 6), or +58,
+            # for Q; the closed form adds each boundary jump minus that +2.
             # Keeping descriptors out of iter_args avoids staged-D256 spills.
-            for ki in cutlass.range(1, mma_k_steps, 1, unroll=1):
+            for ki in cutlass.range(
+                1,
+                mma_k_steps,
+                1,
+                unroll=-1 if cfg.unroll_staged_qk else 1,
+                unroll_full=cfg.unroll_staged_qk,
+            ):
                 if cutlass.const_expr(cfg.store_transformed_kv_in_tmem):
                     iter_k_desc = prims.make_tmem_ptr(
                         kv_desc + ki * Int32(_mma_k_step_qk(cfg) // 4), Int32
@@ -900,7 +906,9 @@ class TmemSResource(DecodeGenResourceBase):
                     iter_k_desc = k_desc + k_desc_offset
                 else:
                     chunk_idx = (ki * Int32(_mma_k_step_qk(cfg))) // Int32(64)
-                    k_desc_offset = ki * Int32(2) + chunk_idx * Int32(1016)
+                    k_desc_offset = ki * Int32(2) + chunk_idx * Int32(
+                        8 * cfg.tile_size_kv - 8
+                    )
                     q_chunk_extra = (
                         8 * cfg.tile_size_q - 8
                         if cutlass.const_expr(cfg.tile_size_q >= 16)

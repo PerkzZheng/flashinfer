@@ -27,6 +27,30 @@ TILE_SIZE_KV = 128
 MAX_SPLITS_KV = 128
 
 
+def select_shared_bf16_kv_tile(
+    *,
+    block_topk: int,
+    cache_bytes: int,
+    l2_cache_bytes: int,
+    compute_capability: tuple[int, int],
+) -> int:
+    """Use the small shared-BF16 tile for non-cache-resident SM100 gathers.
+
+    KV64 shortens the score/correction critical path, but needs more pipeline
+    turns. Cache-resident attention prefers KV128's compute efficiency. The
+    small-tile tuning is qualified only through 2048 selected tokens; other
+    architectures and larger capacities retain the existing recipe.
+    """
+    if (
+        compute_capability == (10, 0)
+        and 0 < block_topk <= 2048
+        and l2_cache_bytes > 0
+        and cache_bytes > l2_cache_bytes
+    ):
+        return 64
+    return TILE_SIZE_KV
+
+
 @dataclass(frozen=True)
 class SparseLaunch:
     tile_size_q: int

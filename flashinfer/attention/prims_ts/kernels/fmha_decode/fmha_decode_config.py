@@ -1111,6 +1111,11 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def unroll_staged_qk(self) -> bool:
+        """Fold short shared-BF16 QK descriptor loops into constant offsets."""
+        return self.uses_token_sparse_kv64
+
+    @property
     def head_dim_kv_stage(self) -> int:
         """Head-dim slice loaded by one K/V stage."""
         return (
@@ -1997,8 +2002,14 @@ class FmhaDecodeConfig:
             raise ValueError(
                 "paged-KV num_tokens_per_page must divide tile_size_kv exactly"
             )
-        if self.uses_scattered_page_route and self.tile_size_kv != 128:
-            raise ValueError("scattered page routes currently require tile_size_kv=128")
+        if (
+            self.uses_scattered_page_route
+            and self.tile_size_kv != 128
+            and not self.uses_token_sparse_kv64
+        ):
+            raise ValueError(
+                "scattered page routes require KV128 or the shared-BF16 KV64 profile"
+            )
         if self.num_tokens_per_page == 1 and not (
             self.uses_q_token_kv_block_sparse_page_route
             and self.max_seq_len_q == 1
@@ -2006,9 +2017,12 @@ class FmhaDecodeConfig:
         ):
             raise ValueError("token locators require direct G1 BF16 sparse attention")
         pages_per_tile = self.tile_size_kv // self.num_tokens_per_page
-        if pages_per_tile not in (1, 2, 4, 8, 16, 32, 128):
+        if pages_per_tile not in (1, 2, 4, 8, 16, 32, 128) and not (
+            pages_per_tile == 64 and self.uses_token_sparse_kv64
+        ):
             raise ValueError(
-                "paged-KV staging supports 1, 2, 4, 8, 16, 32, or 128 pages per KV tile"
+                "paged-KV staging supports 1, 2, 4, 8, 16, 32, or 128 pages per KV tile, "
+                "or 64 for the shared-BF16 token-gather profile"
             )
         max_page_producers = 2 if self.uses_q_token_kv_block_sparse_page_route else 1
         if not 1 <= self.page_offsets_num_warps <= max_page_producers:
@@ -2520,15 +2534,25 @@ class FmhaDecodeConfig:
         unchanged, so keeping the prior anchor within
         ``SOFTMAX_RESCALE_THRESHOLD_LOG2`` trades a bounded 16-bit P range
         (2**8) for fewer TMEM rescales. The profiles listed here are the ones
-        where that trade was measured to pay: KV256 tiles and block-sparse
-        routes, whose row maximum moves often but rarely by much. FP8 P uses
+        where that trade was measured to pay: KV256, block-sparse routes, and
+        shared-BF16 token gathers. Their maxima move often but rarely by much.
+        FP8 P uses
         the static 448 scale, which needs ``p <= 1``, so it always anchors on
         the exact row maximum.
         """
         return (
             self.use_keeps_mma_ab
             and not self.use_fp8_pv
-            and (self.tile_size_kv == 256 or self.use_block_sparse)
+            and (
+                self.tile_size_kv == 256
+                or self.use_block_sparse
+                or (
+                    self.reuse_shared_kv
+                    and self.use_bf16_qkv
+                    and self.use_bf16_output
+                    and self.uses_staged_one_inst_tmem_p
+                )
+            )
         )
 
     @property
@@ -2802,6 +2826,39 @@ class FmhaDecodeConfig:
             and self.max_splits_kv >= self.splits_kv
         )
 
+    @property
+    def uses_token_sparse_kv64(self) -> bool:
+        """Qualified small-tile shared-BF16 token-gather profile.
+
+        Retain the existing single-instance D128-band S/P overlay. Only the
+        number of token columns changes; grouped membership and split-KV
+        layouts have not been qualified for this geometry.
+        """
+        return (
+            self.tile_size_kv == 64
+            and self.tile_size_q == 128
+            and self.heads_q_per_kv == 128
+            and self.headdim == 256
+            and self.head_dim_per_stage_kv == 128
+            and self.use_keeps_mma_ab
+            and not self.use_block_sparse
+            and self.groups_tokens_heads_q
+            and self.use_bf16_qkv
+            and self.use_bf16_output
+            and self.reuse_shared_kv
+            and self.uses_q_token_kv_block_sparse_page_route
+            and self.num_tokens_per_page == 1
+            and self.use_flat_native_kv_tma
+            and self.max_seq_len_q == 1
+            and not self.use_variable_seqlens_q
+            and not self.use_sliding_window_causal
+            and not self.use_attention_sinks
+            and self.num_insts_kv == self.o_stages == 1
+            and self.uses_direct_kv_launch
+            and self.use_persistent_scheduler
+            and self.mask_type == CAUSAL
+        )
+
     def validate_q_token_kv_block_sparse_grouped_keeps_profile(self) -> None:
         """Validate the grouped-Keeps profiles for token-query sparse routes."""
         common_profile = (
@@ -2820,10 +2877,10 @@ class FmhaDecodeConfig:
             and not self.use_sliding_window_causal
             and (self.uses_direct_kv_launch or self.has_valid_split_kv_fanout)
         )
-        if not (common_profile and kv128_profile):
+        if not (common_profile and (kv128_profile or self.uses_token_sparse_kv64)):
             raise ValueError(
                 "QToken-KvBlock-Sparse-Attention grouped KeepsMmaAb requires an encoded sparse Q group "
-                "that fits Q64/Q128, a supported D64/D128/D256 KV128 recipe, "
+                "that fits Q64/Q128, a supported KV128 or shared-BF16 KV64 recipe, "
                 "and a supported causal direct, persistent or split launch"
             )
 
@@ -4856,12 +4913,14 @@ def _validate_profile_support(
     if is_q_token_kv_block_sparse_grouped_keeps:
         cfg.validate_q_token_kv_block_sparse_grouped_keeps_profile()
     supports_grouped_keeps = cfg.supports_grouped_keeps
-    if cfg.tile_size_kv != 128 and not (
-        cfg.tile_size_kv == 256 and supports_grouped_keeps
+    if (
+        cfg.tile_size_kv != 128
+        and not (cfg.tile_size_kv == 256 and supports_grouped_keeps)
+        and not cfg.uses_token_sparse_kv64
     ):
         raise ValueError(
-            "wide KeepsMmaAb is enabled only for the qualified D128 KV256 "
-            "native warp-specialized profile"
+            "non-KV128 KeepsMmaAb requires the qualified shared-BF16 KV64 "
+            "or D128 KV256 native warp-specialized profile"
         )
     if use_keeps_mma_ab and use_groups_tokens_heads_q:
         if not (is_q_token_kv_block_sparse_grouped_keeps or supports_grouped_keeps):
