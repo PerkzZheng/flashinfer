@@ -78,6 +78,9 @@ have not been validated for this extension.
 
 A positive left window requires GQA with an even `Hq/Hkv` ratio greater than
 one. Causal attention requires `Sq <= Sk` for every active request at run time.
+Paged sliding-window loads ignore K/V pages wholly before the earliest visible
+key in a query tile. Those evicted pages may have been recycled and contain
+NaNs; the first partially visible page remains live.
 Plan capacities and fixed tensor extents must be positive; packed request lengths
 may be zero. For each contiguous
 run, the aggregate logical Q and K extents—`B*Sq` and `B*Sk` for fixed storage,

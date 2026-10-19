@@ -1040,6 +1040,7 @@ class GmemQKVResource(MemoryResource):
     seqlen_k: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     kv_tile_start: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     kv_request_begin: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    kv_page_idx_lb: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     kv_page_idx_ub: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __init__(
@@ -1134,6 +1135,11 @@ class GmemQKVResource(MemoryResource):
             default=Int32(0),
             docs="Element offset of the request's block-table row.",
         )
+        self.kv_page_idx_lb = TaskLocalVariable(
+            dtype=Int32,
+            default=Int32(0),
+            docs="First logical page containing a visible sliding-window key.",
+        )
         self.kv_page_idx_ub = TaskLocalVariable(
             dtype=Int32,
             default=Int32(0),
@@ -1154,6 +1160,7 @@ class GmemQKVResource(MemoryResource):
             seqlen_k,
             kv_tile_start,
             kv_request_begin,
+            kv_page_idx_lb,
             kv_page_idx_ub,
         )
     )
@@ -1161,6 +1168,7 @@ class GmemQKVResource(MemoryResource):
     def compute_coords(
         self, stage_info: StageInfo
     ) -> tuple[
+        Int32,
         Int32,
         Int32,
         Int32,
@@ -1196,6 +1204,7 @@ class GmemQKVResource(MemoryResource):
         window_q_offset = Int32(self.q_offset_default)
         kv_tile_start = Int32(0)
         kv_request_begin = Int32(0)
+        kv_page_idx_lb = Int32(0)
         kv_page_idx_ub = Int32(0)
         if cutlass.const_expr(self.cfg.has_varlen):
             if cutlass.const_expr(self.cfg.has_uniform_varlen):
@@ -1263,6 +1272,16 @@ class GmemQKVResource(MemoryResource):
                     )
                     // self.cfg.seq_tile_n,
                 )
+        if cutlass.const_expr(
+            self.cfg.use_paged_kv and self.cfg.kv_tile_start_window_size_left > 0
+        ):
+            first_key = cute.math.max(
+                Int32(0),
+                seq_coord * self.cfg.q_tile_m
+                + window_q_offset
+                - self.cfg.kv_tile_start_window_size_left,
+            )
+            kv_page_idx_lb = first_key // Int32(self.cfg.num_tokens_per_page)
         if cutlass.const_expr(self.cfg.has_variable_window):
             min_window_start = variable_window_cta_min_start(
                 self.variable_window_cta_starts,
@@ -1285,6 +1304,7 @@ class GmemQKVResource(MemoryResource):
             seqlen_k,
             kv_tile_start,
             kv_request_begin,
+            kv_page_idx_lb,
             kv_page_idx_ub,
         )
 
@@ -2028,6 +2048,7 @@ class SmemKVResource(MemoryResource):
         seqlen_k: Int32,
         kv_tile_start: Int32,
         kv_request_begin: Int32,
+        kv_page_idx_lb: Int32,
         kv_page_idx_ub: Int32,
     ) -> None:
         """Issue TMA bulk-copy for one K or V tile."""
@@ -2093,6 +2114,14 @@ class SmemKVResource(MemoryResource):
                             )
                 for frag in cutlass.range_constexpr(pages_per_tile):
                     page_id = Int32(page_ids[frag])
+                    if cutlass.const_expr(self.cfg.kv_tile_start_window_size_left > 0):
+                        # Old pages may be recycled while their table IDs persist.
+                        # Zero-fill their K/V rather than multiplying masked NaNs.
+                        if (
+                            tile_idx * Int32(pages_per_tile) + Int32(frag)
+                            < kv_page_idx_lb
+                        ):
+                            page_id = Int32(-1)
                     for i in cutlass.range_constexpr(stage_iters):
                         d_offset = Int32(
                             head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
@@ -2166,6 +2195,7 @@ class SmemKVResource(MemoryResource):
         seqlen_k: Int32,
         kv_tile_start: Int32,
         kv_request_begin: Int32,
+        kv_page_idx_lb: Int32,
         kv_page_idx_ub: Int32,
     ) -> None:
         """TMA load K tile from GMEM to SMEM."""
@@ -2180,6 +2210,7 @@ class SmemKVResource(MemoryResource):
             seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
             kv_request_begin=kv_request_begin,
+            kv_page_idx_lb=kv_page_idx_lb,
             kv_page_idx_ub=kv_page_idx_ub,
         )
 
@@ -2197,6 +2228,7 @@ class SmemKVResource(MemoryResource):
         seqlen_k: Int32,
         kv_tile_start: Int32,
         kv_request_begin: Int32,
+        kv_page_idx_lb: Int32,
         kv_page_idx_ub: Int32,
     ) -> None:
         """TMA load one K head-dim stage for split D scheduling."""
@@ -2212,6 +2244,7 @@ class SmemKVResource(MemoryResource):
             seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
             kv_request_begin=kv_request_begin,
+            kv_page_idx_lb=kv_page_idx_lb,
             kv_page_idx_ub=kv_page_idx_ub,
         )
 
@@ -2229,6 +2262,7 @@ class SmemKVResource(MemoryResource):
         seqlen_k: Int32,
         kv_tile_start: Int32,
         kv_request_begin: Int32,
+        kv_page_idx_lb: Int32,
         kv_page_idx_ub: Int32,
     ) -> None:
         """TMA load V tile from GMEM to SMEM."""
@@ -2244,6 +2278,7 @@ class SmemKVResource(MemoryResource):
             seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
             kv_request_begin=kv_request_begin,
+            kv_page_idx_lb=kv_page_idx_lb,
             kv_page_idx_ub=kv_page_idx_ub,
         )
 
@@ -2262,6 +2297,7 @@ class SmemKVResource(MemoryResource):
         seqlen_k: Int32,
         kv_tile_start: Int32,
         kv_request_begin: Int32,
+        kv_page_idx_lb: Int32,
         kv_page_idx_ub: Int32,
     ) -> None:
         """TMA load one current or previous V head-dim stage."""
@@ -2277,6 +2313,7 @@ class SmemKVResource(MemoryResource):
             seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
             kv_request_begin=kv_request_begin,
+            kv_page_idx_lb=kv_page_idx_lb,
             kv_page_idx_ub=kv_page_idx_ub,
         )
 
@@ -2295,6 +2332,7 @@ class SmemKVResource(MemoryResource):
         seqlen_k: Int32,
         kv_tile_start: Int32,
         kv_request_begin: Int32,
+        kv_page_idx_lb: Int32,
         kv_page_idx_ub: Int32,
     ) -> None:
         """Load one V head-dimension stage using register-cached page IDs."""
@@ -2311,6 +2349,7 @@ class SmemKVResource(MemoryResource):
             seqlen_k=seqlen_k,
             kv_tile_start=kv_tile_start,
             kv_request_begin=kv_request_begin,
+            kv_page_idx_lb=kv_page_idx_lb,
             kv_page_idx_ub=kv_page_idx_ub,
         )
 

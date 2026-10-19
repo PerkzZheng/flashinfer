@@ -221,7 +221,10 @@ be no greater than the corresponding K/V length.
 
 For request `b`, bottom-right causal row `i` can see through
 `seq_len_k[b] - seq_len_q[b] + i`. A causal left window further retains the
-current key and at most `window_left` preceding keys. `bmm1_scale` defaults to
+current key and at most `window_left` preceding keys. Pages wholly before the
+earliest visible key in a query group are not loaded, so recycled storage outside
+the window cannot introduce NaNs into PV. The first partially visible page is
+retained. `bmm1_scale` defaults to
 `1 / sqrt(D)` and `bmm2_scale` defaults to 1; supplied scales must be finite,
 positive Python scalars representable as positive `float32` values.
 

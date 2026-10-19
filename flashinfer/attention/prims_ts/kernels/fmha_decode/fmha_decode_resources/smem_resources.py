@@ -65,6 +65,7 @@ from ...placeholder_helpers import (
 from .helpers_common import (
     _TASK_CACHE_KV_PAGE_IDX_UB,
     _TASK_CACHE_KV_RAW_TILE_BASE,
+    _TASK_CACHE_KV_WINDOW_START,
     _TASK_CACHE_SEQ_LEN_KV,
     Constexpr,
     DecodeGenResourceBase,
@@ -2145,6 +2146,11 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                 self.num_heads_kv
             ) + cutlass.Int64(logical_h_idx)
         pages_per_tile = Int32(cfg.tile_size_kv // cfg.num_tokens_per_page)
+        page_idx_lb = Int32(0)
+        if cutlass.const_expr(cfg.use_sliding_window_causal):
+            page_idx_lb = Int32(
+                _decode_gen_task_cache(stage_info)[_TASK_CACHE_KV_WINDOW_START]
+            ) // Int32(cfg.num_tokens_per_page)
         if cutlass.const_expr(self.use_native_paged_kv):
             task_cache = _decode_gen_task_cache(stage_info)
             page_idx_ub = Int32(task_cache[_TASK_CACHE_KV_PAGE_IDX_UB])
@@ -2406,9 +2412,13 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                     tile_idx * pages_per_tile + lane_idx, page_idx_ub
                 )
                 smem_offset = stage_info.stage_idx * pages_per_tile + lane_idx
-                smem_page_offsets[smem_offset] = Int32(
-                    page_idx_kv[page_table_offset + logical_page_idx]
-                )
+                page_is_live = cutlass.Boolean(True)
+                if cutlass.const_expr(cfg.use_sliding_window_causal):
+                    page_is_live = logical_page_idx >= page_idx_lb
+                page_id = Int32(-1)
+                if page_is_live:
+                    page_id = Int32(page_idx_kv[page_table_offset + logical_page_idx])
+                smem_page_offsets[smem_offset] = page_id
         else:
             # Shared-offset schedules use one coalesced warp load for an
             # aligned 32-ID window; consumers select their tile within it.
@@ -2420,9 +2430,17 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
                     grouped_base_page_idx + lane_idx, page_idx_ub
                 )
                 grouped_smem_offset = stage_info.stage_idx * Int32(32) + lane_idx
-                smem_page_offsets[grouped_smem_offset] = Int32(
-                    page_idx_kv[page_table_offset + grouped_logical_page_idx]
-                )
+                # Evicted pages can be reused under a different storage dtype.
+                # TensorMap zero-fill keeps masked NaNs out of the PV MMA.
+                page_is_live = cutlass.Boolean(True)
+                if cutlass.const_expr(cfg.use_sliding_window_causal):
+                    page_is_live = grouped_logical_page_idx >= page_idx_lb
+                page_id = Int32(-1)
+                if page_is_live:
+                    page_id = Int32(
+                        page_idx_kv[page_table_offset + grouped_logical_page_idx]
+                    )
+                smem_page_offsets[grouped_smem_offset] = page_id
 
     @producer_work
     @cute.jit

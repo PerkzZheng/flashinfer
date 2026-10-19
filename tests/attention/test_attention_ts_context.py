@@ -4566,6 +4566,7 @@ def _check_paged_head_paired_window(
     k_length=129,
     window_left=63,
     output_dtype=torch.bfloat16,
+    poison_evicted_pages=False,
 ):
     case = _make_paged_context_case(
         q_lengths=(64,),
@@ -4598,6 +4599,11 @@ def _check_paged_head_paired_window(
         case = replace(case, k_cache=view[..., :dim], v_cache=view[..., dim:])
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
+    if poison_evicted_pages:
+        first_key = max(0, k_length - case.reference.q_lengths[0] - window_left)
+        for page in metadata.block_tables[0, : first_key // case.page_size].tolist():
+            case.k_cache[page].fill_(float("nan"))
+            case.v_cache[page].fill_(float("nan"))
     assert wrapper._plan_state is not None
     assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
     output = _run_paged_wrapper(wrapper, case, metadata)
@@ -4618,6 +4624,21 @@ def _check_paged_head_paired_window(
     torch.cuda.synchronize()
     torch.testing.assert_close(
         output.float(), torch.full_like(output.float(), 8), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("head_dim,dtype", ((128, torch.bfloat16), (192, _FP8)))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_window_ignores_evicted_pages(head_dim, dtype):
+    """Direct and staged page loads ignore NaNs in wholly retired pages."""
+    _check_paged_head_paired_window(
+        head_dim,
+        True,
+        dtype,
+        k_length=2048,
+        window_left=511,
+        poison_evicted_pages=True,
     )
 
 

@@ -286,6 +286,7 @@ def create_load_task(
                         seqlen_k,
                         kv_tile_start,
                         kv_request_begin,
+                        kv_page_idx_lb,
                         kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                     sq.acquire()
@@ -313,6 +314,7 @@ def create_load_task(
                                 seqlen_k=seqlen_k,
                                 kv_tile_start=kv_tile_start,
                                 kv_request_begin=kv_request_begin,
+                                kv_page_idx_lb=kv_page_idx_lb,
                                 kv_page_idx_ub=kv_page_idx_ub,
                             )
                             sk.commit()
@@ -347,6 +349,7 @@ def create_load_task(
                                     seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
                                     kv_request_begin=kv_request_begin,
+                                    kv_page_idx_lb=kv_page_idx_lb,
                                     kv_page_idx_ub=kv_page_idx_ub,
                                 )
                             else:
@@ -359,6 +362,7 @@ def create_load_task(
                                     seqlen_k=seqlen_k,
                                     kv_tile_start=kv_tile_start,
                                     kv_request_begin=kv_request_begin,
+                                    kv_page_idx_lb=kv_page_idx_lb,
                                     kv_page_idx_ub=kv_page_idx_ub,
                                 )
                             sv.commit()
@@ -491,6 +495,7 @@ def create_load_task(
                     seqlen_k,
                     kv_tile_start,
                     kv_request_begin,
+                    kv_page_idx_lb,
                     kv_page_idx_ub,
                 ) = coords
                 sq.acquire()
@@ -518,6 +523,7 @@ def create_load_task(
                         seqlen_k=seqlen_k,
                         kv_tile_start=kv_tile_start,
                         kv_request_begin=kv_request_begin,
+                        kv_page_idx_lb=kv_page_idx_lb,
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sk.commit()
@@ -539,6 +545,7 @@ def create_load_task(
                             seqlen_k=seqlen_k,
                             kv_tile_start=kv_tile_start,
                             kv_request_begin=kv_request_begin,
+                            kv_page_idx_lb=kv_page_idx_lb,
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sk.commit()
@@ -560,6 +567,7 @@ def create_load_task(
                             seqlen_k=seqlen_k,
                             kv_tile_start=kv_tile_start,
                             kv_request_begin=kv_request_begin,
+                            kv_page_idx_lb=kv_page_idx_lb,
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sv.commit()
@@ -581,6 +589,7 @@ def create_load_task(
                         seqlen_k=seqlen_k,
                         kv_tile_start=kv_tile_start,
                         kv_request_begin=kv_request_begin,
+                        kv_page_idx_lb=kv_page_idx_lb,
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sv.commit()
@@ -695,6 +704,7 @@ def create_load_task(
                         seqlen_k,
                         kv_tile_start,
                         kv_request_begin,
+                        kv_page_idx_lb,
                         kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                     # Load Q0 for the first Q tile in this work tile.
@@ -734,6 +744,7 @@ def create_load_task(
                             kv_tile_start=kv_tile_start,
                             seqlen_k=seqlen_k,
                             kv_request_begin=kv_request_begin,
+                            kv_page_idx_lb=kv_page_idx_lb,
                             kv_page_idx_ub=kv_page_idx_ub,
                         )
                         sk.commit()
@@ -749,6 +760,7 @@ def create_load_task(
                         kv_tile_start=kv_tile_start,
                         seqlen_k=seqlen_k,
                         kv_request_begin=kv_request_begin,
+                        kv_page_idx_lb=kv_page_idx_lb,
                         kv_page_idx_ub=kv_page_idx_ub,
                     )
                     sk.commit()
@@ -775,6 +787,7 @@ def create_load_task(
                     seqlen_k=seqlen_k,
                     kv_tile_start=kv_tile_start,
                     kv_request_begin=kv_request_begin,
+                    kv_page_idx_lb=kv_page_idx_lb,
                     kv_page_idx_ub=kv_page_idx_ub,
                 )
                 sv.commit()
@@ -926,6 +939,7 @@ def create_mma_task(
                         v_seqlen_k,
                         v_kv_tile_start,
                         _kv_request_begin,
+                        _kv_page_idx_lb,
                         _kv_page_idx_ub,
                     ) = gqkv.compute_coords()
 
@@ -1147,6 +1161,7 @@ def create_mma_task(
                         v_seqlen_k,
                         v_kv_tile_start,
                         _kv_request_begin,
+                        _kv_page_idx_lb,
                         _kv_page_idx_ub,
                     ) = gqkv.compute_coords()
                 if wq is not None:
@@ -1354,6 +1369,7 @@ def create_mma_task(
                     v_seqlen_k,
                     v_kv_tile_start,
                     _kv_request_begin,
+                    _kv_page_idx_lb,
                     _kv_page_idx_ub,
                 ) = gqkv.compute_coords()
             # HEAD: consume Q0, K0, Q1, and V0. TmemStatsDone starts empty, so

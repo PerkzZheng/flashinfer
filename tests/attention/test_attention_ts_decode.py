@@ -7256,6 +7256,7 @@ def _check_window_grouped_graph_live_metadata(
     window_left,
     qkv_dtype,
     kv_lengths=None,
+    poison_evicted_pages=False,
 ):
     output_dtype = (
         torch.float16 if qkv_dtype == _FP8 and head_dim != 192 else torch.bfloat16
@@ -7331,6 +7332,18 @@ def _check_window_grouped_graph_live_metadata(
     ).transpose(1, 2)
     cache[..., :head_dim].copy_(host.k_cache)
     cache[..., head_dim:].copy_(host.v_cache)
+
+    def poison_skipped_pages(table_cpu, live_lengths):
+        if not poison_evicted_pages:
+            return
+        cache[..., :head_dim].copy_(host.k_cache)
+        cache[..., head_dim:].copy_(host.v_cache)
+        for request, length in enumerate(live_lengths):
+            first_key = max(0, length - seq_len_q - window_left)
+            for page in table_cpu[request, : first_key // page_size].tolist():
+                cache[page].fill_(float("nan"))
+
+    poison_skipped_pages(host.block_tables, lengths)
     table = host.block_tables.cuda()
     seq_lens = torch.tensor(lengths, dtype=torch.int32, device="cuda")
     wrapper = BatchDecodePagedTSWrapper()
@@ -7380,6 +7393,7 @@ def _check_window_grouped_graph_live_metadata(
         indices.extend(ids.tolist())
         offsets.append(len(indices))
     table.copy_(new_table)
+    poison_skipped_pages(new_table, new_lengths)
     seq_lens.copy_(torch.tensor(new_lengths, dtype=torch.int32))
     expected = _decode_reference(
         host.q,
@@ -9395,4 +9409,22 @@ def test_attention_ts_decode_window_long_context(kv_len, dtype):
     """Read the actual long-cache tail, not just a large planning bound."""
     _check_window_grouped_graph_live_metadata(
         192, 4, 1, 4, 64, 511, dtype, kv_lengths=(kv_len,)
+    )
+
+
+@pytest.mark.parametrize("dtype", (torch.bfloat16, _FP8), ids=("bf16", "fp8"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_window_ignores_evicted_pages(dtype):
+    """Recycled pages before the live window must not contaminate PV with NaNs."""
+    _check_window_grouped_graph_live_metadata(
+        192,
+        16,
+        1,
+        4,
+        32,
+        511,
+        dtype,
+        kv_lengths=(1024, 1059),
+        poison_evicted_pages=True,
     )
