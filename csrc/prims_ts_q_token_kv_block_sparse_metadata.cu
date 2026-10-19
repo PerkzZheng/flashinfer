@@ -242,7 +242,7 @@ void Launch(TensorView block_indices, TensorView block_table, TensorView token_t
             TensorView q_token_kv_block_sparse_page_indices,
             TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens,
             const QTokenKvBlockSparseMetadataGeometry& geometry, int32_t group_size,
-            bool release_pdl, int32_t locator_page_stride) {
+            bool release_pdl, int32_t locator_page_stride, bool count_current_block_in_topk) {
   const int topk_axis = block_indices.ndim() - 1;
   QTokenKvBlockSparseTouchedMetadataParams<PositionType> params{
       static_cast<const int32_t*>(block_indices.data_ptr()),
@@ -277,7 +277,8 @@ void Launch(TensorView block_indices, TensorView block_table, TensorView token_t
           static_cast<uint32_t>(geometry.storage_page_size / geometry.fragment_size)),
       flashinfer::uint_fastdiv(static_cast<uint32_t>(geometry.pattern_heads)),
       locator_page_stride,
-      release_pdl};
+      release_pdl,
+      count_current_block_in_topk};
 
   ffi::CUDADeviceGuard device_guard(block_indices.device().device_id);
   const cudaStream_t stream = get_stream(block_indices.device());
@@ -295,7 +296,8 @@ void Run(TensorView block_indices, TensorView block_table, TensorView token_to_r
          TensorView q_token_kv_block_sparse_page_indices,
          TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens,
          int64_t group_size, int64_t storage_page_size, int64_t sparse_block_size,
-         int64_t max_seq_len_kv, bool release_pdl, int64_t locator_head_multiplier) {
+         int64_t max_seq_len_kv, bool release_pdl, int64_t locator_head_multiplier,
+         bool count_current_block_in_topk) {
   const QTokenKvBlockSparseMetadataGeometry geometry = ValidateInputs<PackedQuery, QueryMajor>(
       block_indices, block_table, token_to_request, query_positions, qo_indptr,
       q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens,
@@ -310,12 +312,14 @@ void Run(TensorView block_indices, TensorView block_table, TensorView token_to_r
     Launch<int32_t, PackedQuery, QueryMajor>(
         block_indices, block_table, token_to_request, query_positions, qo_indptr,
         q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens,
-        geometry, static_cast<int32_t>(group_size), release_pdl, locator_page_stride);
+        geometry, static_cast<int32_t>(group_size), release_pdl, locator_page_stride,
+        count_current_block_in_topk);
   } else {
     Launch<int64_t, PackedQuery, QueryMajor>(
         block_indices, block_table, token_to_request, query_positions, qo_indptr,
         q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships, seq_lens,
-        geometry, static_cast<int32_t>(group_size), release_pdl, locator_page_stride);
+        geometry, static_cast<int32_t>(group_size), release_pdl, locator_page_stride,
+        count_current_block_in_topk);
   }
 }
 
@@ -326,11 +330,11 @@ void PrimsTSQTokenKvBlockSparseMetadataRunFixed(
     TensorView query_positions, TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
     int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
-    int64_t locator_head_multiplier) {
+    int64_t locator_head_multiplier, bool count_current_block_in_topk) {
   Run<false>(block_indices, block_table, token_to_request, query_positions, nullptr,
              q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships,
              seq_lens, group_size, storage_page_size, sparse_block_size, max_seq_len_kv,
-             release_pdl, locator_head_multiplier);
+             release_pdl, locator_head_multiplier, count_current_block_in_topk);
 }
 
 void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
@@ -339,11 +343,11 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPacked(
     TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
     int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
-    int64_t locator_head_multiplier) {
+    int64_t locator_head_multiplier, bool count_current_block_in_topk) {
   Run<true>(block_indices, block_table, token_to_request, query_positions, &qo_indptr,
             q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships,
             seq_lens, group_size, storage_page_size, sparse_block_size, max_seq_len_kv, release_pdl,
-            locator_head_multiplier);
+            locator_head_multiplier, count_current_block_in_topk);
 }
 
 // Prepared-plan entries; standalone metadata APIs retain byte membership.
@@ -352,11 +356,11 @@ void PrimsTSQTokenKvBlockSparseMetadataRunFixedQueryMajor(
     TensorView query_positions, TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
     int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
-    int64_t locator_head_multiplier) {
+    int64_t locator_head_multiplier, bool count_current_block_in_topk) {
   Run<false, true>(block_indices, block_table, token_to_request, query_positions, nullptr,
                    q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships,
                    seq_lens, group_size, storage_page_size, sparse_block_size, max_seq_len_kv,
-                   release_pdl, locator_head_multiplier);
+                   release_pdl, locator_head_multiplier, count_current_block_in_topk);
 }
 
 void PrimsTSQTokenKvBlockSparseMetadataRunPackedQueryMajor(
@@ -365,9 +369,9 @@ void PrimsTSQTokenKvBlockSparseMetadataRunPackedQueryMajor(
     TensorView q_token_kv_block_sparse_page_indices,
     TensorView q_token_kv_block_sparse_page_memberships, TensorView seq_lens, int64_t group_size,
     int64_t storage_page_size, int64_t sparse_block_size, int64_t max_seq_len_kv, bool release_pdl,
-    int64_t locator_head_multiplier) {
+    int64_t locator_head_multiplier, bool count_current_block_in_topk) {
   Run<true, true>(block_indices, block_table, token_to_request, query_positions, &qo_indptr,
                   q_token_kv_block_sparse_page_indices, q_token_kv_block_sparse_page_memberships,
                   seq_lens, group_size, storage_page_size, sparse_block_size, max_seq_len_kv,
-                  release_pdl, locator_head_multiplier);
+                  release_pdl, locator_head_multiplier, count_current_block_in_topk);
 }

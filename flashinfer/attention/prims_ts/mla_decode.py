@@ -456,8 +456,6 @@ def _validate_mla_run_metadata(
         q_lengths = (max_seq_len_q,) * batch_size
 
     seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
-    if any(seq_len <= 0 for seq_len in seq_lens_host):
-        raise ValueError("every runtime request must contain at least one KV token")
     runtime_max_kv_len = max(seq_lens_host)
     if runtime_max_kv_len > max_kv_len:
         raise ValueError(
@@ -468,7 +466,7 @@ def _validate_mla_run_metadata(
     for request_idx, (row, seq_len) in enumerate(
         zip(block_table_rows, seq_lens_host, strict=True)
     ):
-        required_pages = _ceil_div(seq_len, page_size)
+        required_pages = _ceil_div(max(seq_len, 0), page_size)
         if any(
             int(page_id) < 0 or int(page_id) >= runtime.num_physical_pages
             for page_id in row[:required_pages]
@@ -482,7 +480,7 @@ def _validate_mla_run_metadata(
         for request_idx, (q_len, kv_len) in enumerate(
             zip(q_lengths, seq_lens_host, strict=True)
         ):
-            if q_len > kv_len:
+            if kv_len > 0 and q_len > kv_len:
                 raise ValueError(
                     "causal MLA decode requires every per-request Q length "
                     "to be no greater than its K/V length; request "
@@ -1757,7 +1755,8 @@ def batch_mla_decode_with_paged_kv_cache(
     ``max_seq_len_q``.
     Warm this exact topology outside capture first. Retain stable tensor storage
     and mutate metadata only between completed launches/replays. All live K/V
-    lengths must be positive and within the static bound, active page IDs must
+    positive lengths must be within the static bound; nonpositive lengths mark
+    inactive requests whose output is untouched. Active page IDs must
     index the cache, and causal per-request Q lengths must not exceed K/V lengths.
     Packed offsets must start at zero, end at the query token count, and have
     nonnegative deltas within the Q bound. Scratch/output must not alias

@@ -95,8 +95,7 @@ only. FP32 LSE is internal workspace and is not exposed as an output.
   dimensions.
 - Dense page table: inner-contiguous, non-overlapping CUDA
   `int32[B, max_num_pages]` `block_tables`. Padding between rows is accepted.
-- Runtime lengths: contiguous CUDA `int32[B]` `seq_lens`. Every length is
-  positive and no larger than the static K/V bound.
+- Runtime lengths: contiguous CUDA `int32[B]` `seq_lens`. Positive lengths must not exceed the static K/V bound; nonpositive lengths mark inactive requests.
 
 Internally, the query-token and query-head axes form one affine row space,
 `flat_row = query_idx * H + head_idx`. The 1-CTA profiles partition this space
@@ -126,10 +125,9 @@ no greater than `max_seq_len_q`.
 
 The wrapper receives `block_tables`, `seq_lens`, and packed `qo_indptr` on
 every run. Their storage and values may change between completed launches
-without replanning while page IDs remain valid, K/V lengths stay positive and
-within the static bound, packed-Q deltas stay nonnegative and within their bound,
+without replanning while active page IDs remain valid, positive K/V lengths stay within the static bound, packed-Q deltas stay nonnegative and within their bound,
 and the final packed offset equals the current query/output extent. Causal
-metadata must also preserve `q_len[b] <= seq_lens[b]` for every request.
+metadata must also preserve `q_len[b] <= seq_lens[b]` for every active request.
 Individual packed requests may be empty. An all-empty packed launch requires a
 positive `max_seq_len_q` and returns an empty output without GPU dispatch.
 
@@ -312,3 +310,5 @@ graphs:
 pytest -q tests/attention/test_attention_ts_mla_decode.py
 pytest -q tests/trace/test_fi_trace_template_consistency.py
 ```
+
+Both the 1CTA and 2CTA families treat nonpositive runtime K/V lengths as inactive requests. They skip Q/K/V and partial-output work, preserve caller-owned O/LSE, and retain queue, cluster, TMEM-lifecycle and PDL progress. Separate reducers do not consume stale scratch for these requests. Newly allocated inactive output is unspecified. Positive plan capacity is still required.

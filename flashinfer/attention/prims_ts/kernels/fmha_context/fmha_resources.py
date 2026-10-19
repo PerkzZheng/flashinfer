@@ -502,6 +502,18 @@ class FmhaConfig:
         return self.qk_mma_tiler[2]
 
     @property
+    def smem_v_head_dim(self) -> int:
+        """Physical V extent in complete 128-byte TMA fragments."""
+        fragment = min(1024 // self.v_dtype.width, self.pv_mma_tiler[1])
+        return (self.pv_mma_tiler[1] + fragment - 1) // fragment * fragment
+
+    @property
+    def smem_o_head_dim(self) -> int:
+        """Physical O extent; the final TMA store masks channels beyond D."""
+        fragment = min(1024 // self.o_dtype.width, self.epi_tile[1])
+        return (self.epi_tile[1] + fragment - 1) // fragment * fragment
+
+    @property
     def single_qkv_instance(self) -> bool:
         """Return whether one work tile carries a single Q/KV/O instance."""
         return self.num_qkv_instances == 1
@@ -1356,12 +1368,12 @@ def _qk_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
 
 def _pv_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
     """Return the byte width of one P/V tile inner dimension."""
-    return cfg.pv_n_per_cta * cfg.v_dtype.width // 8
+    return cfg.smem_v_head_dim // cfg.cta_group_size * cfg.v_dtype.width // 8
 
 
 def _o_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
     """Return the byte width of one O tile inner dimension."""
-    return cfg.qk_mma_tiler[2] * cfg.o_dtype.width // 8
+    return cfg.smem_o_head_dim * cfg.o_dtype.width // 8
 
 
 def _smem_layout_for_inner_bytes(inner_dim_size: int) -> int:
@@ -1405,7 +1417,7 @@ def _pv_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
             else cfg.tma_copy_v_iters
         )
         leading_byte_offset = cfg.tma_copy_v_bytes // tma_copy_v_iters
-    stride_byte_offset = cfg.pv_mma_tiler[1] * cfg.v_dtype.width // cfg.tma_copy_v_iters
+    stride_byte_offset = cfg.tma_copy_v_granu_inner * cfg.v_dtype.width
     return leading_byte_offset, stride_byte_offset
 
 
@@ -4920,15 +4932,19 @@ class TmemOResource(MemoryResource):
         self.tmem_o1_offset = tmem_o1_offset
         self.tmem_vec0_resource = tmem_vec0_resource
         self.tmem_vec1_resource = tmem_vec1_resource
-        self._alloc_o0 = TmemAllocation("tmem_o0", 128)
-        self._alloc_o1 = TmemAllocation("tmem_o1", 128)
+        self._alloc_o0 = TmemAllocation("tmem_o0", cfg.epi_tile[1])
+        self._alloc_o1 = TmemAllocation("tmem_o1", cfg.epi_tile[1])
         self.tmem_addr_cached = Int32(0)
         self.tmem_ptr_raw_cached = _placeholder_tmem_ptr()
         self.tmem_o_addr_base_cached = Int32(0)
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Return the TMEM allocations for the double-buffered O accumulators."""
-        return [self._alloc_o0, self._alloc_o1]
+        return (
+            [self._alloc_o0]
+            if self.cfg.single_qkv_instance
+            else [self._alloc_o0, self._alloc_o1]
+        )
 
     @property
     def loop_offset_sensitive(self) -> bool:
@@ -5074,8 +5090,12 @@ class TmemOResource(MemoryResource):
                 a_dtype=ab_format,
                 b_dtype=ab_format,
                 n_dim=(
-                    self.cfg.head_dim_per_stage_kv
-                    if self.cfg.single_qkv_instance and self.cfg.pv_mma_tiler[1] == 256
+                    min(
+                        self.cfg.head_dim_per_stage_kv,
+                        self.cfg.pv_mma_tiler[1]
+                        - head_dim_stage_idx * self.cfg.head_dim_per_stage_kv,
+                    )
+                    if self.cfg.stage_kv_by_head_dim
                     else self.cfg.pv_mma_tiler[1]
                 ),
                 m_dim=self.cfg.pv_mma_tiler[0] * self.cfg.cta_group_size,
@@ -5095,11 +5115,9 @@ class TmemOResource(MemoryResource):
 
             pv_n_dim = self.cfg.pv_mma_tiler[1]
             num_head_dim_stages = 1
-            if cutlass.const_expr(
-                self.cfg.single_qkv_instance and self.cfg.pv_mma_tiler[1] == 256
-            ):
+            if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
                 pv_n_dim = self.cfg.head_dim_per_stage_kv
-                num_head_dim_stages = self.cfg.pv_mma_tiler[1] // pv_n_dim
+                num_head_dim_stages = self.cfg.num_head_dim_stages_v
             head_dim_stage_start = 0
             num_head_dim_stages_to_issue = num_head_dim_stages
             if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
@@ -5570,7 +5588,11 @@ class SmemOResource(MemoryResource):
 
         tmem_shape = "32x32b"
         tmem_x = 16
-        num_iters = o_head_dim // tmem_x
+        # Do not load unallocated TMEM columns in a partial final O band.
+        valid_head_dim = min(
+            o_head_dim, self.cfg.epi_tile[1] - head_dim_stage_idx * o_head_dim
+        )
+        num_iters = valid_head_dim // tmem_x
 
         smem_o_swizzle = _smem_o_swizzle(self.cfg)
 
