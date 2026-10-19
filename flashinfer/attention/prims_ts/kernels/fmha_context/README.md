@@ -371,7 +371,7 @@ assert out.shape == q.shape
 For a `torch.bfloat16` Q/K with a `torch.float8_e4m3fn` V, pass
 `v_dtype=v.dtype` (or `v_dtype=v_cache.dtype` for paged) to `plan()` and
 supply `output_scale=v_descale`; `sm_scale` is unchanged because Q and K stay
-BF16. Both wrappers accept this combination for head dimensions 128 and 256.
+BF16. Both wrappers accept this combination for head dimensions 128, 192, and 256.
 
 For CUDA graph capture, call `plan()` and perform one default-validating
 `run()` first. Capture subsequent calls with `validate=False`, keep every
@@ -412,9 +412,10 @@ runtime tensors alive until every graph using that plan is destroyed.
 
 ## Validation
 
-The public suite covers fixed, ragged, and paged layouts; MHA/GQA; both head
-dimensions; `torch.float16`, `torch.bfloat16`, and `torch.float8_e4m3fn`
-inputs; BF16 Q/K with FP8 V for contiguous and paged storage at both head
+The public suite covers fixed, ragged, and paged layouts; MHA/GQA; head
+dimensions 128, 192, and 256; `torch.float16`, `torch.bfloat16`, and
+`torch.float8_e4m3fn` inputs; BF16 Q/K with FP8 V for contiguous and paged
+storage at all three head
 dimensions; dense, causal, and left-window masks; nonidentity pages; scheduler
 safety; CUDA graphs; and reference accuracy. Explicit input-to-output dtype
 conversion coverage spans all nine pairings of FP16, BF16, and FP8 input and

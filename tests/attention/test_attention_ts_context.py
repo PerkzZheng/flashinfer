@@ -3991,7 +3991,7 @@ def test_attention_ts_context_packed_dense_k_bounds_exclude_peer_requests():
     )
 
     wrapper = BatchPrefillTSWrapper()
-    _plan_wrapper(wrapper, case)
+    _plan_wrapper(wrapper, replace(case, k_lengths=(65, 65 + 257)))
     output = torch.full_like(actual, 8)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -5446,7 +5446,8 @@ def test_attention_ts_context_mla_prefill(
         device=q.device,
         batch_size=batch_size,
         max_seq_len_q=max(q_lens) + replay_shift,
-        max_kv_len=max(k_lens) + int(replay_shift > 0),
+        # Packed replays can reassign the first request's K rows to its peer.
+        max_kv_len=sum(k_lens) if packed else max(k_lens),
         num_qo_heads=hq,
         num_kv_heads=hkv,
         head_dim=192,

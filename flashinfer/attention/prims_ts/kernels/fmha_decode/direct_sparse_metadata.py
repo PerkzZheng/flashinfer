@@ -137,6 +137,7 @@ class DirectSparseMetadataView:
 
     @cute.jit
     def selected_block_bound(self, visible):
+        """Return the exclusive top-k block bound under the current-block policy."""
         eligible = visible
         if cutlass.const_expr(not self.count_current_block_in_topk):
             eligible = cute.math.max(visible - Int32(1), Int32(0))

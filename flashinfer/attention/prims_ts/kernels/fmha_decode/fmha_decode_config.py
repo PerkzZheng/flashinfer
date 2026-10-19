@@ -3016,10 +3016,16 @@ class FmhaDecodeConfig:
 
         if profile in _D192_GROUPED_KEEPS_PROFILES:
             # Fixed-Q staged resources support dense/paged K/V, CLC and
-            # GMEM splits. The common validators still enforce reduction
-            # geometry and reject cluster-SMEM Keeps and windowed splits.
+            # non-windowed GMEM splits. Common validators enforce the
+            # remaining reduction geometry and exclude cluster-SMEM Keeps.
             return (
-                (direct or (self.use_split_kv and self.splits_kv > 1))
+                (
+                    direct
+                    or (
+                        self.has_valid_split_kv_fanout
+                        and not self.use_sliding_window_causal
+                    )
+                )
                 and not self.uses_q_token_kv_block_sparse_page_route
                 and not self.use_variable_seqlens_q
                 and not self.use_attention_sinks

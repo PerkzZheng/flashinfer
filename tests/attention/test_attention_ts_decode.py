@@ -5267,36 +5267,6 @@ def test_attention_ts_decode_plan_owned_validation_uses_host_seq_lens() -> None:
     )
 
 
-@pytest.mark.parametrize("inactive_length", (0, -1))
-@_REQUIRES_PRIMTS_GPU
-def test_attention_ts_decode_causal_plan_owned_inactive_requests(
-    inactive_length: int,
-) -> None:
-    """Inactive plan-owned lengths bypass causal Q/K and page-table checks."""
-
-    q = torch.zeros((2, 4, 8, 192), dtype=torch.bfloat16, device="cuda")
-    kv = torch.zeros((1, 2, 1, 32, 192), dtype=q.dtype, device=q.device)
-    table = torch.tensor(((-1,), (0,)), dtype=torch.int32, device=q.device)
-    output = torch.full_like(q, 8)
-    wrapper = BatchDecodePagedTSWrapper()
-    wrapper.plan(
-        q.device,
-        2,
-        8,
-        1,
-        192,
-        32,
-        32,
-        max_seq_len_q=4,
-        q_data_type=q.dtype,
-        mask_type="causal",
-        seq_lens=[inactive_length, 32],
-    )
-    wrapper.run(q, kv, None, table, out=output)
-    torch.testing.assert_close(output[0], torch.full_like(output[0], 8))
-    torch.testing.assert_close(output[1], torch.zeros_like(output[1]))
-
-
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_runtime_owned_seq_lens_remain_dynamic_in_graph() -> None:
     """Run-owned lengths may change values and identity across graph replays."""
@@ -5372,10 +5342,24 @@ def test_attention_ts_decode_runtime_owned_seq_lens_remain_dynamic_in_graph() ->
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(graph_out, torch.full_like(graph_out, 8), rtol=0, atol=0)
-    frozen = BatchDecodePagedTSWrapper()
-    frozen.plan(case.q.device, 1, 8, 1, 64, 16, 128, seq_lens=[-1])
-    _run_case(frozen, case, out=graph_out)
-    torch.testing.assert_close(graph_out, torch.full_like(graph_out, 8), rtol=0, atol=0)
+    # Plan-owned inactive lengths must also bypass the causal Q > KV check.
+    for inactive_length in (0, -1):
+        frozen = BatchDecodePagedTSWrapper()
+        frozen.plan(
+            case.q.device,
+            1,
+            8,
+            1,
+            64,
+            16,
+            128,
+            mask_type="causal",
+            seq_lens=[inactive_length],
+        )
+        _run_case(frozen, case, out=graph_out)
+        torch.testing.assert_close(
+            graph_out, torch.full_like(graph_out, 8), rtol=0, atol=0
+        )
 
 
 @pytest.mark.parametrize(
@@ -5721,6 +5705,59 @@ def test_attention_ts_decode_config_accepts_arbitrary_positive_q_length(
     )
     assert cfg.max_seq_len_q == seq_len_q
     assert cfg.num_q_ctas == seq_len_q
+
+
+@pytest.mark.parametrize(
+    ("windowed", "splits", "capacity", "supported"),
+    (
+        pytest.param(False, 1, 1, True, id="direct"),
+        pytest.param(True, 1, 1, True, id="windowed-direct"),
+        pytest.param(False, 2, 2, True, id="split"),
+        pytest.param(True, 2, 2, False, id="windowed-split"),
+        pytest.param(False, 2, 1, False, id="insufficient-split-capacity"),
+    ),
+)
+def test_attention_ts_decode_d192_keeps_split_contract(
+    windowed, splits, capacity, supported
+):
+    """Validate explicit D192 launch modes before compiling a kernel."""
+    options = dict(
+        headdim=192,
+        args={
+            "use_keeps_mma_ab": True,
+            "groups_tokens_heads_q": True,
+            "tile_size_q": 64,
+            "tile_size_kv": 128,
+            "head_dim_per_stage_kv": 128,
+            "num_insts_kv": 1,
+            "o_stages": 1,
+            "use_split_kv": splits > 1,
+            "splits_kv": splits,
+            "max_splits_kv": capacity,
+        },
+        seq_len_q=4,
+        seq_len_kv=1024,
+        batch_size=2,
+        num_heads_q=8,
+        num_heads_kv=1,
+        q_dtype=BFloat16,
+        k_dtype=BFloat16,
+        v_dtype=BFloat16,
+        o_dtype=BFloat16,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=32,
+        mask_type="causal",
+        sliding_window_causal=windowed,
+        attention_window_size=128 if windowed else 0,
+        split_kv_mode="disabled",
+        auto_tuner=False,
+    )
+    if supported:
+        cfg = make_decode_config(**options)
+        assert cfg.use_split_kv is (splits > 1)
+    else:
+        with pytest.raises(ValueError, match="grouped KeepsMmaAb"):
+            make_decode_config(**options)
 
 
 @pytest.mark.parametrize(

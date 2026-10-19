@@ -1203,6 +1203,12 @@ def get_q_token_kv_block_sparse_workspace_size(
         False uses independent per-KV-head patterns. Match this setting in
         workspace sizing and planning; it does not change the attention grid.
 
+    count_current_block_in_topk : bool
+        True (default) counts a completed current block in the selection budget.
+        False excludes it from selected IDs and always appends its visible tokens.
+        Match this setting in workspace sizing and planning; False can require
+        a larger workspace.
+
     Returns
     -------
     int
@@ -1241,6 +1247,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
     share_pattern_across_kv_heads: bool = True,
     count_current_block_in_topk: bool = True,
 ) -> _PrimsTSQTokenKvBlockSparseWorkspaceLayout:
+    """Infer query geometry and size scratch for the selected sparse-block policy."""
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     if not isinstance(query, torch.Tensor):
         raise TypeError("query must be a torch.Tensor")
@@ -2204,6 +2211,7 @@ def _validate_inputs(
     share_pattern_across_kv_heads: bool = True,
     count_current_block_in_topk: bool = True,
 ) -> None:
+    """Validate tensor structure without copying live metadata values to the host."""
     sparse_block_size = _validate_sparse_block_size(sparse_block_size)
     for name, tensor in (
         ("block_indices", block_indices),
