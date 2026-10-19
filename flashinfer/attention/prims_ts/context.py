@@ -2591,11 +2591,11 @@ class BatchPrefillTSWrapper:
         scale_softmax_log2 = _validate_scale(
             sm_scale * math.log2(math.e), "sm_scale * log2(e)"
         )
-        scale_tensor = torch.tensor(
-            [scale_softmax_log2], dtype=torch.float32, device=geometry.device
+        scale_tensor = torch.full(
+            (1,), scale_softmax_log2, dtype=torch.float32, device=geometry.device
         )
-        output_scale_tensor = torch.tensor(
-            [output_scale], dtype=torch.float32, device=geometry.device
+        output_scale_tensor = torch.full(
+            (1,), output_scale, dtype=torch.float32, device=geometry.device
         )
         empty_i32 = torch.empty(1, dtype=torch.int32, device=geometry.device)
         if geometry.mask_type == "variable_window":
@@ -2979,11 +2979,11 @@ class BatchPrefillPagedTSWrapper:
         scale_softmax_log2 = _validate_scale(
             sm_scale * math.log2(math.e), "sm_scale * log2(e)"
         )
-        scale_tensor = torch.tensor(
-            [scale_softmax_log2], dtype=torch.float32, device=geometry.device
+        scale_tensor = torch.full(
+            (1,), scale_softmax_log2, dtype=torch.float32, device=geometry.device
         )
-        output_scale_tensor = torch.tensor(
-            [output_scale], dtype=torch.float32, device=geometry.device
+        output_scale_tensor = torch.full(
+            (1,), output_scale, dtype=torch.float32, device=geometry.device
         )
 
         # Keep the two plan-owned scalar allocations ahead of CUTLASS JIT,
