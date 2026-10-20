@@ -19,6 +19,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64
 from cutlass.experimental import primitives as prims
 
+from ..helpers.math import final_lse
 from .config import (
     REDUCTION_THREADS_PER_ROW,
     REDUCTION_VALUES_PER_THREAD,
@@ -54,6 +55,7 @@ def run_reduction_kernel(
     cfg,
     max_splits: cutlass.Constexpr[int],
     rows_per_cta: cutlass.Constexpr[int],
+    split_divisor=None,
 ):
     """Combine consecutive logical split rows in one reference-reducer CTA.
 
@@ -173,6 +175,7 @@ def run_reduction_kernel(
         row_k_tile_total,
         tile_k_tile_total,
         split_kv_cap,
+        split_divisor=split_divisor,
     )
 
     smem_lse_scale = cutlass.Array(
@@ -216,7 +219,10 @@ def run_reduction_kernel(
             else -kernel.lse_dtype.inf
         )
         if lane_idx == 0 and query_is_valid:
-            (lse.iterator.raw_ptr() + Int64(public_flat_query_row)).store(global_lse)
+            if cutlass.const_expr(lse is not None):
+                (lse.iterator.raw_ptr() + Int64(public_flat_query_row)).store(
+                    final_lse(global_lse, cfg.lse_base_on_e)
+                )
         for i in cutlass.range_constexpr(lse_per_thread):
             split_kv_idx = lane_idx + i * cfg.threads_per_warp
             if cute.elem_less(split_kv_idx, local_split_kv):
@@ -250,13 +256,15 @@ def run_reduction_kernel(
             Int64(batch_idx)
             * Int64(cute.size(acc_output.shape[3]))
             * Int64(physical_tile_rows)
-            * Int64(split_kv)
+            * Int64(kernel.reduction_split_capacity)
             * Int64(cfg.latent_dim)
             + Int64(query_tile_idx)
             * Int64(physical_tile_rows)
-            * Int64(split_kv)
+            * Int64(kernel.reduction_split_capacity)
             * Int64(cfg.latent_dim)
-            + Int64(row_in_tile) * Int64(split_kv) * Int64(cfg.latent_dim)
+            + Int64(row_in_tile)
+            * Int64(kernel.reduction_split_capacity)
+            * Int64(cfg.latent_dim)
             + Int64(element_idx)
         )
         partial_output_ptr = acc_output_ptr + partial_elem_offset_base

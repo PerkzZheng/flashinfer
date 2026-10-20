@@ -19,6 +19,7 @@ import cutlass.cute as cute
 from cutlass.experimental import primitives as prims
 from cutlass import Float32, Int32, Int64
 
+from ..helpers.math import final_lse
 from .config import MlaConfig
 from ..helpers.math import ceil_div
 from ..helpers.ops import (
@@ -32,7 +33,7 @@ from ..helpers.query import (
     public_query_flat_row,
     split_o_element_offset,
 )
-from ..helpers.tile import runtime_seq_len_kv_for_q
+from ..helpers.tile import runtime_seq_len_kv_for_q, runtime_split_count
 
 
 # Baseline split-KV reduction uses one 128-thread CTA.  Each thread owns eight
@@ -235,6 +236,7 @@ def run_gmem_reduction_kernel(
     cu_seqlens_q,
     cfg,
     num_reduction_ctas,
+    requested_splits=None,
 ):
     """Reduce split-KV partial O/LSE rows written by the 1CTA main kernel.
 
@@ -251,6 +253,12 @@ def run_gmem_reduction_kernel(
     public storage; inactive tail rows may synchronize and consume workspace
     slots but never publish O or LSE.
     """
+
+    split_limit = (
+        Int32(cfg.num_ctas_per_seq_kv)
+        if requested_splits is None
+        else runtime_split_count(requested_splits)
+    )
     # Pair with the dense kernel PDL signal before reading partials.
     prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
     q_idx, head_dim_tile_idx, batch_idx = cute.arch.block_idx()
@@ -312,8 +320,18 @@ def run_gmem_reduction_kernel(
                 )
                 lse_max = kernel.lse_dtype(-kernel.lse_dtype.inf)
                 for split_idx in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
-                    local_lse[split_idx] = row_lse[split_idx]
-                    lse_max = fmax_f32(lse_max, local_lse[split_idx])
+                    if Int32(split_idx) < split_limit:
+                        local_lse[split_idx] = (
+                            (row_lse[split_idx])
+                            if Int32(split_idx)
+                            < (
+                                Int32(cfg.num_ctas_per_seq_kv)
+                                if requested_splits is None
+                                else runtime_split_count(requested_splits)
+                            )
+                            else Float32(-Float32.inf)
+                        )
+                        lse_max = fmax_f32(lse_max, local_lse[split_idx])
 
                 lse_max = (
                     lse_max
@@ -322,10 +340,11 @@ def run_gmem_reduction_kernel(
                 )
                 sum_lse = kernel.lse_dtype(0.0)
                 for split_idx in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
-                    sum_lse += cute.math.exp2(
-                        local_lse[split_idx] - lse_max,
-                        fastmath=True,
-                    )
+                    if Int32(split_idx) < split_limit:
+                        sum_lse += cute.math.exp2(
+                            local_lse[split_idx] - lse_max,
+                            fastmath=True,
+                        )
                 has_finite_mass = sum_lse == sum_lse and sum_lse != kernel.lse_dtype(
                     0.0
                 )
@@ -341,7 +360,10 @@ def run_gmem_reduction_kernel(
                         batch_idx,
                         cu_seqlens_q,
                     )
-                    (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                    if cutlass.const_expr(lse is not None):
+                        (lse.iterator.raw_ptr() + output_query_row).store(
+                            final_lse(global_lse, cfg.lse_base_on_e)
+                        )
 
                 acc_vec = vector_from_scalars(
                     (
@@ -357,31 +379,32 @@ def run_gmem_reduction_kernel(
                     dtype=Float32,
                 )
                 for split_idx in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
-                    scale = Float32(
-                        cute.math.exp2(
-                            local_lse[split_idx] - global_lse,
-                            fastmath=True,
+                    if Int32(split_idx) < split_limit:
+                        scale = Float32(
+                            cute.math.exp2(
+                                local_lse[split_idx] - global_lse,
+                                fastmath=True,
+                            )
+                            if has_finite_mass
+                            else kernel.acc_dtype(0.0)
                         )
-                        if has_finite_mass
-                        else kernel.acc_dtype(0.0)
-                    )
-                    acc_elem_offset = split_o_element_offset(
-                        cfg,
-                        batch_idx,
-                        cta_idx_q,
-                        head_idx,
-                        Int32(split_idx),
-                        dim_idx,
-                    )
-                    partial_vec = (
-                        (acc_ptr + acc_elem_offset)
-                        .load(
-                            count=GMEM_REDUCTION_ELEMENTS_PER_THREAD,
-                            alignment=GMEM_REDUCTION_VECTOR_BYTES,
+                        acc_elem_offset = split_o_element_offset(
+                            cfg,
+                            batch_idx,
+                            cta_idx_q,
+                            head_idx,
+                            Int32(split_idx),
+                            dim_idx,
                         )
-                        .to(Float32)
-                    )
-                    acc_vec = acc_vec + partial_vec * scale
+                        partial_vec = (
+                            (acc_ptr + acc_elem_offset)
+                            .load(
+                                count=GMEM_REDUCTION_ELEMENTS_PER_THREAD,
+                                alignment=GMEM_REDUCTION_VECTOR_BYTES,
+                            )
+                            .to(Float32)
+                        )
+                        acc_vec = acc_vec + partial_vec * scale
 
                 output_query_row = public_query_flat_row(
                     cfg,
@@ -456,9 +479,18 @@ def run_gmem_reduction_kernel(
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_idx = lane_idx + Int32(i * GMEM_REDUCTION_WARP_LANES)
                     local_lse[i] = (
-                        row_lse[split_idx]
-                        if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv))
-                        else -kernel.lse_dtype.inf
+                        (
+                            row_lse[split_idx]
+                            if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv))
+                            else -kernel.lse_dtype.inf
+                        )
+                        if Int32(split_idx)
+                        < (
+                            Int32(cfg.num_ctas_per_seq_kv)
+                            if requested_splits is None
+                            else runtime_split_count(requested_splits)
+                        )
+                        else Float32(-Float32.inf)
                     )
                     lse_max = fmax_f32(lse_max, local_lse[i])
                 lse_max = warp_reduce_max_f32(lse_max)
@@ -486,7 +518,10 @@ def run_gmem_reduction_kernel(
                         batch_idx,
                         cu_seqlens_q,
                     )
-                    (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                    if cutlass.const_expr(lse is not None):
+                        (lse.iterator.raw_ptr() + output_query_row).store(
+                            final_lse(global_lse, cfg.lse_base_on_e)
+                        )
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_idx = lane_idx + Int32(i * GMEM_REDUCTION_WARP_LANES)
                     if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv)):
@@ -542,29 +577,30 @@ def run_gmem_reduction_kernel(
                 dtype=Float32,
             )
             for split_idx in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
-                scale = Float32(
-                    smem_lse_scale[
-                        local_head_idx * Int32(cfg.num_ctas_per_seq_kv)
-                        + Int32(split_idx)
-                    ]
-                )
-                acc_elem_offset = split_o_element_offset(
-                    cfg,
-                    batch_idx,
-                    q_idx,
-                    global_head_idx,
-                    Int32(split_idx),
-                    dim_idx,
-                )
-                partial_vec = (
-                    (acc_ptr + acc_elem_offset)
-                    .load(
-                        count=GMEM_REDUCTION_ELEMENTS_PER_THREAD,
-                        alignment=16,
+                if Int32(split_idx) < split_limit:
+                    scale = Float32(
+                        smem_lse_scale[
+                            local_head_idx * Int32(cfg.num_ctas_per_seq_kv)
+                            + Int32(split_idx)
+                        ]
                     )
-                    .to(Float32)
-                )
-                acc_vec = acc_vec + partial_vec * scale
+                    acc_elem_offset = split_o_element_offset(
+                        cfg,
+                        batch_idx,
+                        q_idx,
+                        global_head_idx,
+                        Int32(split_idx),
+                        dim_idx,
+                    )
+                    partial_vec = (
+                        (acc_ptr + acc_elem_offset)
+                        .load(
+                            count=GMEM_REDUCTION_ELEMENTS_PER_THREAD,
+                            alignment=16,
+                        )
+                        .to(Float32)
+                    )
+                    acc_vec = acc_vec + partial_vec * scale
             output_query_row = public_query_flat_row(
                 cfg,
                 storage_flat_query_row,
@@ -623,9 +659,18 @@ def run_gmem_reduction_kernel(
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_idx = lane_idx + Int32(i * GMEM_REDUCTION_WARP_LANES)
                     local_lse[i] = (
-                        row_lse[split_idx]
-                        if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv))
-                        else -kernel.lse_dtype.inf
+                        (
+                            row_lse[split_idx]
+                            if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv))
+                            else -kernel.lse_dtype.inf
+                        )
+                        if Int32(split_idx)
+                        < (
+                            Int32(cfg.num_ctas_per_seq_kv)
+                            if requested_splits is None
+                            else runtime_split_count(requested_splits)
+                        )
+                        else Float32(-Float32.inf)
                     )
                     lse_max = fmax_f32(lse_max, local_lse[i])
                 lse_max = warp_reduce_max_f32(lse_max)
@@ -653,7 +698,10 @@ def run_gmem_reduction_kernel(
                         batch_idx,
                         cu_seqlens_q,
                     )
-                    (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                    if cutlass.const_expr(lse is not None):
+                        (lse.iterator.raw_ptr() + output_query_row).store(
+                            final_lse(global_lse, cfg.lse_base_on_e)
+                        )
                 for i in cutlass.range_constexpr(lse_per_thread):
                     split_idx = lane_idx + Int32(i * GMEM_REDUCTION_WARP_LANES)
                     if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv)):
@@ -705,28 +753,29 @@ def run_gmem_reduction_kernel(
             )
             acc_ptr = acc_output.iterator.raw_ptr()
             for split_idx in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
-                scale = Float32(
-                    smem_lse_scale[
-                        row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
-                    ]
-                )
-                acc_elem_offset = split_o_element_offset(
-                    cfg,
-                    batch_idx,
-                    q_idx,
-                    head_idx,
-                    Int32(split_idx),
-                    dim_idx,
-                )
-                partial_vec = (
-                    (acc_ptr + acc_elem_offset)
-                    .load(
-                        count=GMEM_REDUCTION_ELEMENTS_PER_THREAD,
-                        alignment=16,
+                if Int32(split_idx) < split_limit:
+                    scale = Float32(
+                        smem_lse_scale[
+                            row_in_slice * Int32(cfg.num_ctas_per_seq_kv) + split_idx
+                        ]
                     )
-                    .to(Float32)
-                )
-                acc_vec = acc_vec + partial_vec * scale
+                    acc_elem_offset = split_o_element_offset(
+                        cfg,
+                        batch_idx,
+                        q_idx,
+                        head_idx,
+                        Int32(split_idx),
+                        dim_idx,
+                    )
+                    partial_vec = (
+                        (acc_ptr + acc_elem_offset)
+                        .load(
+                            count=GMEM_REDUCTION_ELEMENTS_PER_THREAD,
+                            alignment=16,
+                        )
+                        .to(Float32)
+                    )
+                    acc_vec = acc_vec + partial_vec * scale
             output_query_row = public_query_flat_row(
                 cfg,
                 storage_flat_query_row,
@@ -784,10 +833,19 @@ def run_gmem_reduction_kernel(
         for i in cutlass.range_constexpr(lse_per_thread):
             split_idx = lane_idx + Int32(i * GMEM_REDUCTION_WARP_LANES)
             local_lse[i] = (
-                g_lse[split_idx]
-                if valid_output_row
-                and cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv))
-                else -kernel.lse_dtype.inf
+                (
+                    g_lse[split_idx]
+                    if valid_output_row
+                    and cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv))
+                    else -kernel.lse_dtype.inf
+                )
+                if Int32(split_idx)
+                < (
+                    Int32(cfg.num_ctas_per_seq_kv)
+                    if requested_splits is None
+                    else runtime_split_count(requested_splits)
+                )
+                else Float32(-Float32.inf)
             )
             lse_max = fmax_f32(lse_max, local_lse[i])
         lse_max = warp_reduce_max_f32(lse_max)
@@ -810,7 +868,10 @@ def run_gmem_reduction_kernel(
                     batch_idx,
                     cu_seqlens_q,
                 )
-                (lse.iterator.raw_ptr() + output_query_row).store(global_lse)
+                if cutlass.const_expr(lse is not None):
+                    (lse.iterator.raw_ptr() + output_query_row).store(
+                        final_lse(global_lse, cfg.lse_base_on_e)
+                    )
         for i in cutlass.range_constexpr(lse_per_thread):
             split_idx = lane_idx + Int32(i * GMEM_REDUCTION_WARP_LANES)
             if cute.elem_less(split_idx, Int32(cfg.num_ctas_per_seq_kv)):
@@ -833,9 +894,12 @@ def run_gmem_reduction_kernel(
     r_acc_o[0] = kernel.acc_dtype(0.0)
     if valid_output_row:
         for split_idx in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
-            scale = Float32(smem_lse_scale[split_idx])
-            if dim_idx < Int32(cfg.head_dim_v):
-                r_acc_o[0] = r_acc_o[0] + Float32(g_acc_o[split_idx, dim_idx]) * scale
+            if Int32(split_idx) < split_limit:
+                scale = Float32(smem_lse_scale[split_idx])
+                if dim_idx < Int32(cfg.head_dim_v):
+                    r_acc_o[0] = (
+                        r_acc_o[0] + Float32(g_acc_o[split_idx, dim_idx]) * scale
+                    )
     r_o.store(r_acc_o.load(0, 1).to(out_element_dtype), 0)
     if dim_idx < Int32(cfg.head_dim_v) and valid_output_row:
         output_query_row = public_query_flat_row(

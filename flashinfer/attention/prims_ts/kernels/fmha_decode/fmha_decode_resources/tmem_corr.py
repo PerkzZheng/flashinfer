@@ -61,6 +61,7 @@ from .helpers_common import (
     _q_physical_output_row,
     _q_physical_output_row_from_logical,
     _q_row_is_valid_for_seq,
+    _q_logical_output_row_is_valid_for_seq,
     _q_tile_output_row_base,
     _q_tile_valid_rows_for_seq,
     _masked_weighted_sum,
@@ -83,8 +84,7 @@ from .helpers_output import (
     _store_transposed_smem8b,
 )
 from .helpers_softmax import (
-    _attention_sink_for_local_head,
-    _attention_sink_for_scale_idx,
+    _final_output_lse,
     _pack_float4_to_fp8_e4m3,
 )
 from .sage_scales import SageVScalesResource
@@ -121,6 +121,7 @@ class TmemCorrResource(DecodeGenResourceBase):
     partial_stats_ptr: cute.Pointer = None
     split_kv_counter_ptr: cute.Pointer = None
     attention_sinks_ptr: cute.Pointer = None
+    lse_ptr: cute.Pointer | None = None
     # The ``sfV`` / ``v_mean`` block the correction task stages per work tile;
     # the schedule waits and releases it, the epilogue only reads it. ``None``
     # without Sage attention.
@@ -251,6 +252,9 @@ class TmemCorrResource(DecodeGenResourceBase):
             seq_len_kv,
             self.seq_len_q,
             _q_group_token_base(cfg, logical_q_group_idx),
+            requested_splits=_decode_gen_task_cache(stage_info)[10]
+            if cfg.runtime_split_kv
+            else None,
         )
 
     def _can_alias_o_smem(self) -> bool:
@@ -1109,6 +1113,7 @@ class TmemCorrResource(DecodeGenResourceBase):
             reduce_row_idx,
             sum_val,
             max_val,
+            lse_writer=reduce_col_idx == Int32(0),
         )
         dst_offset = dst_row_base + reduce_col_idx * Int32(self.cfg.o_dtype_bytes)
         final_o_dst = cutlass.inttoptr(
@@ -1125,6 +1130,42 @@ class TmemCorrResource(DecodeGenResourceBase):
         )
 
     @cute.jit
+    def _final_row_weight(self, head_kv, batch, row, row_sum, row_max, writer):
+        cfg = self.cfg
+        weight = Float32(1.0)
+        if cutlass.const_expr(cfg.use_attention_sinks or cfg.lse_mode != "none"):
+            local_head = _local_head_from_q_output_row(cfg, self.h_r, row)
+            head_stride = _attention_sink_head_stride(cfg, self.h_r)
+            physical_row = _q_physical_output_row_from_logical(
+                cfg,
+                self.h_r,
+                self.num_heads_kv,
+                batch,
+                head_kv,
+                row,
+                self.q_token_offset,
+            )
+            # Validity is expressed in the compact logical output-row domain.
+            valid = _q_logical_output_row_is_valid_for_seq(
+                cfg, self.h_r, row, self.seq_len_q
+            )
+            mass_lse = Float32(-Float32.inf)
+            if row_sum > Float32(0.0):
+                mass_lse = self.scale_softmax_log2 * row_max + cute.math.log2(
+                    row_sum, fastmath=True
+                )
+            weight = _final_output_lse(
+                cfg,
+                self.attention_sinks_ptr,
+                self.lse_ptr,
+                mass_lse,
+                physical_row,
+                head_kv * head_stride + local_head,
+                writer and valid,
+            )
+        return weight
+
+    @cute.jit
     def _softmax_output_row_state(
         self,
         logical_h_k_idx: Int32,
@@ -1132,6 +1173,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         reduce_row_idx: Int32,
         sum_val: Float32,
         max_val: Float32,
+        lse_writer: cutlass.Boolean = False,
     ) -> tuple[Int64, Float32]:
         """Resolve one logical row's output address and normalization once.
 
@@ -1139,24 +1181,13 @@ class TmemCorrResource(DecodeGenResourceBase):
         (``fp8_p_quant_scale``), which cancels in a direct tail.
         """
         cfg = self.cfg
-        attention_sink_h_r = _attention_sink_head_stride(cfg, self.h_r)
-        attention_sink_head_idx = _local_head_from_q_output_row(
-            cfg, self.h_r, reduce_row_idx
-        )
-        sum_val += _attention_sink_for_local_head(
-            cfg,
-            self.attention_sinks_ptr,
-            self.scale_softmax_log2,
-            max_val,
-            logical_h_k_idx,
-            attention_sink_h_r,
-            self.num_heads_kv,
-            attention_sink_head_idx,
+        final_weight = self._final_row_weight(
+            logical_h_k_idx, logical_b_idx, reduce_row_idx, sum_val, max_val, lse_writer
         )
         # ``output_scale`` is the public bmm2_scale. Fold it into the final
         # normalization for every output dtype; split partials reach this
         # helper only after the cross-CTA reduction has completed.
-        norm_scale = self.output_scale * self._safe_norm_rcp(sum_val)
+        norm_scale = self.output_scale * self._safe_norm_rcp(sum_val) * final_weight
         if cutlass.const_expr(cfg.use_fp8_pv and cfg.use_split_kv):
             # Fused split partials carry O divided by the FP8 P scale (see
             # ``_split_partial_scale``); restore it after the FP32 reduction.
@@ -2604,6 +2635,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_output_row_idx: Int32,
         denominator: Float32,
         global_max: Float32,
+        lse_writer: cutlass.Boolean,
     ) -> tuple[cutlass.Boolean, Int64, Float32]:
         """Return ``(valid_output_row, row_base, row_scale)`` of a lane's output row.
 
@@ -2637,6 +2669,7 @@ class TmemCorrResource(DecodeGenResourceBase):
                     logical_output_row_idx,
                     denominator,
                     global_max,
+                    lse_writer=lse_writer and valid_output_row,
                 )
         return valid_output_row, row_base, row_scale
 
@@ -2679,6 +2712,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_output_row_idx = q_row_offset + exchange_row_idx
         valid_output_row, row_base, row_scale = self._kv_tile_256_output_row_state(
             resolves=output_lane,
+            lse_writer=output_lane,
             logical_h_k_idx=logical_h_k_idx,
             logical_b_idx=logical_b_idx,
             logical_kv_idx=logical_kv_idx,
@@ -3013,6 +3047,7 @@ class TmemCorrResource(DecodeGenResourceBase):
         logical_output_row_idx = q_row_offset + exchange_row_idx
         valid_output_row, row_base, row_scale = self._kv_tile_256_output_row_state(
             resolves=cutlass.Boolean(True),
+            lse_writer=owned_col_base == Int32(0),
             logical_h_k_idx=logical_h_k_idx,
             logical_b_idx=logical_b_idx,
             logical_kv_idx=logical_kv_idx,
@@ -3359,24 +3394,20 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             return
 
-        attention_sink_h_r = _attention_sink_head_stride(cfg, self.h_r)
-        attention_sink_head_idx = _local_head_from_q_output_row(
-            cfg, self.h_r, logical_output_row_idx
-        )
-        reduced_sum_0 += _attention_sink_for_local_head(
-            cfg,
-            self.attention_sinks_ptr,
-            self.scale_softmax_log2,
-            final_max_0,
+        final_weight = self._final_row_weight(
             logical_h_k_idx,
-            attention_sink_h_r,
-            self.num_heads_kv,
-            attention_sink_head_idx,
+            logical_b_idx,
+            logical_output_row_idx,
+            reduced_sum_0,
+            final_max_0,
+            col_base == Int32(0) and valid_output_row,
         )
         # Apply public bmm2_scale in the final direct-output normalization.
         # The split-KV branch above returns before reaching this point, so its
         # partial O remains unscaled for the selected reducer.
-        norm_scale_0 = self.output_scale * self._safe_norm_rcp(reduced_sum_0)
+        norm_scale_0 = (
+            self.output_scale * self._safe_norm_rcp(reduced_sum_0) * final_weight
+        )
         # Direct-output path: fold attention sinks into the denominator, then
         # bake normalization and per-instance max correction into the O scales.
         final_scale0_0 = norm_scale_0 * exp_scale0_0
@@ -3778,28 +3809,6 @@ class TmemCorrResource(DecodeGenResourceBase):
                 )
                 reduced_sum[scale_base] = reduced_pair[0]
                 reduced_sum[scale_base + 1] = reduced_pair[1]
-        if cutlass.const_expr(not cfg.use_split_kv):
-            logical_h_k_idx, _ = _logical_head_batch(
-                stage_info, self.h_k_idx, self.b_idx
-            )
-            logical_q_group_idx = _logical_q_group_idx(
-                cfg, stage_info, self.q_group_idx
-            )
-            for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                # Attention sinks add to the denominator before the
-                # final normalization scale is computed.
-                reduced_sum[scale_idx] += _attention_sink_for_scale_idx(
-                    cfg,
-                    self.attention_sinks_ptr,
-                    self.scale_softmax_log2,
-                    final_max[scale_idx],
-                    logical_h_k_idx,
-                    self.h_r,
-                    self.num_heads_kv,
-                    logical_q_group_idx,
-                    col_group_idx,
-                    scale_idx,
-                )
 
         base_addr0 = self._swaps_o_stage_base_addr(
             tmem_row_base, o_base_col, tail_o_stage_idx_0
@@ -3975,11 +3984,33 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             return
 
+        logical_h_k_idx, logical_b_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             # Direct final-output scales include both the reciprocal softmax
             # denominator and public bmm2_scale. Split partials returned above
             # use only the unnormalized ``exp_scale*`` arrays.
-            norm_scale = self.output_scale * self._safe_norm_rcp(reduced_sum[scale_idx])
+            row_in_tile = (
+                Int32((scale_idx // 2) * 8)
+                + col_group_idx * Int32(2)
+                + Int32(scale_idx % 2)
+            )
+            output_row = _q_tile_output_row_base(cfg, logical_q_group_idx) + row_in_tile
+            final_weight = self._final_row_weight(
+                logical_h_k_idx,
+                logical_b_idx,
+                output_row,
+                reduced_sum[scale_idx],
+                final_max[scale_idx],
+                warp_idx == Int32(0) and lane_idx < Int32(4),
+            )
+            norm_scale = (
+                self.output_scale
+                * self._safe_norm_rcp(reduced_sum[scale_idx])
+                * final_weight
+            )
             final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
             final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
 
@@ -4283,27 +4314,6 @@ class TmemCorrResource(DecodeGenResourceBase):
             for scale_idx in cutlass.range_constexpr(num_scale_groups):
                 reduced_sum[scale_idx] = reduced_pair[scale_idx]
 
-        if cutlass.const_expr(not cfg.use_split_kv):
-            logical_h_k_idx, _ = _logical_head_batch(
-                stage_info, self.h_k_idx, self.b_idx
-            )
-            logical_q_group_idx = _logical_q_group_idx(
-                cfg, stage_info, self.q_group_idx
-            )
-            for scale_idx in cutlass.range_constexpr(num_scale_groups):
-                reduced_sum[scale_idx] += _attention_sink_for_scale_idx(
-                    cfg,
-                    self.attention_sinks_ptr,
-                    self.scale_softmax_log2,
-                    final_max[scale_idx],
-                    logical_h_k_idx,
-                    self.h_r,
-                    self.num_heads_kv,
-                    logical_q_group_idx,
-                    col_group_idx,
-                    scale_idx,
-                )
-
         base_addr0 = self._swaps_o_stage_base_addr(
             tmem_row_base, o_base_col, tail_o_stage_idx_0
         )
@@ -4482,11 +4492,33 @@ class TmemCorrResource(DecodeGenResourceBase):
             )
             return
 
+        logical_h_k_idx, logical_b_idx = _logical_head_batch(
+            stage_info, self.h_k_idx, self.b_idx
+        )
+        logical_q_group_idx = _logical_q_group_idx(cfg, stage_info, self.q_group_idx)
         for scale_idx in cutlass.range_constexpr(num_scale_groups):
             # Direct final-output scales include both the reciprocal softmax
             # denominator and public bmm2_scale. Split partials returned above
             # use only the unnormalized ``exp_scale*`` arrays.
-            norm_scale = self.output_scale * self._safe_norm_rcp(reduced_sum[scale_idx])
+            row_in_tile = (
+                Int32((scale_idx // 2) * 8)
+                + col_group_idx * Int32(2)
+                + Int32(scale_idx % 2)
+            )
+            output_row = _q_tile_output_row_base(cfg, logical_q_group_idx) + row_in_tile
+            final_weight = self._final_row_weight(
+                logical_h_k_idx,
+                logical_b_idx,
+                output_row,
+                reduced_sum[scale_idx],
+                final_max[scale_idx],
+                warp_idx == Int32(0) and lane_idx < Int32(4),
+            )
+            norm_scale = (
+                self.output_scale
+                * self._safe_norm_rcp(reduced_sum[scale_idx])
+                * final_weight
+            )
             final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
             final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
 

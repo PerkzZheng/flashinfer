@@ -882,7 +882,8 @@ class FmhaDecodeConfig:
         """Whether encoded paging keeps the complete CTA route in SMEM."""
 
         return (
-            self.use_paged_kv
+            not self.runtime_split_kv
+            and self.use_paged_kv
             and self.uses_scattered_page_route
             and self.tile_size_kv == 128
             and not self.use_sliding_window_causal
@@ -971,6 +972,17 @@ class FmhaDecodeConfig:
             return None
         if self.use_transform_kv:
             return 88
+        # Runtime partition metadata extends the full score tile's live ranges.
+        # Grant one eight-register quantum per Softmax thread from Correction;
+        # the two-instance Q128 graph returns 16 registers per correction lane.
+        if self.runtime_split_kv and self.use_keeps_mma_ab and self.tile_size_q == 128:
+            softmax_warps = self.softmax0_num_warps + (
+                self.softmax1_num_warps if self.num_insts_kv != 1 else 0
+            )
+            quanta = (
+                softmax_warps + self.correction_num_warps - 1
+            ) // self.correction_num_warps
+            return 88 - quanta * 8
         return KV_TILE_256_CORRECTION_TASK_REGISTERS if self.tile_size_kv == 256 else 88
 
     @property
@@ -1431,6 +1443,9 @@ class FmhaDecodeConfig:
     # Split-KV fanout: number of CTAs that cooperate on one (batch, head_kv)
     # when use_split_kv is enabled. The launcher picks this based on SM count.
     splits_kv: int = 1
+    runtime_split_kv: bool = False
+    # Internal launch profile for a bounded CTA-relative page-ID span.
+    runtime_page_window: bool = False
     # Upper bound of splits_kv across all (batch, head_kv) groups,
     # used to size the per-launch partial-O / partial-stats / counter
     # scratch GMEM buffers.
@@ -1480,6 +1495,7 @@ class FmhaDecodeConfig:
     # denominator (extra logit that absorbs probability mass). Requires the
     # `attention_sinks` tensor argument at launch.
     use_attention_sinks: bool = False
+    lse_mode: str = "none"
     # Optional profile and reduction knobs selected by launcher policy or tests.
     use_keeps_mma_ab: bool = False
     # Sage attention: a nonzero ``sage_k_block_size`` enables per-block Q/K

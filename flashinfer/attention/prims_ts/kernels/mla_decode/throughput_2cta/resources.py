@@ -55,6 +55,7 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 from cutlass.experimental.task_scheduling.resources import consumer_work, producer_work
 from cutlass.experimental.task_scheduling.enums import WorkAttr
+from ..helpers.math import final_lse
 from ...mask import kv_tile_needs_right_mask
 from ...tensor_map import transform_ragged_coords
 
@@ -521,6 +522,9 @@ class MlaWorkQueue(WorkQueue):
                 k_tile_total,
                 split_kv_cap,
                 split_kv_idx,
+                split_divisor=params.split_kv_fdd
+                if self.static_split_kv is None and not self.is_var_split_kv
+                else None,
             )
         return MlaTsWorkTileInfo(
             tile_idx,
@@ -4130,7 +4134,7 @@ class GmemOResource(HighThroughputMlaResource):
                             + Int64(logical_lse_q_idx) * Int64(logical_num_heads_q)
                             + Int64(batch_idx) * Int64(logical_num_heads_q) * Int64(S_q)
                         )
-                    lse_base_ptr.store(lse)
+                    lse_base_ptr.store(final_lse(lse, cfg.lse_base_on_e))
 
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         cute.arch.fence_view_async_tmem_load()
@@ -4408,7 +4412,7 @@ class GmemOResource(HighThroughputMlaResource):
                                 * Int64(logical_num_heads_q)
                                 * Int64(S_q)
                             )
-                        lse_base_ptr.store(lse)
+                        lse_base_ptr.store(final_lse(lse, cfg.lse_base_on_e))
 
         prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
         cute.arch.fence_view_async_tmem_load()

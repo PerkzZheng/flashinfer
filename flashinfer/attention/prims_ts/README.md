@@ -13,9 +13,8 @@ first use and provide no compatibility guarantee. Calling an API is the opt-in;
 no environment variable is required. Existing API logging and `fi_trace`
 bindings remain available.
 
-Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
-admitted by the runtime architecture guard but is not yet signoff-qualified.
-The QToken-KvBlock-Sparse-Attention extension is separately validated on SM103/GB300.
+Hardware eligibility and the exercised software/hardware matrix are listed in
+[Validation scope](#validation-scope).
 
 ## Compilation cache
 
@@ -48,7 +47,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 
 | Kernel | Guide | Public APIs |
 | --- | --- | --- |
-| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
+| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache`, `get_prims_ts_batch_prefill_workspace_size` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
@@ -60,9 +59,7 @@ output/workspace ownership, examples, limitations, and validation commands.
 ### Unified decode entry points
 
 `batch_decode_with_paged_kv_cache` and `batch_mla_decode_with_paged_kv_cache`
-support both convenience and explicit caller-workspace execution. Existing
-calls retain their validated convenience behavior, including FMHA's
-length-specialized policies. For allocation-free, synchronization-free
+support both convenience and explicit caller-workspace execution. Convenience calls validate inputs and allocate model scratch when omitted. For allocation-free, synchronization-free
 steady-state launches, provide `workspace_buffer`, `max_kv_len`, `out`,
 and `validate=False`. Packed Q additionally requires `max_seq_len_q`
 (FMHA also accepts its non-default `seq_len_q` alias).
@@ -73,8 +70,9 @@ metadata values back to the host. FMHA preserves initialized caller scratch
 by planning with `initialize_workspace=False`.
 
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
-capture. FMHA scratch must be zero-initialized and re-zeroed when any workspace
-layout input (including batch size) changes. Scratch and output must not
+capture. Zero caller-owned FMHA scratch before its first trusted standalone
+launch; model wrappers initialize control storage by default. Their fixed
+control tail supports ordinary batch/length changes without re-zeroing. Scratch and output must not
 overlap any live input or each other; each concurrent launch/graph needs its
 own scratch. Warm up the exact topology before capture, retain stable storage,
 and update metadata only between completed replays. Validation is enabled by
@@ -103,35 +101,100 @@ with torch.cuda.graph(graph):
 graph.replay()
 ```
 
-The contiguous and paged context, FMHA decode, and MLA decode wrappers separate
-reusable static state from per-run request state. `plan()` compiles a static
-capacity, shape, dtype, and storage-mode specialization without retaining
-request tensors or metadata. FMHA decode can optionally own a fixed sequence-length
-vector for the plan's lifetime. Paged context plans may additionally freeze
-explicit exact-uniform-length, zero-causal-offset, or zeroed-V-tail promises.
-Context `run()` receives current packed offsets or fixed-table paged metadata;
-per-token variable-window bounds for fixed-shape inputs are also per-run, with
-optional caller-precomputed per-CTA start minima. Both context wrappers own
-their default scale tensors. Contiguous variable-window plans additionally own
-mutable fallback scratch that derives CTA minima only when the caller omits
-them, while paged context owns no other workspace. With `validate=False`,
-supplying CTA minima avoids that repeated preprocessing and leaves all
-variable-window metadata caller-owned. Runtime validation is enabled by
-default; callers that have already validated their inputs may use
-`validate=False` for steady-state timing or CUDA Graph capture and then own
-every dtype, device, shape, stride, alignment, value, aliasing, and lifetime
-obligation.
+### Reusable model plans
 
-All PrimTS APIs leave cross-tensor storage overlap unchecked, regardless of
-`validate`. Output must not overlap inputs, live metadata, or plan-owned
-buffers. Caller-provided workspace must be disjoint from the public input and
-output tensors; its internal views retain their documented layout. Callers
-must preserve these preconditions when rebinding tensors and replaying graphs.
-Writable-buffer aliasing is unsupported, not an in-place execution mode.
-TensorMap stride/alignment and workspace-capacity checks remain in place.
+`plan()` accepts model configuration and workspace, with no batch size or
+Q/KV length arguments. Batch and fixed Q lengths come from `run()` tensors.
+Packed Q requires the caller's `max_seq_len_q`; pass `max_kv_len` for trusted
+execution. Workspace queries take only model geometry and hardware information.
 
-The standalone sparse-attention example suggests G for both packed prefill
-and fixed decode using a caller-cached SM count, then fixes G for each plan.
+Constructor model defaults use the existing `plan()` keyword names; explicit
+plan arguments override them. Decode/MLA accept caller workspace directly in
+the constructor or `plan()`. The optional wrapper `get_workspace_size()` query
+avoids repeating model configuration. Without caller scratch, `plan()` allocates
+it. Context needs no split scratch and both workspace queries return zero.
+
+```python
+import torch
+
+from flashinfer.attention.prims_ts import (
+    BatchDecodePagedTSWrapper,
+)
+
+device = torch.device("cuda:0")
+dtype = torch.bfloat16
+num_qo_heads, num_kv_heads, head_dim, page_size = 32, 4, 128, 32
+
+# Store model geometry once. Existing constructors and plan arguments also work.
+wrapper = BatchDecodePagedTSWrapper(
+    "NHD",
+    device=device,
+    num_qo_heads=num_qo_heads,
+    num_kv_heads=num_kv_heads,
+    head_dim=head_dim,
+    page_size=page_size,
+    q_data_type=dtype,
+    packed_query=True,
+    mask_type="causal",
+)
+workspace = torch.empty(wrapper.get_workspace_size(), dtype=torch.uint8, device=device)
+wrapper.plan(workspace_buffer=workspace)
+
+# This execution has two requests: Q lengths [2, 1], KV lengths [128, 96].
+# The scheduler supplies both host bounds; no CUDA reduction is needed.
+max_seq_len_q, max_kv_len = 2, 128
+q = torch.randn(3, num_qo_heads, head_dim, dtype=dtype, device=device)
+qo_indptr = torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
+seq_lens = torch.tensor([128, 96], dtype=torch.int32, device=device)
+block_tables = torch.tensor(
+    [[0, 1, 2, 3], [4, 5, 6, 0]], dtype=torch.int32, device=device
+)
+# Separate NHD K/V tensors: [pages, page_size, kv_heads, head_dim].
+k_cache = torch.randn(7, page_size, num_kv_heads, head_dim, dtype=dtype, device=device)
+v_cache = torch.randn_like(k_cache)
+out = torch.empty_like(q)
+
+run_args = dict(
+    qo_indptr=qo_indptr,
+    max_seq_len_q=max_seq_len_q,
+    max_kv_len=max_kv_len,
+    out=out,
+)
+# Validate and warm the selected kernels outside CUDA graph capture.
+wrapper.run(q, (k_cache, v_cache), seq_lens, block_tables, **run_args)
+
+# Reuse the same plan/workspace for subsequent ordered executions.
+result = wrapper.run(
+    q, (k_cache, v_cache), seq_lens, block_tables, validate=False, **run_args
+)
+print(f"Workspace: {workspace.numel():,} bytes; output: {tuple(result.shape)}")
+```
+
+An existing arena can instead be passed directly as
+`BatchDecodePagedTSWrapper("NHD", workspace_buffer=existing_workspace)`;
+then supply model geometry to `plan()`. No sizing query is required. Standalone
+workspace queries retain their problem-specific form; queries return
+the same hardware bound as reusable plans.
+
+Each new execution geometry resolves a tensor-free CPU policy shared
+across layers, complementing the persistent compilation and occupancy caches
+from [#6529](https://github.com/flashinfer-ai/flashinfer/pull/6529). Scales,
+workspace views and variable-window buffers remain layer-owned. CPU policy records use an unbounded cache; GPU bindings stay wrapper-owned.
+Model-key hashing is prepared once during planning.
+
+Warm each execution shape before capture. Owned scratch may grow during warmup
+for auxiliary or forced-split formats; caller scratch must already fit. The
+first capture freezes the workspace address and retains resource owners.
+Decode counters occupy a fixed tail outside partial-result views, allowing
+ordered calls and graphs of different sizes to reuse one arena. Concurrent
+execution needs separate wrappers and workspace.
+
+Use `validate=False` with host bounds and caller output/LSE buffers for trusted,
+allocation-free execution. Validation otherwise reads metadata on the host.
+Output/LSE/workspace must be disjoint from inputs and live buffers; overlap
+and lifetime remain caller obligations in both modes. Update metadata only
+between completed launches or graph replays. TensorMap shapes and all runtime
+metadata must still satisfy the selected plan's capacities.
 
 ## QToken-KvBlock-Sparse-Attention interface
 
@@ -480,8 +543,19 @@ exactly when `sage.v_mean` is set.
 
 ## Validation
 
-Run the numerical, graph, scheduler/resource, and public-surface
-contracts:
+### Validation scope
+
+The established kernels retain their earlier SM100a/B200 qualification.
+Reusable model plans, NHD caches, final LSE/sinks, generic MLA heads, and
+runtime split-KV have representative correctness and latency validation on
+SM103/GB300 with PyTorch 26.08, CUDA 13.4, and CuTe DSL 4.7.0. The contiguous
+QK192/V128 extension is also covered on that stack. This is the measured
+matrix for these extensions. Additional SM103/GB300 correctness smoke covers
+CuTe DSL 4.8.1, including NHD prefill, decode/MLA runtime split counts, tracing,
+clustered LSE and graph replay. Performance qualification remains specific to
+the measured DSL 4.7.0 stack.
+
+Run the numerical, graph, scheduler/resource, and public-surface contracts:
 
 ```bash
 pytest -q \
@@ -492,4 +566,57 @@ pytest -q \
   tests/attention/test_attention_ts_features.py \
   tests/attention/test_attention_ts_mla_decode.py \
   tests/attention/test_attention_ts_sage.py
+
 ```
+
+
+## Final statistics and sink semantics
+
+PrimTS context and dense FMHA/MLA decode plans accept `lse_mode="none"`
+(default) or `"base2"`. Base-2 is the single output convention, matching
+FlashInfer FMHA/cascade statistics. Enable LSE in planning, then request
+`return_lse=True` to receive `(output, lse)`. An optional compact CUDA FP32
+`lse` output has the query shape minus its final dimension; it is written
+whenever supplied to an enabled plan, even if the return flag is false.
+LSE excludes output scaling and removes internal FP8 probability amplification.
+Keep output and LSE buffers disjoint from live inputs and workspace.
+
+Context and dense FMHA decode plans additionally support
+`use_attention_sinks=True`, binding `attention_sinks` on every run. This FP32
+CUDA `[Hq]` vector contains natural-log sink logits after QK scaling and adds
+denominator mass with zero value contribution. Callers must supply finite
+values or `-inf`; validation checks tensor metadata without reading these
+values. The stable final merge happens once, after any split reduction and
+before output rounding; returned LSE includes the sink. Values may change
+between completed graph replays. Supply caller outputs and disable validation
+for allocation-free replay.
+
+FP8 scalar dequantization remains caller-composed: effective QK scale is
+`sm_scale * q_scale * k_scale`; effective output scale includes `v_scale`.
+Context uses `sm_scale` / `output_scale` while planning and
+`scale_softmax_log2 = effective_QK_scale * log2(e)` / `output_scale` at run.
+FMHA and MLA decode name the effective scales `bmm1_scale` / `bmm2_scale`.
+Context scales are host FP32 scalar operands; device scale tensors are not
+supported. Captured graphs retain the scalar values used during capture;
+changing them requires recapture. Scalar values are validated on the host and do not specialize JIT. Packed NVFP4 block
+scales remain a separate input contract.
+
+### Runtime split-KV policy
+
+Split counts are automatic and private, with the physical SM count as their
+ceiling. The policy bounds useful work using execution geometry and KV capacity,
+then prepares scratch/reduction capacity in ranges 1, 2–4, 5–8, 9–16, 17–32,
+33–64, and sixteen-split ranges above 64 clipped to the hardware ceiling.
+No count, ceiling, or count tensor is exposed to users.
+
+Producers and reducers receive typed runtime counts. Scratch strides and
+cluster/barrier participation retain prepared capacity; inactive slots/ranks
+contribute neutral state and preserve teardown. Count changes within a capacity
+reuse the compiled callables, including reduction. Static internal kernel
+recipes remain available for comparison.
+
+MLA 2CTA plans size scratch from the prepared bound, replacing the implicit
+128-split reservation. Parallel reduction is selected from the capacity/topology
+envelope. The launcher prepares exact integer-division metadata once per call
+and shares it with scheduled tile consumers. Full Q128 runtime-split graphs
+reserve eight additional registers per Softmax thread from the correction warpgroup.

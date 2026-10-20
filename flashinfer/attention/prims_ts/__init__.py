@@ -35,6 +35,7 @@ from .context import (
     BatchPrefillTSWrapper,
     batch_prefill,
     batch_prefill_with_paged_kv_cache,
+    get_prims_ts_batch_prefill_workspace_size,
 )
 from .mla_decode import (
     BatchSparseMLADecodePagedTSWrapper,
@@ -65,6 +66,7 @@ __all__ = [
     "BatchPrefillPagedTSWrapper",
     "batch_prefill",
     "batch_prefill_with_paged_kv_cache",
+    "get_prims_ts_batch_prefill_workspace_size",
     "BatchDecodePagedTSWrapper",
     "PrimsTSBatchDecodePlan",
     "batch_decode_with_paged_kv_cache",

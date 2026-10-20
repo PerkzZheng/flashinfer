@@ -74,7 +74,10 @@ from .fmha_decode_resources.helpers_common import (
     fmul2,
 )
 from .fmha_decode_resources.helpers_kv_tile_idx import _runtime_active_splits_kv
-from .fmha_decode_resources.helpers_softmax import _pack_float4_to_fp8_e4m3
+from .fmha_decode_resources.helpers_softmax import (
+    _pack_float4_to_fp8_e4m3,
+    _final_output_lse,
+)
 from ..separate_reduction import (
     merge_log2_lse,
     unpack_normalized_vec8,
@@ -126,6 +129,7 @@ def _reduction_active_splits_kv(
     h_r: Int32,
     logical_output_row_idx: Int32,
     seq_len_q: Int32,
+    requested_splits=None,
 ) -> Int32:
     """Recompute the producer's useful split prefix for one output row."""
     q_group_idx = _reduction_q_group_idx(cfg, h_r, logical_output_row_idx)
@@ -134,6 +138,7 @@ def _reduction_active_splits_kv(
         Int32(g_seqlens_kv[b_idx]),
         seq_len_q,
         _q_group_token_base(cfg, q_group_idx),
+        requested_splits=requested_splits,
     )
 
 
@@ -149,6 +154,8 @@ def _reduce_exact_splits_body(
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
     wait_for_pdl_producer: cutlass.Constexpr[bool] = False,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> None:
     """Fold every split in one 512-thread CTA over one 8 KiB output slice.
 
@@ -229,6 +236,7 @@ def _reduce_exact_splits_body(
             g_q_output_rows,
             reduce_row_idx,
             seq_len_q,
+            requested_splits=requested_splits,
         )
 
     if valid_reduce_row:
@@ -297,6 +305,7 @@ def _reduce_exact_splits_body(
             grid_h_k,
             attention_sink_head_idx,
             cfg,
+            lse_ptr=lse_ptr,
         )
 
 
@@ -311,6 +320,8 @@ def decode_gen_separate_reduction_kernel(
     g_q_output_rows: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> None:
     """Run the 512-thread exact-split reference schedule."""
 
@@ -324,6 +335,8 @@ def decode_gen_separate_reduction_kernel(
         g_q_output_rows,
         cfg,
         static_full_split_prefix,
+        lse_ptr=lse_ptr,
+        requested_splits=requested_splits,
     )
 
 
@@ -368,6 +381,7 @@ def _store_parallel_reduction_output(
     grid_h_k: Int32,
     attention_sink_head_idx: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
+    lse_ptr: cute.Pointer | None = None,
 ) -> None:
     """Merge the optional sink and store one normalized output fragment.
 
@@ -376,15 +390,15 @@ def _store_parallel_reduction_output(
     standalone reducer therefore only merges normalized states here.
     """
 
-    sink_lse = _attention_sink_log2_lse(
+    split_weight = _final_output_lse(
         cfg,
         g_attention_sinks,
-        h_k_idx,
-        attention_sink_h_r,
-        grid_h_k,
-        attention_sink_head_idx,
+        lse_ptr,
+        global_lse,
+        output_row_idx,
+        h_k_idx * attention_sink_h_r + attention_sink_head_idx,
+        reduce_col_idx == Int32(0),
     )
-    _, split_weight, _ = merge_log2_lse(global_lse, sink_lse)
 
     final_regs = cutlass.Array(
         Int32,
@@ -457,6 +471,8 @@ def decode_gen_parallel_separate_reduction_kernel(
     g_q_output_rows: Int32,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> None:
     """Reduce split partials with a compact or clustered constexpr schedule.
 
@@ -481,6 +497,8 @@ def decode_gen_parallel_separate_reduction_kernel(
             cfg,
             static_full_split_prefix,
             cfg.use_parallel_separate_reduction_pdl,
+            lse_ptr=lse_ptr,
+            requested_splits=requested_splits,
         )
         return
 
@@ -584,6 +602,7 @@ def decode_gen_parallel_separate_reduction_kernel(
             g_q_output_rows,
             reduce_row_idx,
             seq_len_q,
+            requested_splits=requested_splits,
         )
 
     for split_base_i in cutlass.range_constexpr(
@@ -727,6 +746,7 @@ def decode_gen_parallel_separate_reduction_kernel(
                 grid_h_k,
                 attention_sink_head_idx,
                 cfg,
+                lse_ptr=lse_ptr,
             )
         return
 
@@ -883,6 +903,7 @@ def decode_gen_parallel_separate_reduction_kernel(
             grid_h_k,
             attention_sink_head_idx,
             cfg,
+            lse_ptr=lse_ptr,
         )
 
     # Keep every peer CTA alive until rank zero has finished its DSMEM reads.
@@ -904,6 +925,8 @@ def fmha_decode_separate_reduction_launch(
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
     static_full_split_prefix: cutlass.Constexpr[bool] = False,
+    lse_ptr: cute.Pointer | None = None,
+    requested_splits=None,
 ) -> None:
     """Launch the standalone reducer after the main split-KV decode kernel.
 
@@ -960,6 +983,8 @@ def fmha_decode_separate_reduction_launch(
             q_output_rows,
             cfg,
             static_full_split_prefix,
+            lse_ptr=lse_ptr,
+            requested_splits=requested_splits,
         ).launch(
             grid=(num_parallel_slices * cluster_size, h_k, b),
             block=[cfg.parallel_reduction_threads_per_cta, 1, 1],
@@ -978,6 +1003,8 @@ def fmha_decode_separate_reduction_launch(
         q_output_rows,
         cfg,
         static_full_split_prefix,
+        lse_ptr=lse_ptr,
+        requested_splits=requested_splits,
     ).launch(
         grid=(num_reduction_slices, h_k, b),
         # Reduction parallelism is entirely in block.x; y/z are singleton

@@ -65,6 +65,7 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional, TypeAlias
 
+from ..separate_reduction import merge_log2_lse
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int16, Int32
@@ -100,6 +101,9 @@ SmemDescOffsets: TypeAlias = tuple[int, int]
 TmemAddr: TypeAlias = int | Int32
 TmemPtr: TypeAlias = cutlass.Array
 
+# Keep masked scores finite: an all-masked tile must not form inf - inf.
+_SOFTMAX_MASK_VALUE = -3.4028234663852886e38  # -FLT_MAX, bits 0xff7fffff
+
 SoftmaxScalar: TypeAlias = Float32
 SoftmaxChunk: TypeAlias = cutlass.Vector
 SoftmaxChunks: TypeAlias = list[SoftmaxChunk]
@@ -111,6 +115,18 @@ SoftmaxRowSumContribution: TypeAlias = SoftmaxChunks | SoftmaxScalar
 _tmem_sp_sdata: dict[int, list] = {}
 # Packed fp8 P words carried from exp2_p to store_p when P is staged in SMEM.
 _tmem_sp_pwords: dict[int, tuple] = {}
+
+
+@cute.jit
+def _softmax_exp2_bias(row_max: Float32, scale: Float32, p_scale: Float32) -> Float32:
+    """Use a zero exponent anchor for masked rows without changing their max."""
+    return Float32(
+        cutlass.select_(
+            row_max == Float32(_SOFTMAX_MASK_VALUE),
+            p_scale,
+            (Float32(0.0) - row_max) * scale + p_scale,
+        )
+    )
 
 
 @cute.jit
@@ -149,10 +165,10 @@ def _mask_score_quad(
             setp.ne.u32 valid2, bit, 0;
             and.b32 bit, {$r0}, 0x8;
             setp.ne.u32 valid3, bit, 0;
-            @!valid0 mov.b32 {$w0}, 0xff800000;
-            @!valid1 mov.b32 {$w1}, 0xff800000;
-            @!valid2 mov.b32 {$w2}, 0xff800000;
-            @!valid3 mov.b32 {$w3}, 0xff800000;
+            @!valid0 mov.b32 {$w0}, 0xff7fffff;
+            @!valid1 mov.b32 {$w1}, 0xff7fffff;
+            @!valid2 mov.b32 {$w2}, 0xff7fffff;
+            @!valid3 mov.b32 {$w3}, 0xff7fffff;
         }
         """,
         write_only_types=[Float32, Float32, Float32, Float32],
@@ -410,6 +426,8 @@ class FmhaConfig:
     # Keep the running row max while a tile raises it by at most this many log2 units.
     corr_skip_threshold_log2: float = 0.0
     two_cta_umma: bool = False
+    lse_mode: str = "none"
+    use_attention_sinks: bool = False
     # exp2 pairs per 16-pair softmax chunk computed on the FMA pipe.
     exp2_fma_pairs: int = 0
 
@@ -2526,7 +2544,7 @@ class TmemSPResource(MemoryResource):
     variable_window_token_ends: cute.Tensor | None = field(init=False, default=None)
     variable_window_cta_starts: cute.Tensor | None = field(init=False, default=None)
     variable_window_q_stride: int | Int32 = field(init=False, default=0)
-    scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
+    scale_softmax_log2: Float32 | None = field(init=False, default=None)
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
     # Precomputed TMEM pointers/addresses (set by auxiliary work). Avoids
     # per-iteration inttoptr + address math.
@@ -2568,7 +2586,7 @@ class TmemSPResource(MemoryResource):
         variable_window_token_ends: cute.Tensor | None = None,
         variable_window_cta_starts: cute.Tensor | None = None,
         variable_window_q_stride: int | Int32 = 0,
-        scale_softmax_log2: cute.Tensor | None = None,
+        scale_softmax_log2: Float32 | None = None,
         smem_p: Optional[SmemPResource] = None,
         **kwargs: Any,
     ) -> None:
@@ -2599,12 +2617,12 @@ class TmemSPResource(MemoryResource):
         self.smem_p = smem_p
         self.old_row_max = TaskLocalVariable(
             dtype=Float32,
-            default=Float32(-Float32.inf),
+            default=Float32(_SOFTMAX_MASK_VALUE),
             docs="Softmax row maximum from the previous K/V tile.",
         )
         self.row_max = TaskLocalVariable(
             dtype=Float32,
-            default=Float32(-Float32.inf),
+            default=Float32(_SOFTMAX_MASK_VALUE),
             docs="Softmax row maximum for the current K/V tile.",
         )
         self.row_sum = TaskLocalVariable(
@@ -3012,7 +3030,7 @@ class TmemSPResource(MemoryResource):
         if cutlass.const_expr(self.scale_softmax_log2 is None):
             # Safe fallback for validation-only resource construction.
             return Float32(0.0)
-        return self.scale_softmax_log2[0]
+        return self.scale_softmax_log2
 
     @cute.jit
     def _init_work_tile_state(self, stage_info: StageInfo) -> None:
@@ -3049,8 +3067,8 @@ class TmemSPResource(MemoryResource):
     ) -> tuple[Float32, Float32, Float32, Int32]:
         self._init_work_tile_state(stage_info)
         return (
-            Float32(-Float32.inf),
-            Float32(-Float32.inf),
+            Float32(_SOFTMAX_MASK_VALUE),
+            Float32(_SOFTMAX_MASK_VALUE),
             Float32(0.0),
             Int32(self.q_offset_default),
         )
@@ -3205,10 +3223,7 @@ class TmemSPResource(MemoryResource):
             tile_row_max = row_vector.reduce("max")
             row_max = cute.math.max(row_max, tile_row_max)
         _tmem_sp_sdata[id(self)] = s_data
-        row_max_safe = row_max
-        if row_max == -Float32.inf:
-            row_max_safe = Float32(0.0)
-        return old_row_max, row_max_safe
+        return old_row_max, row_max
 
     @cute.jit
     def _load_s_chunks_and_reduce_row_max(
@@ -3273,21 +3288,18 @@ class TmemSPResource(MemoryResource):
                         Int32(tmem_x),
                     )
                     mask = cutlass.vector.create_mask([tmem_x], [num_valid])
-                    neg_inf = cutlass.vector.full_like(
-                        s_data[chunk_idx], Float32(-Float32.inf)
+                    masked_values = cutlass.vector.full_like(
+                        s_data[chunk_idx], Float32(_SOFTMAX_MASK_VALUE)
                     )
                     s_data[chunk_idx] = cutlass.vector.where(
-                        mask, s_data[chunk_idx], neg_inf
+                        mask, s_data[chunk_idx], masked_values
                     )
                     masked_row_max = cute.math.max(
                         masked_row_max, s_data[chunk_idx].reduce("max")
                     )
                 row_max = masked_row_max
         _tmem_sp_sdata[id(self)] = s_data
-        row_max_safe = row_max
-        if row_max == -Float32.inf:
-            row_max_safe = Float32(0.0)
-        return old_row_max, row_max_safe
+        return old_row_max, row_max
 
     @cute.jit
     def _exp2_p_store(
@@ -3333,7 +3345,7 @@ class TmemSPResource(MemoryResource):
             dtype=self.cfg.v_dtype,
         )
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
-        minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
+        minus_row_max_scale = _softmax_exp2_bias(row_max, scale, p_scale_log2)
         if cutlass.const_expr(chunk_hi < num_chunks):
             # A later range reads the same S data.
             s_data = _tmem_sp_sdata[id(self)]
@@ -3529,7 +3541,7 @@ class TmemSPResource(MemoryResource):
         store_group_words = 4
         words_per_chunk = 2 * store_group_words
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
-        minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
+        minus_row_max_scale = _softmax_exp2_bias(row_max, scale, p_scale_log2)
         s_data = _tmem_sp_sdata.pop(id(self))
         local_sum_chains = cutlass.Array(
             Float32,
@@ -3690,7 +3702,7 @@ class TmemSPResource(MemoryResource):
         tmem_x = self.cfg.tmem_x_load_s
         num_values = self.cfg.qk_mma_tiler[1]
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
-        minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
+        minus_row_max_scale = _softmax_exp2_bias(row_max, scale, p_scale_log2)
         s_data = _tmem_sp_sdata.pop(id(self))
 
         fma_values: tuple[Any, ...] = ()
@@ -3839,9 +3851,9 @@ class TmemSPResource(MemoryResource):
         else:
             is_tail_tile = stage_info.loop_offset == stage_info.loop_end - Int32(1)
         if is_tail_tile:
-            neg_inf = cutlass.vector.full(
+            masked_values = cutlass.vector.full(
                 [tmem_x],
-                self.cfg.qk_acc_dtype(-Float32.inf),
+                self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
                 dtype=self.cfg.qk_acc_dtype,
             )
             for chunk_idx in cutlass.range_constexpr(num_chunks):
@@ -3854,7 +3866,7 @@ class TmemSPResource(MemoryResource):
                 )
                 mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
                 s_data[chunk_idx] = cutlass.vector.where(
-                    mask, s_data[chunk_idx], neg_inf
+                    mask, s_data[chunk_idx], masked_values
                 )
         return self._reduce_row_max(s_data, row_max)
 
@@ -3880,9 +3892,9 @@ class TmemSPResource(MemoryResource):
         kv_base = kv_tile_idx * self.cfg.kv_tile_n
         kv_end = kv_base + Int32(self.cfg.kv_tile_n)
         if seqlen_k < kv_end:
-            neg_inf = cutlass.vector.full(
+            masked_values = cutlass.vector.full(
                 [tmem_x],
-                self.cfg.qk_acc_dtype(-Float32.inf),
+                self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
                 dtype=self.cfg.qk_acc_dtype,
             )
             for chunk_idx in cutlass.range_constexpr(num_chunks):
@@ -3893,7 +3905,7 @@ class TmemSPResource(MemoryResource):
                 )
                 mask = cutlass.vector.create_mask([tmem_x], [valid_in_chunk])
                 s_data[chunk_idx] = cutlass.vector.where(
-                    mask, s_data[chunk_idx], neg_inf
+                    mask, s_data[chunk_idx], masked_values
                 )
         return self._reduce_row_max(s_data, row_max)
 
@@ -3996,8 +4008,10 @@ class TmemSPResource(MemoryResource):
             )
         kv_tile_abs = kv_tile_start + stage_info.loop_offset
 
-        neg_inf = cutlass.vector.full(
-            [tmem_x], self.cfg.qk_acc_dtype(-Float32.inf), dtype=self.cfg.qk_acc_dtype
+        masked_values = cutlass.vector.full(
+            [tmem_x],
+            self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
+            dtype=self.cfg.qk_acc_dtype,
         )
         all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
 
@@ -4019,7 +4033,9 @@ class TmemSPResource(MemoryResource):
                 )
                 right_mask = cutlass.vector.create_mask([tmem_x], [right_oob_start_idx])
                 mask = mask & right_mask
-            s_data[chunk_idx] = cutlass.vector.where(mask, s_data[chunk_idx], neg_inf)
+            s_data[chunk_idx] = cutlass.vector.where(
+                mask, s_data[chunk_idx], masked_values
+            )
 
         return self._reduce_row_max(s_data, row_max)
 
@@ -4195,13 +4211,13 @@ class TmemSPResource(MemoryResource):
                     all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
                     left_mask = left_mask_inverted ^ all_true_mask
                     mask = mask & left_mask
-                neg_inf = cutlass.vector.full(
+                masked_values = cutlass.vector.full(
                     [tmem_x],
-                    self.cfg.qk_acc_dtype(-Float32.inf),
+                    self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
                     dtype=self.cfg.qk_acc_dtype,
                 )
                 s_data[chunk_idx] = cutlass.vector.where(
-                    mask, s_data[chunk_idx], neg_inf
+                    mask, s_data[chunk_idx], masked_values
                 )
         return self._reduce_row_max(s_data, row_max)
 
@@ -4244,11 +4260,11 @@ class TmemSPResource(MemoryResource):
                     Int32(tmem_x),
                 )
                 causal_mask = cutlass.vector.create_mask([tmem_x], [num_valid])
-                neg_inf_vec = cutlass.vector.full_like(
-                    s_data[chunk_idx], Float32(-Float32.inf)
+                masked_values_vec = cutlass.vector.full_like(
+                    s_data[chunk_idx], Float32(_SOFTMAX_MASK_VALUE)
                 )
                 s_data[chunk_idx] = cutlass.vector.where(
-                    causal_mask, s_data[chunk_idx], neg_inf_vec
+                    causal_mask, s_data[chunk_idx], masked_values_vec
                 )
         return s_data
 
@@ -4316,11 +4332,8 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Tail stage for softmax group 0: identity row_max, no S load."""
-        row_max_safe = row_max
-        if row_max == -Float32.inf:
-            row_max_safe = Float32(0.0)
         _ = stage_info
-        return row_max, row_max_safe
+        return row_max, row_max
 
     @consumer_work
     @cute.jit
@@ -4387,7 +4400,9 @@ class TmemSPResource(MemoryResource):
         _ = stage_info
         threshold = Float32(self.cfg.corr_skip_threshold_log2)
         frozen = row_max
-        if (row_max - old_row_max) * scale_softmax_log2 <= threshold:
+        if (old_row_max != Float32(_SOFTMAX_MASK_VALUE)) & (
+            (row_max - old_row_max) * scale_softmax_log2 <= threshold
+        ):
             frozen = old_row_max
         return frozen
 
@@ -4540,8 +4555,13 @@ class TmemStatsResource(MemoryResource):
 
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     tmem_vec_offset: Constexpr[int] = field(init=False, default=None)
-    scale_softmax_log2: cute.Tensor | None = field(init=False, default=None)
-    output_scale: cute.Tensor | None = field(init=False, default=None)
+    scale_softmax_log2: Float32 | None = field(init=False, default=None)
+    output_scale: Float32 | None = field(init=False, default=None)
+    lse_output: cute.Tensor | None = field(init=False, default=None)
+    attention_sinks: cute.Tensor | None = field(init=False, default=None)
+    cum_seqlen_q: cute.Tensor | None = field(init=False, default=None)
+    query_seq_len: Int32 | int = field(init=False, default=0)
+    peer_idx: Constexpr[int] = field(init=False, default=0)
     tmem_addr_cached: TmemAddr | None = field(init=False, default=None)
     # Precomputed per-warp TMEM vec address (once, before persistent loop).
     tmem_vec_addr_cached: TmemAddr | None = field(init=False, default=None)
@@ -4559,8 +4579,13 @@ class TmemStatsResource(MemoryResource):
         pipeline_config: PipelineConfig,
         cfg: FmhaConfig,
         tmem_vec_offset: int,
-        scale_softmax_log2: cute.Tensor | None = None,
-        output_scale: cute.Tensor | None = None,
+        scale_softmax_log2: Float32 | None = None,
+        output_scale: Float32 | None = None,
+        lse_output: cute.Tensor | None = None,
+        attention_sinks: cute.Tensor | None = None,
+        cum_seqlen_q: cute.Tensor | None = None,
+        query_seq_len: Int32 | int = 0,
+        peer_idx: int = 0,
         **kwargs: Any,
     ) -> None:
         """Bind the correction-stat TMEM vector offset and allocation."""
@@ -4569,6 +4594,11 @@ class TmemStatsResource(MemoryResource):
         self.tmem_vec_offset = tmem_vec_offset
         self.scale_softmax_log2 = scale_softmax_log2
         self.output_scale = output_scale
+        self.lse_output = lse_output
+        self.attention_sinks = attention_sinks
+        self.cum_seqlen_q = cum_seqlen_q
+        self.query_seq_len = query_seq_len
+        self.peer_idx = peer_idx
         self._alloc = TmemAllocation(f"tmem_vec_{tmem_vec_offset}", cfg.tmem_stats_cols)
         self._smem_alloc = None
         if cfg.stats_via_smem:
@@ -4664,7 +4694,7 @@ class TmemStatsResource(MemoryResource):
         if cutlass.const_expr(self.scale_softmax_log2 is None):
             # Safe fallback for validation-only resource construction.
             return Float32(0.0)
-        return self.scale_softmax_log2[0]
+        return self.scale_softmax_log2
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns="output_scale_value")
     @cute.jit
@@ -4674,7 +4704,7 @@ class TmemStatsResource(MemoryResource):
         if cutlass.const_expr(self.output_scale is None):
             # Identity fallback for validation-only resource construction.
             return Float32(1.0)
-        return self.output_scale[0]
+        return self.output_scale
 
     @cute.jit
     def _init_work_tile_state(self, stage_info: StageInfo) -> None:
@@ -4842,8 +4872,62 @@ class TmemStatsResource(MemoryResource):
         else:
             vec_row_sum = vec_rmem[0]
             vec_old_max = vec_new_max
-        _ = stage_info
+        if cutlass.const_expr(
+            final_stats
+            and (self.lse_output is not None or self.attention_sinks is not None)
+        ):
+            scale *= self._store_final_lse(
+                stage_info, vec_new_max, vec_row_sum, scale_softmax_log2
+            )
         return vec_old_max, vec_new_max, vec_row_sum, scale
+
+    @cute.jit
+    def _store_final_lse(self, stage_info, row_max, row_sum, scale_softmax_log2):
+        # Match GmemO's logical row mapping, including paired heads/queries and
+        # cluster tiles. Correction has one thread for each physical Q row.
+        seq_tile, head_tile, batch = _resolve_work_tile_coords(
+            self.cfg, stage_info.work_tile.tile_idx
+        )
+        head = (
+            head_tile * self.cfg.work_tile_q_heads
+            + self.peer_idx * self.cfg.peer_q_head_stride
+        )
+        row = cute.arch.thread_idx()[0] % Int32(128)
+        query = (
+            seq_tile * self.cfg.work_tile_q_seq_tiles
+            + self.peer_idx * self.cfg.peer_q_seq_tile_stride
+        ) * self.cfg.q_tile_m + row
+        heads = (
+            Int32(self.lse_output.shape[-1])
+            if self.lse_output is not None
+            else Int32(self.attention_sinks.shape[0])
+        )
+        weight = Float32(1.0)
+        start = Int32(0)
+        length = Int32(self.query_seq_len)
+        if cutlass.const_expr(self.cum_seqlen_q is not None):
+            start = Int32(self.cum_seqlen_q[batch])
+            length = Int32(self.cum_seqlen_q[batch + Int32(1)]) - start
+        if query < length and head < heads:
+            flat_query = batch * length + query
+            if cutlass.const_expr(self.cum_seqlen_q is not None):
+                flat_query = start + query
+            value = Float32(-Float32.inf)
+            if row_sum > Float32(0.0):
+                value = (
+                    scale_softmax_log2 * row_max
+                    + cute.math.log2(row_sum, fastmath=True)
+                    - Float32(self.cfg.pv_p_scale_log2)
+                )
+            if cutlass.const_expr(self.attention_sinks is not None):
+                sink = Float32(self.attention_sinks[head]) * Float32(1.4426950408889634)
+                value, weight, _ = merge_log2_lse(value, sink)
+            if cutlass.const_expr(self.lse_output is not None):
+                offset = cutlass.Int64(flat_query) * cutlass.Int64(
+                    heads
+                ) + cutlass.Int64(head)
+                (self.lse_output.iterator + offset).store(value)
+        return weight
 
     @consumer_work(returns=(vec_old_max, vec_new_max, vec_row_sum, vec_scale))
     @cute.jit
@@ -5310,9 +5394,9 @@ class TmemOResource(MemoryResource):
         Uses inst_idx to select O0/O1 and forwards row_sum to
         SmemO.producer_vars for the tail epilog.
 
-        With skip_correction enabled: uses vote_ballot_sync to check if
-        old_max == new_max across all threads. If true, scale=1.0 and
-        we skip the expensive TMEM load+rescale+store.
+        With skip_correction enabled, rescale only when a row with prior
+        visible keys changes its maximum. Empty histories and unchanged
+        maxima skip the TMEM load+rescale+store.
         """
         # Select O offset from captured correction-call position.
         if cutlass.const_expr(self.cfg.single_qkv_instance or inst_idx == 0):
@@ -5336,7 +5420,13 @@ class TmemOResource(MemoryResource):
         # Check if we should skip correction (when old_max == new_max)
         should_rescale = cutlass.Boolean(True)
         if cutlass.const_expr(self.cfg.enable_skip_correction):
-            vote_ballot_cnt = cute.arch.vote_ballot_sync(vec_old_max != vec_new_max)
+            # A neutral old maximum means every prior P tile was zero.
+            # The first visible tile establishes an anchor but has no old O
+            # contribution to rescale, including a late first tile in one Q peer.
+            needs_rescale = (vec_old_max != vec_new_max) & (
+                vec_old_max != Float32(_SOFTMAX_MASK_VALUE)
+            )
+            vote_ballot_cnt = cute.arch.vote_ballot_sync(needs_rescale)
             should_rescale = vote_ballot_cnt != Int32(0)
 
         scale = Float32(1.0)
