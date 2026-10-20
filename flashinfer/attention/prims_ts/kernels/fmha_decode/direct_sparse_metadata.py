@@ -61,6 +61,7 @@ class DirectSparseMetadataView:
         fragment_size=4,
         head=0,
         count_current_block_in_topk=True,
+        fixed_query_len=0,
     ):
         self.values = (*inputs, qo_indptr, head)
         self.packed = packed
@@ -70,6 +71,7 @@ class DirectSparseMetadataView:
         self.lengths = lengths
         self.sparse_block_size = sparse_block_size
         self.count_current_block_in_topk = count_current_block_in_topk
+        self.fixed_query_len = fixed_query_len
         self.fragment_size = fragment_size
         self.fragments_per_block = sparse_block_size // fragment_size
 
@@ -89,6 +91,7 @@ class DirectSparseMetadataView:
             sparse_block_size=self.sparse_block_size,
             fragment_size=self.fragment_size,
             count_current_block_in_topk=self.count_current_block_in_topk,
+            fixed_query_len=self.fixed_query_len,
             head=new[5],
         )
 
@@ -104,6 +107,7 @@ class DirectSparseMetadataView:
             sparse_block_size=self.sparse_block_size,
             fragment_size=self.fragment_size,
             count_current_block_in_topk=self.count_current_block_in_topk,
+            fixed_query_len=self.fixed_query_len,
             head=head,
         )
 
@@ -123,8 +127,20 @@ class DirectSparseMetadataView:
         request = Int32(-1)
         visible = Int32(0)
         if valid:
-            request = Int32(requests[row])
-            position = Int64(positions[row])
+            if cutlass.const_expr(self.fixed_query_len > 0):
+                request = row // Int32(self.fixed_query_len)
+                # Fixed Q ends at the per-request KV length.
+                length = Int64(positions[request])
+                position = Int64(-1)
+                if length > Int64(0):
+                    position = (
+                        length
+                        - Int64(self.fixed_query_len)
+                        + Int64(row % Int32(self.fixed_query_len))
+                    )
+            else:
+                request = Int32(requests[row])
+                position = Int64(positions[row])
             valid = (
                 (request >= Int32(0))
                 & (request < Int32(table.shape[0]))

@@ -98,9 +98,21 @@ struct QTokenKvBlockSparseTouchedMetadataParams {
   // True: a complete current block competes inside top-k; append only a partial tail.
   // False: exclude the current block from top-k and always append its visible tokens.
   bool count_current_block_in_topk;
+  // Nonzero for request-aligned fixed Q; query_positions then stores KV lengths.
+  int32_t fixed_query_len;
 };
 
 namespace detail {
+
+template <typename PositionType>
+__device__ __forceinline__ int64_t
+QueryPosition(const QTokenKvBlockSparseTouchedMetadataParams<PositionType>& params, int32_t row) {
+  if (params.fixed_query_len > 0) {
+    const int64_t length = params.query_positions[row / params.fixed_query_len];
+    return length > 0 ? length - params.fixed_query_len + row % params.fixed_query_len : -1;
+  }
+  return static_cast<int64_t>(params.query_positions[row]);
+}
 
 // Excluding the current block leaves it outside the selection budget even
 // when its last token completes the block.
@@ -196,8 +208,9 @@ __device__ __forceinline__ void InitRoute(
   int32_t lane_request = -1;
   int64_t lane_position = -1;
   if (lane < query_count) {
-    lane_request = params.token_to_request[first_row + lane];
-    lane_position = static_cast<int64_t>(params.query_positions[first_row + lane]);
+    lane_request = params.fixed_query_len > 0 ? (first_row + lane) / params.fixed_query_len
+                                              : params.token_to_request[first_row + lane];
+    lane_position = QueryPosition(params, first_row + lane);
   }
   const int32_t request = __shfl_sync(0xffffffffu, lane_request, 0);
   const int64_t first_position = __shfl_sync(0xffffffffu, static_cast<long long>(lane_position), 0);
@@ -739,7 +752,7 @@ __launch_bounds__(kQTokenKvBlockSparseBitmapBlockThreads) void QTokenKvBlockSpar
       const int64_t row = static_cast<int64_t>(group) * GroupSize + query;
       if (query < static_cast<uint32_t>(GroupSize) &&
           query_item < static_cast<uint32_t>(params.block_topk) && row < params.rows) {
-        const int64_t position = static_cast<int64_t>(params.query_positions[row]);
+        const int64_t position = QueryPosition(params, static_cast<int32_t>(row));
         if (position >= 0 && position < params.max_seq_len_kv &&
             query_item < static_cast<uint64_t>(SelectedBlockBound(params, position + 1))) {
           prefetched_blocks[item] =

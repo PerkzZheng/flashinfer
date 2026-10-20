@@ -112,6 +112,7 @@ class _DirectQ1CompileSpec(NamedTuple):
     kv_block_size: int
     page_capacity: int
     count_current_block_in_topk: bool = True
+    fixed_query_len: int = 0
 
 
 @dataclass(frozen=True)
@@ -1643,6 +1644,7 @@ def _get_compiled_decode(
                 page_capacity=direct_q1_spec.page_capacity,
                 sparse_block_size=direct_q1_spec.kv_block_size,
                 count_current_block_in_topk=direct_q1_spec.count_current_block_in_topk,
+                fixed_query_len=direct_q1_spec.fixed_query_len,
                 fragment_size=static_cfg.num_tokens_per_page,
                 lengths=True,
             )
@@ -1655,6 +1657,7 @@ def _get_compiled_decode(
                 page_capacity=direct_q1_spec.page_capacity,
                 sparse_block_size=direct_q1_spec.kv_block_size,
                 count_current_block_in_topk=direct_q1_spec.count_current_block_in_topk,
+                fixed_query_len=direct_q1_spec.fixed_query_len,
                 fragment_size=static_cfg.num_tokens_per_page,
                 lengths=False,
             )
@@ -1751,6 +1754,7 @@ def _get_compiled_decode(
                     page_capacity=direct_q1_spec.page_capacity,
                     sparse_block_size=direct_q1_spec.kv_block_size,
                     count_current_block_in_topk=direct_q1_spec.count_current_block_in_topk,
+                    fixed_query_len=direct_q1_spec.fixed_query_len,
                     fragment_size=static_cfg.num_tokens_per_page,
                     lengths=True,
                 )
@@ -1908,10 +1912,14 @@ def _get_compiled_decode(
                 stride=(cute.sym_int64(), 1),
                 assumed_align=4,
             ),
-            fake_compact(Int32, (rows,), 4),
+            (
+                None
+                if direct_q1_spec.fixed_query_len
+                else fake_compact(Int32, (rows,), 4)
+            ),
             fake_compact(
                 Int64 if direct_q1_spec.position_dtype_key == "int64" else Int32,
-                (rows,),
+                (cute.sym_int(),) if direct_q1_spec.fixed_query_len else (rows,),
                 4,
             ),
         )
@@ -2504,7 +2512,7 @@ class PrimsTSBatchDecodePlan:
     _workspace: _DecodeWorkspaceViews
     _compiled_main: Callable[..., object]
     _compiled_reducer: Optional[Callable[..., object]]
-    _direct_q1_inputs: tuple[torch.Tensor, ...] = ()
+    _direct_q1_inputs: tuple[Optional[torch.Tensor], ...] = ()
     _flat_locator_heads: int = 1
 
     def run(
@@ -2551,7 +2559,7 @@ class PrimsTSBatchDecodePlan:
         out: torch.Tensor,
         scale_qk: float,
         scale_v: float,
-        direct_q1_inputs: Optional[tuple[torch.Tensor, ...]] = None,
+        direct_q1_inputs: Optional[tuple[Optional[torch.Tensor], ...]] = None,
     ) -> torch.Tensor:
         """Launch state already proven by a framework-owned outer plan."""
 
@@ -3376,9 +3384,10 @@ def _prepare_prims_ts_batch_decode_plan(
     use_q_token_kv_block_sparse_route: bool = False,
     use_pdl: bool = False,
     split_kv: bool = True,
-    direct_q1_inputs: tuple[torch.Tensor, ...] = (),
+    direct_q1_inputs: tuple[Optional[torch.Tensor], ...] = (),
     direct_q1_max_model_len: Optional[int] = None,
     direct_q1_sparse_block_size: int = 4,
+    direct_q1_fixed_query_len: int = 0,
     count_current_block_in_topk: bool = True,
     share_pattern_across_kv_heads: bool = True,
     allow_head_aware_locators: bool = False,
@@ -3549,6 +3558,7 @@ def _prepare_prims_ts_batch_decode_plan(
     if direct_q1_inputs:
         assert use_q_token_kv_block_sparse_route and seq_len_q == 1
         assert direct_q1_max_model_len is not None
+        assert direct_q1_inputs[0] is not None and direct_q1_inputs[3] is not None
         direct_q1_spec = _DirectQ1CompileSpec(
             position_dtype_key=str(direct_q1_inputs[3].dtype).removeprefix("torch."),
             max_seq_len_kv=direct_q1_max_model_len,
@@ -3556,6 +3566,7 @@ def _prepare_prims_ts_batch_decode_plan(
             kv_block_size=direct_q1_sparse_block_size,
             count_current_block_in_topk=count_current_block_in_topk,
             page_capacity=max_num_pages,
+            fixed_query_len=direct_q1_fixed_query_len,
         )
     flat_native_kv_tma = (
         use_q_token_kv_block_sparse_route

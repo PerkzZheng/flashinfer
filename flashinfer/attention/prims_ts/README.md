@@ -159,6 +159,15 @@ be divisible by a suggested group: packed mode permits a shorter final route,
 while fixed mode may append consecutive semantic dummy rows and discard their
 outputs.
 
+For request-aligned fixed Q, `run(..., seq_lens=kv_lengths)` may omit
+`token_to_request` and `query_positions`. `kv_lengths` is a contiguous CUDA
+Int32/Int64 `[B]` tensor including the request's `Nq * G` query tokens.
+The existing attention/metadata kernels derive request IDs and positions
+without allocating per-token metadata or launching another preparation
+kernel. Nonpositive KV lengths mark inactive requests; positive lengths must
+cover all query tokens. Packed Q and arbitrary mappings continue to accept
+explicit per-token metadata.
+
 Packed Q uses a bounded `[D, Hq, total_q_tokens]` TensorMap. Per-route masks
 handle tiles crossing a request boundary, and the physical token extent
 bounds the final tile. FP8 queries need no extra tail allocation or staging copy.

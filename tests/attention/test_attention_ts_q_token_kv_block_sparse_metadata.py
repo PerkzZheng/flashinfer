@@ -381,11 +381,14 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "indexer_block_ids",
         "token_to_request",
         "query_positions",
+        "seq_lens",
         "qo_indptr",
         "sm_scale",
         "v_scale",
         "out",
     )
+    assert run_parameters["token_to_request"].default is None
+    assert run_parameters["query_positions"].default is None
 
 
 @pytest.mark.parametrize(
@@ -4854,6 +4857,123 @@ def _check_current_block_budget_case(
     if fp8:
         difference = out.reshape_as(expected).float() - expected.float()
         assert difference.norm() <= 0.05 * expected.float().norm().clamp_min(1e-6)
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize("query_len,group_size", ((1, 1), (4, 1), (4, 4)))
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
+def test_fixed_query_lengths_match_explicit_metadata_and_replay(
+    query_len, group_size, dtype
+):
+    """Derive request/position metadata, including live/inactive graph transitions."""
+    torch.manual_seed(827)
+    batch, heads, kv_heads, dim, context, page_size, topk = 3, 16, 2, 192, 128, 16, 8
+    q = (
+        torch.randn(
+            batch, query_len // group_size, group_size, heads, dim, device="cuda"
+        )
+        * 0.2
+    ).to(dtype)
+    pages = batch * context // page_size
+    cache = (torch.randn(pages, kv_heads, page_size, 2 * dim, device="cuda") * 0.2).to(
+        dtype
+    )
+    key, value = cache[..., :dim], cache[..., dim:]
+    table = torch.randperm(pages, device="cuda", dtype=torch.int32).view(batch, -1)
+    ids = torch.empty(
+        batch * query_len, kv_heads, topk, device="cuda", dtype=torch.int32
+    )
+    requests = torch.empty(batch * query_len, device="cuda", dtype=torch.int32)
+    positions = torch.empty(batch * query_len, device="cuda", dtype=torch.int64)
+    length_dtype = (
+        torch.int64 if query_len == 4 and dtype == torch.bfloat16 else torch.int32
+    )
+    seq_lens = torch.empty(batch, device="cuda", dtype=length_dtype)
+    actual = torch.empty_like(q, dtype=torch.bfloat16)
+    expected = torch.empty_like(actual)
+
+    def make_wrapper():
+        workspace = torch.empty(
+            get_q_token_kv_block_sparse_workspace_size(
+                q,
+                key,
+                table,
+                group_size=group_size,
+                block_topk=topk,
+                max_seq_len_kv=context,
+                kv_block_size=8,
+                split_kv=True,
+                share_pattern_across_kv_heads=False,
+                count_current_block_in_topk=False,
+                o_data_type=torch.bfloat16,
+            ),
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        wrapper = QTokenKvBlockSparsePagedTSWrapper()
+        wrapper.plan(
+            batch * query_len // group_size,
+            heads,
+            kv_heads,
+            dim,
+            8,
+            page_size,
+            topk,
+            context,
+            device="cuda",
+            workspace_buffer=workspace,
+            group_size=group_size,
+            q_data_type=dtype,
+            o_data_type=torch.bfloat16,
+            split_kv=True,
+            share_pattern_across_kv_heads=False,
+            count_current_block_in_topk=False,
+        )
+        return wrapper
+
+    explicit, derived = make_wrapper(), make_wrapper()
+
+    def update(lengths):
+        host_ids = torch.full(ids.shape, -1, dtype=torch.int32)
+        host_positions, host_requests = [], []
+        for request, length in enumerate(lengths):
+            for offset in range(query_len):
+                row = request * query_len + offset
+                position = length - query_len + offset if length > 0 else -1
+                host_positions.append(position)
+                host_requests.append(request if length > 0 else -1)
+                for head in range(kv_heads):
+                    history = max(position // 8, 0)
+                    count = min(topk, history)
+                    host_ids[row, head, :count] = torch.randperm(history)[:count]
+        ids.copy_(host_ids)
+        requests.copy_(torch.tensor(host_requests, dtype=torch.int32))
+        positions.copy_(torch.tensor(host_positions, dtype=torch.int64))
+        seq_lens.copy_(torch.tensor(lengths, dtype=length_dtype))
+
+    def run():
+        return derived.run(q, (key, value), table, ids, seq_lens=seq_lens, out=actual)
+
+    update((124, 117, 0))
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for lengths in ((124, 117, 0), (128, 93, 64), (-1, 127, 120)):
+        update(lengths)
+        actual.fill_(0.25)
+        expected.fill_(0.25)
+        explicit.run(q, (key, value), table, ids, requests, positions, out=expected)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.02)
+
+    # Eager calls may replace metadata storage without changing its ABI.
+    replacement_lengths = seq_lens.clone()
+    seq_lens.zero_()
+    actual.fill_(0.25)
+    derived.run(q, (key, value), table, ids, seq_lens=replacement_lengths, out=actual)
+    torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.02)
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
