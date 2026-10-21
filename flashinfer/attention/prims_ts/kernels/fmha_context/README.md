@@ -1,9 +1,9 @@
 # Task-Scheduled FMHA Context
 
-Model plans can omit batch size and Q/KV length bounds; execution metadata
-belongs to `run()`. The [shared model-plan contract](../../README.md#reusable-model-plans)
-describes workspace sizing, standalone queries, warmup and CUDA graph lifetime.
-Examples below use model-only planning and run-time execution bounds.
+Plans select cached kernel policies and compile/load kernels using explicit
+batch size and Q/KV bounds. Live request metadata belongs to `run()`.
+The [shared planning contract](../../README.md#reusable-plans) describes
+workspace sizing, standalone queries, cache reuse and CUDA graph lifetime.
 
 This directory contains the CuTe DSL task-scheduled (TS) FMHA context/prefill
 kernel used by FlashInfer's experimental Blackwell APIs. One implementation
@@ -40,18 +40,17 @@ These experimental context entry points are not currently registered with
 `fi_trace`. This exclusion is specific to context and does not limit tracing
 support for other PrimTS APIs.
 
-Both reusable wrappers retain device, head geometry, dtype, mask, window,
-and host scalar defaults in `plan()`. Batch and Q/KV lengths belong to `run()`;
-warmup resolves and compiles native variants. The contiguous plan fixes `packed`
-(`False` for BSHD, `True` for THD); paged plans fix page size and optional
-`uniform_packed_lengths`, `has_q_offset`, and `paged_v_tail_is_zero` promises.
+Both wrappers select and compile/load their cached execution in `plan()`.
+Batch is exact; fixed contiguous Q/KV extents are exact, while packed/paged
+request lengths stay within the provided Q/KV bounds. Every `run()` supplies
+current tensors/metadata and launches the prepared execution.
 
-Every run supplies current Q/K/V and metadata. Neither plan allocates device
-scale tensors. Contiguous variable-window executions retain fallback scratch
-for CTA start minima when callers omit them; paged plans need no scratch.
-Validation reads metadata values on the host. Trusted/captured execution uses
-`validate=False`, explicit host bounds and stable tensor addresses. Callers then
-own every shape, value, alignment, aliasing and lifetime precondition.
+The contiguous plan fixes `packed` (BSHD or THD); paged plans also fix page size
+and optional `uniform_packed_lengths`, `has_q_offset`, and zero-V-tail promises.
+Plans retain host scalar defaults without device scale tensors. Variable-window
+plans allocate fallback CTA-minimum metadata; paged plans need no scratch.
+Validation can read metadata values on the host. Trusted/captured execution uses
+`validate=False` and stable addresses, with callers owning all preconditions.
 
 ## Supported contract
 
@@ -277,7 +276,7 @@ k = torch.randn(B, Sk, Hkv, D, device=device, dtype=torch.bfloat16)
 v = torch.randn_like(k)
 
 wrapper = BatchPrefillTSWrapper()
-wrapper.plan(device=q.device, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, q_dtype=q.dtype, k_dtype=k.dtype, mask_type='causal')
+wrapper.plan(device=q.device, batch_size=B, max_seq_len_q=Sq, max_kv_len=Sk, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, q_dtype=q.dtype, k_dtype=k.dtype, mask_type='causal')
 out = wrapper.run(q, k, v)
 assert out.shape == q.shape
 ```
@@ -289,7 +288,7 @@ q = torch.randn(1, 8192, 96, 192, device="cuda", dtype=torch.bfloat16)
 k = torch.randn(1, 8192, 1, 192, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(1, 8192, 1, 128, device="cuda", dtype=torch.bfloat16)
 wrapper = BatchPrefillTSWrapper()
-wrapper.plan(device=q.device, num_qo_heads=96, num_kv_heads=1, head_dim=192, head_dim_vo=128, q_dtype=q.dtype, k_dtype=k.dtype, mask_type='causal', out_dtype=torch.bfloat16)
+wrapper.plan(device=q.device, batch_size=1, max_seq_len_q=8192, max_kv_len=8192, num_qo_heads=96, num_kv_heads=1, head_dim=192, head_dim_vo=128, q_dtype=q.dtype, k_dtype=k.dtype, mask_type='causal', out_dtype=torch.bfloat16)
 out = wrapper.run(q, k, v)
 assert out.shape == (1, 8192, 96, 128)
 ```
@@ -321,7 +320,7 @@ block_tables = torch.tensor(
 seq_lens_kv = torch.tensor(kv_lens, device=device, dtype=torch.int32)
 
 wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
-wrapper.plan(device=q.device, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, q_dtype=q.dtype, k_dtype=k_cache.dtype, out_dtype=q.dtype, page_size=page_size, mask_type='causal')
+wrapper.plan(device=q.device, batch_size=B, max_seq_len_q=max(q_lens), max_kv_len=max(kv_lens), num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, q_dtype=q.dtype, k_dtype=k_cache.dtype, out_dtype=q.dtype, page_size=page_size, mask_type='causal')
 out = wrapper.run(
     q,
     k_cache,

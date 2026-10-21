@@ -1,9 +1,9 @@
 # Task-Scheduled FMHA Decode
 
-Model plans can omit batch size and Q/KV length bounds; execution metadata
-belongs to `run()`. The [shared model-plan contract](../../README.md#reusable-model-plans)
-describes workspace sizing, standalone queries, warmup and CUDA graph lifetime.
-Examples below use model-only planning and run-time execution bounds.
+Plans select cached kernel policies and compile/load kernels using explicit
+batch size and Q/KV bounds. Live request metadata belongs to `run()`.
+The [shared planning contract](../../README.md#reusable-plans) describes
+workspace sizing, standalone queries, cache reuse and CUDA graph lifetime.
 
 This directory contains the CuTe DSL task-scheduled (TS) FMHA kernel used by
 FlashInfer's experimental paged decode APIs on NVIDIA Blackwell GPUs. It
@@ -89,7 +89,7 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchDecodePagedTSWrapper` | Reusable model-only `plan()` with per-run K/V lengths. |
+| `BatchDecodePagedTSWrapper` | Reusable eager `plan()` with explicit problem bounds and optional owned K/V lengths. |
 | `batch_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
 | `prepare_prims_ts_batch_decode_with_kv_cache` | Validate and compile a standalone launch once for a lightweight graph-safe `run()`. |
@@ -98,11 +98,11 @@ Trace a warmed stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The bound state supplies the selected query mode and output dtype. Trace
 extensions for the new capabilities are deferred.
 
-`plan()` takes model configuration and optional scratch, with no batch or
-Q/KV length parameters. Every `run()` supplies live query/cache, sequence lengths,
-a row-strided page table, and offsets for packed Q. Fixed Q sizes follow tensor
-shapes; packed Q requires host `max_seq_len_q`, and trusted execution requires
-host `max_kv_len`. Native variants are compiled during warmup before capture.
+`plan()` takes model configuration, exact batch size, Q/KV bounds and optional
+scratch. It selects cached policy, obtains compiled kernels and binds resources.
+Every `run()` supplies query/cache, page tables and packed-Q offsets when needed.
+Live K/V lengths come from each run unless `plan(seq_lens=...)` owns a CUDA copy.
+Fixed Q length is exact; packed Q lengths stay within planned `max_seq_len_q`.
 Validation is enabled by default and may synchronize metadata to the host.
 
 ## Dense page tables only
@@ -182,14 +182,14 @@ have padded storage.
   scratch. The unified one-shot API also supports trusted capture-safe calls
   with caller workspace, `out`, explicit `max_kv_len`, and `validate=False`;
   packed Q additionally requires `max_seq_len_q`. Warm the selected execution
-  before capture and supply `lse` when LSE is enabled. See the shared model-plan
+  before capture and supply `lse` when LSE is enabled. See the shared planning
   contract for workspace initialization and lifetime rules.
 
 For every request `b`, the fixed table must satisfy
 `ceil(seq_lens[b] / page_size) <= C`. Only that active row prefix must contain
 valid physical page IDs; inactive tail entries are never read.
 Query offsets start at zero, increase strictly, end at the packed Q extent,
-and have every delta no larger than the runtime `max_seq_len_q`. Causal
+and have every delta no larger than the planned `max_seq_len_q`. Causal
 attention additionally requires each fixed or packed per-request Q length to
 be no greater than the corresponding K/V length.
 
@@ -271,8 +271,8 @@ max_seq_len = pages_per_request * page_size
 seq_lens = torch.full((B,), max_seq_len, device=device, dtype=torch.int32)
 
 wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
-wrapper.plan(q.device, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size, packed_query=False, q_data_type=q.dtype, k_data_type=kv.dtype, v_data_type=kv.dtype, o_data_type=q.dtype, mask_type='causal')
-out = wrapper.run(q, kv, seq_lens, block_tables, max_kv_len=max_seq_len)
+wrapper.plan(q.device, batch_size=B, max_seq_len_q=1, max_kv_len=max_seq_len, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size, packed_query=False, q_data_type=q.dtype, k_data_type=kv.dtype, v_data_type=kv.dtype, o_data_type=q.dtype, mask_type='causal')
+out = wrapper.run(q, kv, seq_lens, block_tables)
 assert out.shape == q.shape
 
 # The standalone API uses caller-owned scratch and explicit K/V lengths.
@@ -298,9 +298,8 @@ and workspaces for concurrent execution. Caller-owned scratch must remain alive
 and must not overlap Q, K/V cache, metadata, or output storage.
 
 With default `validate=True`, each wrapper run checks the fixed table, effective
-K/V lengths, packed offsets when present, tensors, and output. Plan-owned
-lengths and their specialization predicates were validated by `plan()` and are
-not revalidated against a second length vector. Once the caller has established
+K/V lengths, packed offsets when present, tensors, and output. When the plan
+owns sequence lengths, pass `None` for the run's length argument. Once the caller has established
 the remaining conditions, `validate=False` avoids explicit checks and host
 metadata reads. Invalid run-owned lengths, page IDs, or offsets in that mode
 may cause incorrect results or out-of-bounds access. Storage overlap is
@@ -310,7 +309,7 @@ run-owned metadata concurrently with a launch or replay that reads it.
 For the standalone workflow, query scratch with model head geometry, page
 size, device and split capability. Allocate contiguous, 32-byte-aligned CUDA
 `torch.int8` or `torch.uint8` scratch and zero it before its first trusted
-standalone launch. Model wrappers initialize the fixed control tail by default;
+standalone launch. Wrappers initialize the fixed control tail by default;
 ordinary batch/length changes do not require re-zeroing that tail. Tensor-bound
 prepared plans retain their own layouts and require reinitialization before
 sharing scratch with a different prepared layout. Do not share it

@@ -13,10 +13,10 @@ generated per-block scales. Dynamic scale composition belongs in upstream work.
 Index lists use `-1` for holes and need no 128-entry padding.
 The kernel keeps source boundaries aligned to its KV tiles internally.
 The dense API contract below retains its 512-latent plus 64-RoPE layout.
-Model plans can omit batch size and Q/KV length bounds; execution metadata
-belongs to `run()`. The [shared model-plan contract](../../README.md#reusable-model-plans)
-describes workspace sizing, standalone queries, warmup and CUDA graph lifetime.
-Examples below use model-only planning and run-time execution bounds.
+Plans select cached kernel policies and compile/load kernels using explicit
+batch size and Q/KV bounds. Live request metadata belongs to `run()`.
+The [shared planning contract](../../README.md#reusable-plans) describes
+workspace sizing, standalone queries, cache reuse and CUDA graph lifetime.
 
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
 Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
@@ -39,7 +39,7 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 
 | API | Use |
 | --- | --- |
-| `BatchMLADecodePagedTSWrapper` | Reusable model or explicit capacity `plan()`, followed by per-run request metadata. |
+| `BatchMLADecodePagedTSWrapper` | Reusable eager capacity `plan()`, followed by per-run request metadata. |
 | `batch_mla_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_mla_decode_workspace_size` | Size caller-owned standalone scratch. |
 
@@ -47,24 +47,20 @@ Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
 carry the wrapper's plan-owned fixed-versus-packed query mode.
 
-A model `plan()` retains the device, head geometry, page size, dtypes, mask,
-and fixed-versus-packed query mode, and allocates or binds reusable scratch.
-Warmup `run()` calls prepare native execution variants. Explicit-batch capacity
-plans additionally fix Q/KV bounds and compile their native specialization in
-`plan()`. Neither form retains request metadata. Every `run()` supplies query,
-cache, block tables, and K/V lengths, plus offsets and a caller-provided
-`max_seq_len_q` for packed queries. Length bounds supplied to a model plan
-serve as defaults for `run()`. Validation is enabled by default. `validate=False`
-skips explicit wrapper checks and host metadata reads for a previously
-validated steady state or CUDA Graph launch; the caller then owns every value,
-bounds, aliasing, and lifetime precondition.
+`plan()` retains the device, exact batch size, Q/KV bounds, head geometry,
+page size, dtypes, mask and fixed-versus-packed query mode. It selects cached
+policy, obtains compiled kernels and binds reusable scratch before execution.
+Every `run()` supplies query, cache, page tables, live K/V lengths and packed-Q
+offsets when needed. Fixed Q length is exact; packed request lengths stay within
+planned `max_seq_len_q`. Validation is enabled by default. `validate=False`
+skips explicit checks and host metadata reads; callers own all preconditions.
 
 Convenience one-shot calls may read request metadata and allocate scratch.
 The same API supports trusted capture-safe execution with caller workspace,
 preallocated `out`, explicit `max_kv_len`, and `validate=False`; packed Q also
 requires `max_seq_len_q`. Warm the execution before capture and provide `lse`
-when enabled. Reusable wrappers retain their warmed variants and workspace
-across calls; see the shared model-plan contract.
+when enabled. Reusable wrappers retain their prepared execution and workspace
+across calls; see the shared planning contract.
 
 ## Supported contract
 
@@ -247,7 +243,7 @@ seq_lens = torch.full(
 )
 
 wrapper = BatchMLADecodePagedTSWrapper()
-wrapper.plan(query.device, num_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=False, q_data_type=query.dtype, kv_data_type=kv_cache.dtype, o_data_type=torch.bfloat16, mask_type='causal')
+wrapper.plan(query.device, batch_size=B, max_seq_len_q=1, max_kv_len=pages_per_request * page_size, num_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=False, q_data_type=query.dtype, kv_data_type=kv_cache.dtype, o_data_type=torch.bfloat16, mask_type='causal')
 out = wrapper.run(query, kv_cache, block_tables, seq_lens)
 assert out.shape == (B, 1, H, latent_dim)
 
@@ -260,15 +256,13 @@ packed_query = torch.randn(
     dtype=torch.bfloat16,
 )
 packed_wrapper = BatchMLADecodePagedTSWrapper()
-packed_wrapper.plan(packed_query.device, num_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=True, q_data_type=packed_query.dtype, kv_data_type=kv_cache.dtype, o_data_type=torch.bfloat16, mask_type='causal')
+packed_wrapper.plan(packed_query.device, batch_size=B, max_seq_len_q=max(q_lens), max_kv_len=pages_per_request * page_size, num_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=True, q_data_type=packed_query.dtype, kv_data_type=kv_cache.dtype, o_data_type=torch.bfloat16, mask_type='causal')
 packed_out = packed_wrapper.run(
     packed_query,
     kv_cache,
     block_tables,
     seq_lens,
     qo_indptr=qo_indptr,
-    max_seq_len_q=max(q_lens),
-    max_kv_len=pages_per_request * page_size,
 )
 assert packed_out.shape == (sum(q_lens), H, latent_dim)
 ```

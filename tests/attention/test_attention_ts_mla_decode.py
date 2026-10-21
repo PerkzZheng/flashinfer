@@ -719,7 +719,6 @@ def _plan_case(
     *,
     qo_indptr: torch.Tensor | None = None,
     max_seq_len_q: int | None = None,
-    model_plan: bool = False,
     **plan_options,
 ):
     wrapper = BatchMLADecodePagedTSWrapper()
@@ -739,30 +738,24 @@ def _plan_case(
         kv_data_type=case.kv_cache.dtype,
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
+        max_seq_len_q=resolved_max_seq_len_q,
     )
     options.update(plan_options)
     wrapper.plan(
         case.query.device,
-        num_heads=num_heads,
-        kv_lora_rank=_LATENT_DIM,
-        qk_rope_head_dim=_ROPE_DIM,
-        page_size=case.page_size,
+        int(case.block_tables.shape[0]),
+        num_heads,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        case.page_size,
+        case.max_seq_len,
         **options,
     )
-    _run_case(
-        wrapper,
-        case,
-        qo_indptr=qo_indptr,
-        max_seq_len_q=resolved_max_seq_len_q,
-        max_kv_len=case.max_seq_len,
-    )
+
     return wrapper
 
 
 def _run_case(wrapper, case, *, qo_indptr=None, out=None, validate=True, **kwargs):
-    kwargs.setdefault("max_kv_len", case.max_seq_len)
-    if qo_indptr is not None and "max_seq_len_q" not in kwargs:
-        kwargs["max_seq_len_q"] = wrapper._plan_state.max_seq_len_q
     return wrapper.run(
         case.query,
         case.kv_cache,
@@ -1196,10 +1189,13 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert tuple(plan_parameters) == (
         "self",
         "device",
+        "batch_size",
         "num_heads",
         "kv_lora_rank",
         "qk_rope_head_dim",
         "page_size",
+        "max_kv_len",
+        "max_seq_len_q",
         "packed_query",
         "q_data_type",
         "kv_data_type",
@@ -1219,7 +1215,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         assert plan_parameters[name].default is inspect.Parameter.empty
     for name in ("num_heads", "kv_lora_rank", "qk_rope_head_dim", "page_size"):
         assert plan_parameters[name].default is inspect.Parameter.empty
-    assert not {"batch_size", "max_kv_len", "max_seq_len_q"} & plan_parameters.keys()
+    assert {"batch_size", "max_kv_len", "max_seq_len_q"}.issubset(plan_parameters)
     for request_metadata in (
         "block_tables",
         "seq_lens",
@@ -1241,8 +1237,6 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "lse",
         "return_lse",
         "validate",
-        "max_seq_len_q",
-        "max_kv_len",
     )
     assert run_parameters["block_tables"].default is inspect.Parameter.empty
     assert run_parameters["seq_lens"].default is inspect.Parameter.empty
@@ -1633,24 +1627,20 @@ def test_attention_ts_mla_run_rejects_invalid_kv_lengths(
     wrapper = BatchMLADecodePagedTSWrapper()
     wrapper.plan(
         device,
-        num_heads=8,
-        kv_lora_rank=_LATENT_DIM,
-        qk_rope_head_dim=_ROPE_DIM,
-        page_size=_DEFAULT_PAGE_SIZE,
+        2,
+        8,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        _DEFAULT_PAGE_SIZE,
+        max_kv_len,
         packed_query=False,
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
         o_data_type=torch.bfloat16,
+        max_seq_len_q=1,
     )
     with pytest.raises(ValueError, match=message):
-        wrapper.run(
-            query,
-            kv_cache,
-            block_tables,
-            runtime_seq_lens,
-            max_seq_len_q=1,
-            max_kv_len=max_kv_len,
-        )
+        wrapper.run(query, kv_cache, block_tables, runtime_seq_lens)
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -1706,26 +1696,21 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
     wrapper = BatchMLADecodePagedTSWrapper()
     wrapper.plan(
         device,
-        num_heads=8,
-        kv_lora_rank=_LATENT_DIM,
-        qk_rope_head_dim=_ROPE_DIM,
-        page_size=page_size,
+        2,
+        8,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        page_size,
+        16,
         packed_query=packed_q,
         q_data_type=torch.bfloat16,
         kv_data_type=torch.bfloat16,
         o_data_type=torch.bfloat16,
         mask_type="causal",
+        max_seq_len_q=max_seq_len_q,
     )
     with pytest.raises(ValueError, match=match):
-        wrapper.run(
-            query,
-            kv_cache,
-            block_tables,
-            seq_lens,
-            max_seq_len_q=max_seq_len_q,
-            max_kv_len=16,
-            qo_indptr=qo_indptr,
-        )
+        wrapper.run(query, kv_cache, block_tables, seq_lens, qo_indptr=qo_indptr)
     with pytest.raises(ValueError, match=match):
         batch_mla_decode_with_paged_kv_cache(
             query,
@@ -2868,21 +2853,20 @@ def test_attention_ts_mla_decode_generic_packed_logical_rows(heads, dtype):
 @pytest.mark.parametrize("heads", (16, 32, 64, 128, 129))
 @pytest.mark.parametrize("dtype", (torch.bfloat16, _FP8), ids=("bf16", "fp8"))
 @pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
-def test_attention_ts_mla_model_plan_runtime_sizes(heads, dtype, packed_query):
-    """One MLA model plan serves different batches, Q lengths and KV lengths."""
+def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
+    """Replanned problem sizes retain numerical accuracy and graph replay."""
     wrapper = BatchMLADecodePagedTSWrapper()
-    wrapper.plan(
+    workspace = torch.empty(
+        get_prims_ts_batch_mla_decode_workspace_size(
+            num_heads=heads,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            page_size=32,
+            device="cuda",
+        ),
+        dtype=torch.uint8,
         device="cuda",
-        num_heads=heads,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        page_size=32,
-        packed_query=packed_query,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=torch.bfloat16,
     )
-    workspace = wrapper._runtime_plan.workspace
     for batch, sq, sk in ((2, 1, 513), (3, 3, 641), (1, 5, 769), (2, 1, 514)):
         case = _make_mla_case(
             batch_size=batch,
@@ -2896,6 +2880,22 @@ def test_attention_ts_mla_model_plan_runtime_sizes(heads, dtype, packed_query):
         if packed_query:
             case, qo_indptr = _pack_mla_case(case, (sq,) * batch)
 
+        wrapper.plan(
+            device="cuda",
+            num_heads=heads,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            page_size=32,
+            packed_query=packed_query,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            o_data_type=torch.bfloat16,
+            batch_size=batch,
+            max_seq_len_q=sq,
+            max_kv_len=sk,
+            workspace_buffer=workspace,
+        )
+
         def run(out=None, validate=True):
             return wrapper.run(
                 case.query,
@@ -2907,15 +2907,13 @@ def test_attention_ts_mla_model_plan_runtime_sizes(heads, dtype, packed_query):
                 bmm2_scale=case.bmm2_scale,
                 out=out,
                 validate=validate,
-                max_seq_len_q=sq,
-                max_kv_len=sk,
             )
 
         output = run()
         _assert_case_correct(
             output, case, dict(wrapper._plan_state.policy), qo_indptr=qo_indptr
         )
-        assert wrapper._runtime_plan.workspace.data_ptr() == workspace.data_ptr()
+        assert wrapper._plan_state.workspace_buffer.data_ptr() == workspace.data_ptr()
     out = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -2968,22 +2966,16 @@ def test_attention_ts_mla_standalone_reuses_model_workspace():
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize("dtype", (torch.bfloat16, _FP8), ids=("bf16", "fp8"))
-def test_attention_ts_mla_model_plan_runtime_sm_split_ceiling(dtype):
+def test_attention_ts_mla_runtime_sm_split_ceiling(dtype):
     """Canonical KV geometry retains live counts above the historical 128 cap."""
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     if sms <= 128:
         pytest.skip("requires more than 128 physical SMs")
     wrapper = BatchMLADecodePagedTSWrapper()
-    wrapper.plan(
+    workspace = torch.empty(
+        get_prims_ts_batch_mla_decode_workspace_size(16, 512, 64, 32, device="cuda"),
+        dtype=torch.uint8,
         device="cuda",
-        num_heads=16,
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        page_size=32,
-        packed_query=False,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=torch.bfloat16,
     )
     compiled = []
     for sk in (sms * 256, (sms - 1) * 256):
@@ -2994,7 +2986,22 @@ def test_attention_ts_mla_model_plan_runtime_sm_split_ceiling(dtype):
             qkv_dtype=dtype,
             seed=90900 + sk,
         )
-        wrapper._runtime_plan.workspace.view(torch.uint8).fill_(255)
+        wrapper.plan(
+            device="cuda",
+            num_heads=16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            page_size=32,
+            packed_query=False,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            o_data_type=torch.bfloat16,
+            batch_size=1,
+            max_seq_len_q=1,
+            max_kv_len=sk,
+            workspace_buffer=workspace,
+        )
+        wrapper._plan_state.workspace_buffer.view(torch.uint8).fill_(255)
         output = wrapper.run(
             case.query,
             case.kv_cache,
@@ -3002,7 +3009,6 @@ def test_attention_ts_mla_model_plan_runtime_sm_split_ceiling(dtype):
             case.seq_lens,
             bmm1_scale=case.bmm1_scale,
             bmm2_scale=case.bmm2_scale,
-            max_kv_len=sk,
         )
         policy = dict(wrapper._plan_state.policy)
         assert 128 < policy["split_kv"] <= sms
@@ -3054,15 +3060,7 @@ def test_mla_final_lse(dtype, heads, nq, nk, packed, mode):
     # Scalar FP32 LSE stores must accept a 4-byte-aligned offset view.
     guard = torch.full((expected.numel() + 2,), float("nan"), device="cuda")
     lse = guard[1:-1].view(expected.shape)
-    run = functools.partial(
-        _run_case,
-        wrapper,
-        case,
-        qo_indptr=offsets,
-        max_seq_len_q=nq,
-        max_kv_len=nk,
-        lse=lse,
-    )
+    run = functools.partial(_run_case, wrapper, case, qo_indptr=offsets, lse=lse)
     out, stats = run(return_lse=True)
     _assert_case_correct(out, case, dict(wrapper._plan_state.policy), qo_indptr=offsets)
     assert stats is lse
@@ -3109,9 +3107,7 @@ def test_mla_runtime_count_changes(dtype, heads, batch, kv):
         capacity,
         2,
     ):
-        wrapper._runtime_plan.prepared[
-            next(reversed(wrapper._runtime_plan.prepared))
-        ] = replace(state, split_kv=count)
+        wrapper._plan_state = replace(state, split_kv=count)
         scratch = state.workspace_views.kernel_workspace
         if scratch is not None:
             scratch.fill_(-1)
@@ -3120,7 +3116,6 @@ def test_mla_runtime_count_changes(dtype, heads, batch, kv):
             case.kv_cache,
             case.block_tables,
             case.seq_lens,
-            max_kv_len=kv,
             bmm1_scale=case.bmm1_scale,
             bmm2_scale=case.bmm2_scale,
             out=out,
@@ -3142,7 +3137,6 @@ def test_mla_runtime_count_changes(dtype, heads, batch, kv):
             case.kv_cache,
             case.block_tables,
             case.seq_lens,
-            max_kv_len=kv,
             bmm1_scale=case.bmm1_scale,
             bmm2_scale=case.bmm2_scale,
             out=out,

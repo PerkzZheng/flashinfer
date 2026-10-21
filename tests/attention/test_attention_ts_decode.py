@@ -1608,13 +1608,14 @@ def _plan_case(
 ):
     wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
     seq_len_q = 1 if case.q.ndim == 3 else int(case.q.shape[1])
-    seq_lens = case.seq_lens
     wrapper.plan(
         case.q.device,
-        num_qo_heads=case.q.shape[-2],
-        num_kv_heads=case.k_cache.shape[1],
-        head_dim=case.q.shape[-1],
-        page_size=case.k_cache.shape[2],
+        int(case.paged_kv_indptr.numel()) - 1,
+        case.q.shape[-2],
+        case.k_cache.shape[1],
+        case.q.shape[-1],
+        case.k_cache.shape[2],
+        max_kv_len,
         packed_query=qo_indptr is not None,
         q_data_type=case.q.dtype,
         k_data_type=case.k_cache.dtype,
@@ -1622,17 +1623,9 @@ def _plan_case(
         o_data_type=case.output_dtype,
         mask_type=case.mask_type,
         window_left=case.window_left,
+        max_seq_len_q=seq_len_q if max_seq_len_q is None else max_seq_len_q,
     )
 
-    _run_case(
-        wrapper,
-        case,
-        seq_lens=seq_lens,
-        kv_scale_factors=kv_scale_factors,
-        qo_indptr=qo_indptr,
-        max_seq_len_q=max_seq_len_q or seq_len_q,
-        max_kv_len=max_kv_len,
-    )
     return wrapper
 
 
@@ -1682,16 +1675,10 @@ def _run_case(
     qo_indptr: Optional[torch.Tensor] = None,
     out=None,
     validate: bool = True,
-    max_seq_len_q: int | None = None,
     kv_scale_factors=None,
-    max_kv_len: int | None = None,
 ):
     if seq_lens is None:
         seq_lens = case.seq_lens
-    if max_kv_len is None:
-        max_kv_len = wrapper._plan_state.max_kv_len
-    if max_seq_len_q is None:
-        max_seq_len_q = wrapper._plan_state.seq_len_q
     return wrapper.run(
         case.q,
         case.paged_kv_cache,
@@ -1701,8 +1688,6 @@ def _run_case(
         kv_scale_factors=kv_scale_factors,
         bmm1_scale=case.bmm1_scale,
         bmm2_scale=case.bmm2_scale,
-        max_seq_len_q=max_seq_len_q,
-        max_kv_len=max_kv_len,
         out=out,
         validate=validate,
     )
@@ -2089,10 +2074,12 @@ def test_attention_ts_decode_paged_wide_head_group_graph(dtype, page_size):
     wrapper = BatchDecodePagedTSWrapper()
     wrapper.plan(
         case.q.device,
-        num_qo_heads=128,
-        num_kv_heads=1,
-        head_dim=128,
-        page_size=page_size,
+        len(kv_lens),
+        128,
+        1,
+        128,
+        page_size,
+        max(kv_lens),
         q_data_type=dtype,
         mask_type="causal",
         split_kv=False,
@@ -2106,7 +2093,6 @@ def test_attention_ts_decode_paged_wide_head_group_graph(dtype, page_size):
             case.paged_kv_cache,
             seq_lens,
             case.block_tables,
-            max_kv_len=max(kv_lens),
             out=out,
             validate=False,
         )
@@ -2489,9 +2475,7 @@ def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> N
     with pytest.raises(
         NotImplementedError, match=r"padded FMHA decode K/V coordinates"
     ):
-        BatchDecodePagedTSWrapper().plan(
-            device, num_qo_heads=8, num_kv_heads=1, head_dim=64, page_size=page_size
-        )
+        BatchDecodePagedTSWrapper().plan(device, 1, 8, 1, 64, page_size, unsafe_max)
 
 
 @pytest.mark.parametrize(
@@ -2571,10 +2555,13 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.plan).parameters) == (
         "self",
         "device",
+        "batch_size",
         "num_qo_heads",
         "num_kv_heads",
         "head_dim",
         "page_size",
+        "max_kv_len",
+        "max_seq_len_q",
         "packed_query",
         "q_data_type",
         "k_data_type",
@@ -2582,11 +2569,12 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "kv_data_type",
         "o_data_type",
         "mask_type",
-        "window_left",
-        "storage_page_size",
         "lse_mode",
         "use_attention_sinks",
+        "window_left",
+        "seq_lens",
         "workspace_buffer",
+        "storage_page_size",
         "split_kv",
         "validate",
         "initialize_workspace",
@@ -2607,14 +2595,12 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "return_lse",
         "attention_sinks",
         "validate",
-        "max_seq_len_q",
-        "max_kv_len",
     )
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
 
     assert _DecodePlanState.__dataclass_params__.frozen is True
-    assert {"batch_size", "max_kv_len", "max_seq_len_q", "seq_lens"}.isdisjoint(
+    assert {"batch_size", "max_kv_len", "max_seq_len_q", "seq_lens"}.issubset(
         inspect.signature(BatchDecodePagedTSWrapper.plan).parameters
     )
     request_fields = {"qo_indptr", "block_tables"}
@@ -4450,7 +4436,6 @@ def test_attention_ts_decode_mixed_precision(
             case.paged_kv_cache,
             case.seq_lens,
             case.block_tables,
-            max_kv_len=wrapper._plan_state.max_kv_len,
             kv_scale_factors=kv_scale_factors,
             bmm1_scale=case.bmm1_scale,
             bmm2_scale=case.bmm2_scale,
@@ -4531,9 +4516,7 @@ def test_attention_ts_decode_mixed_precision_more_loaders_than_pages(
     from flashinfer.attention.prims_ts import decode as decode_module
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
-    from flashinfer.attention.prims_ts.policy_cachec import shared_policy_cache
-
-    shared_policy_cache.cache_clear()
+    decode_module._resolve_decode_launch_spec.cache_clear()
     original_make_decode_config = fmha_decode_config.make_decode_config
 
     def make_multiwarp_config(*args, **kwargs):
@@ -4576,14 +4559,11 @@ def test_attention_ts_decode_mixed_precision_more_loaders_than_pages(
         case.paged_kv_cache,
         case.seq_lens,
         case.block_tables,
-        max_kv_len=wrapper._plan_state.max_kv_len,
         kv_scale_factors=kv_scale_factors,
         bmm1_scale=case.bmm1_scale,
         bmm2_scale=case.bmm2_scale,
     )
     _assert_case_correct(output, case)
-
-    shared_policy_cache.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -4909,9 +4889,7 @@ def test_attention_ts_decode_runtime_owned_seq_lens_remain_dynamic_in_graph() ->
         seed=20260901,
     )
     wrapper = BatchDecodePagedTSWrapper()
-    wrapper.plan(
-        case.q.device, num_qo_heads=8, num_kv_heads=1, head_dim=64, page_size=16
-    )
+    wrapper.plan(case.q.device, 1, 8, 1, 64, 16, 128)
     policy = dict(wrapper._policy)
     assert policy["kv_prefix_mode"] == "dynamic"
     assert policy["kv_lengths_mode"] == "dynamic"
@@ -4995,9 +4973,9 @@ def test_attention_ts_decode_run_rejects_malformed_fixed_metadata_values(
         device=device,
     )
     wrapper = BatchDecodePagedTSWrapper()
-    wrapper.plan(device, num_qo_heads=8, num_kv_heads=1, head_dim=128, page_size=32)
+    wrapper.plan(device, 2, 8, 1, 128, 32, 64)
     with pytest.raises(ValueError, match=message):
-        wrapper.run(q, kv_cache, seq_lens, block_tables, max_kv_len=64)
+        wrapper.run(q, kv_cache, seq_lens, block_tables)
 
 
 @_REQUIRES_PRIMTS_GPU
@@ -5107,23 +5085,18 @@ def test_attention_ts_decode_rejects_per_request_causal_q_longer_than_kv(
     wrapper = BatchDecodePagedTSWrapper()
     wrapper.plan(
         device,
-        num_qo_heads=8,
-        num_kv_heads=1,
-        head_dim=64,
-        page_size=page_size,
+        2,
+        8,
+        1,
+        64,
+        page_size,
+        16,
         packed_query=packed_q,
         mask_type="causal",
+        max_seq_len_q=max_seq_len_q if packed_q else seq_len_q,
     )
     with pytest.raises(ValueError, match=match):
-        wrapper.run(
-            q,
-            kv_cache,
-            seq_lens,
-            block_tables,
-            max_seq_len_q=max_seq_len_q if packed_q else seq_len_q,
-            max_kv_len=16,
-            qo_indptr=qo_indptr,
-        )
+        wrapper.run(q, kv_cache, seq_lens, block_tables, qo_indptr=qo_indptr)
     with pytest.raises(ValueError, match=match):
         batch_decode_with_paged_kv_cache(
             q,
@@ -5699,16 +5672,19 @@ def test_dense_split_control_graph_and_workspace(dtype, packed, split_kv):
     wrapper = BatchDecodePagedTSWrapper()
     wrapper.plan(
         query.device,
-        num_qo_heads=hq,
-        num_kv_heads=1,
-        head_dim=dim,
-        page_size=page,
+        batch,
+        hq,
+        1,
+        dim,
+        page,
+        context,
         packed_query=packed,
         q_data_type=dtype,
         o_data_type=dtype,
         mask_type="causal",
         workspace_buffer=workspace,
         split_kv=split_kv,
+        max_seq_len_q=sq,
     )
     if not split_kv:
         assert not dict(wrapper._policy)["use_split_kv"]
@@ -5728,15 +5704,7 @@ def test_dense_split_control_graph_and_workspace(dtype, packed, split_kv):
 
     def run():
         wrapper.run(
-            query,
-            (k, v),
-            lengths,
-            table,
-            max_seq_len_q=sq,
-            max_kv_len=context,
-            qo_indptr=offsets,
-            out=out,
-            validate=False,
+            query, (k, v), lengths, table, qo_indptr=offsets, out=out, validate=False
         )
 
     def check():
@@ -7962,13 +7930,14 @@ def test_q_token_sparse_geometry_graph(
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         batch,
+        hkv * ratio,
+        hkv,
+        dim,
+        block,
+        page,
+        topk,
         context,
-        num_qo_heads=hkv,
-        num_kv_heads=dim,
-        head_dim=block,
-        page_size=page,
         group_size=group,
-        device=q.device,
         workspace_buffer=workspace,
         use_packed_q=packed,
         split_kv=False,
@@ -7985,7 +7954,6 @@ def test_q_token_sparse_geometry_graph(
             sparse_ids,
             requests,
             positions.flatten()[:rows],
-            max_kv_len=topk,
             qo_indptr=qo_indptr,
             out=out,
         )
@@ -8120,13 +8088,14 @@ def test_q_token_sparse_packed_query_boundaries(group, dim, ratio, dtype, split_
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         batch,
+        hq,
+        hkv,
+        dim,
+        4,
+        page,
+        topk,
         context,
-        num_qo_heads=hkv,
-        num_kv_heads=dim,
-        head_dim=4,
-        page_size=page,
         group_size=group,
-        device=q.device,
         workspace_buffer=workspace,
         use_packed_q=True,
         split_kv=split_kv,
@@ -8136,15 +8105,7 @@ def test_q_token_sparse_packed_query_boundaries(group, dim, ratio, dtype, split_
 
     def run():
         wrapper.run(
-            q,
-            (k, v),
-            table,
-            ids,
-            requests,
-            positions,
-            max_kv_len=topk,
-            qo_indptr=qo_indptr,
-            out=out,
+            q, (k, v), table, ids, requests, positions, qo_indptr=qo_indptr, out=out
         )
 
     def check():
@@ -8325,13 +8286,14 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
     wrapper = QTokenKvBlockSparsePagedTSWrapper()
     wrapper.plan(
         batch,
+        hkv * ratio,
+        hkv,
+        dim,
+        block,
+        page,
+        topk,
         context,
-        num_qo_heads=hkv,
-        num_kv_heads=dim,
-        head_dim=block,
-        page_size=page,
         group_size=group,
-        device=q.device,
         workspace_buffer=workspace,
         use_packed_q=packed,
         split_kv=split_kv,
@@ -8342,15 +8304,7 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
 
     def run():
         wrapper.run(
-            q,
-            (k, v),
-            table,
-            ids,
-            requests,
-            positions,
-            max_kv_len=topk,
-            qo_indptr=qo_indptr,
-            out=out,
+            q, (k, v), table, ids, requests, positions, qo_indptr=qo_indptr, out=out
         )
 
     def check():
@@ -8477,27 +8431,11 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         page_table = pages.view(batch, sk // page)
         lens = torch.full((batch,), sk, device="cuda", dtype=torch.int32)
         w = BlockSparsePagedTSWrapper()
-        w.plan(
-            batch,
-            block,
-            page,
-            num_qo_heads=sk,
-            num_kv_heads=hq,
-            head_dim=hkv,
-            page_size=dim,
-            **static,
-        )
+        w.plan(batch, sq, sk, hq, hkv, dim, qb, block, page, **static)
 
         def run():
             return w.run(
-                q,
-                (cache_k, cache_v),
-                page_table,
-                lens,
-                indptr,
-                indices,
-                max_kv_len=qb,
-                out=out,
+                q, (cache_k, cache_v), page_table, lens, indptr, indices, out=out
             )
 
         eager = block_sparse_attention_with_paged_kv_cache(
@@ -8515,16 +8453,7 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         )
     else:
         w = BlockSparseTSWrapper()
-        w.plan(
-            batch,
-            block,
-            num_qo_heads=sk,
-            num_kv_heads=hq,
-            head_dim=hkv,
-            page_size=dim,
-            sparse_format=fmt,
-            **static,
-        )
+        w.plan(batch, sq, sk, hq, hkv, dim, qb, block, sparse_format=fmt, **static)
         route_args = dict(
             block_indptr=indptr if fmt == "bsr" else None,
             block_indices=indices if fmt == "bsr" else None,
@@ -8532,7 +8461,7 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         )
 
         def run():
-            return w.run(q, k, v, max_kv_len=qb, **route_args, out=out)
+            return w.run(q, k, v, **route_args, out=out)
 
         eager = block_sparse_attention(
             q,
@@ -8598,27 +8527,21 @@ def test_dense_encoded_eight_token_fragments(dtype):
     wrapper = BatchDecodePagedTSWrapper()
     wrapper.plan(
         q.device,
-        num_qo_heads=hkv * ratio,
-        num_kv_heads=hkv,
-        head_dim=dim,
-        page_size=fragment,
+        batch,
+        hkv * ratio,
+        hkv,
+        dim,
+        fragment,
+        context,
         storage_page_size=storage,
         mask_type="causal",
         q_data_type=dtype,
         split_kv=False,
+        max_seq_len_q=sq,
     )
 
     def run():
-        wrapper.run(
-            q,
-            (k, v),
-            lengths,
-            table,
-            max_seq_len_q=sq,
-            max_kv_len=context,
-            out=out,
-            validate=False,
-        )
+        wrapper.run(q, (k, v), lengths, table, out=out, validate=False)
 
     run()
     definition = fi_trace(
@@ -8658,21 +8581,17 @@ def test_dense_encoded_eight_token_fragments(dtype):
 @pytest.mark.parametrize("dtype", (torch.bfloat16, _FP8), ids=("bf16", "fp8"))
 @pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
 @pytest.mark.parametrize("layout", ("HND", "NHD"))
-def test_attention_ts_decode_model_plan_runtime_sizes(dtype, packed_query, layout):
-    """Problem changes reuse the model plan, arena and bounded native variants."""
+def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
+    """Replanned problem sizes retain numerical accuracy and graph replay."""
     output_dtype = torch.float16 if dtype == _FP8 else torch.bfloat16
     wrapper = BatchDecodePagedTSWrapper(layout)
-    wrapper.plan(
+    workspace = torch.empty(
+        get_prims_ts_batch_decode_workspace_size(
+            num_qo_heads=16, num_kv_heads=2, head_dim=128, page_size=32, device="cuda"
+        ),
+        dtype=torch.uint8,
         device="cuda",
-        num_qo_heads=16,
-        num_kv_heads=2,
-        head_dim=128,
-        page_size=32,
-        q_data_type=dtype,
-        o_data_type=output_dtype,
-        packed_query=packed_query,
     )
-    workspace = wrapper._runtime_plan.workspace
 
     def check(output, case):
         if dtype == _FP8:
@@ -8709,6 +8628,21 @@ def test_attention_ts_decode_model_plan_runtime_sizes(dtype, packed_query, layou
             kv_cache = tuple(cache.transpose(1, 2).contiguous() for cache in kv_cache)
         seq_lens = torch.full((batch,), sk, dtype=torch.int32, device="cuda")
 
+        wrapper.plan(
+            device="cuda",
+            num_qo_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            page_size=32,
+            q_data_type=dtype,
+            o_data_type=output_dtype,
+            packed_query=packed_query,
+            batch_size=batch,
+            max_seq_len_q=sq,
+            max_kv_len=sk,
+            workspace_buffer=workspace,
+        )
+
         def run(out=None, validate=True):
             return wrapper.run(
                 case.q,
@@ -8720,13 +8654,11 @@ def test_attention_ts_decode_model_plan_runtime_sizes(dtype, packed_query, layou
                 bmm2_scale=case.bmm2_scale,
                 out=out,
                 validate=validate,
-                max_seq_len_q=sq,
-                max_kv_len=sk,
             )
 
         output = run()
         check(output, case)
-        assert wrapper._runtime_plan.workspace.data_ptr() == workspace.data_ptr()
+        assert wrapper._plan_state.workspace_buffer.data_ptr() == workspace.data_ptr()
     out = torch.empty_like(output)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -8822,6 +8754,9 @@ def test_attention_ts_decode_final_statistics(dtype, heads, nq, nk, mode):
         mask_type="causal",
         lse_mode=mode,
         use_attention_sinks=True,
+        batch_size=1,
+        max_kv_len=nk,
+        max_seq_len_q=nq,
     )
     pages = case.block_tables[0, : (nk + 31) // 32].long()
     k, v = (
@@ -8845,10 +8780,8 @@ def test_attention_ts_decode_final_statistics(dtype, heads, nq, nk, mode):
             cache,
             lengths,
             case.block_tables,
-            max_seq_len_q=nq,
             bmm1_scale=case.bmm1_scale,
             bmm2_scale=case.bmm2_scale,
-            max_kv_len=nk,
             attention_sinks=sinks,
             **kwargs,
         )
@@ -8858,9 +8791,7 @@ def test_attention_ts_decode_final_statistics(dtype, heads, nq, nk, mode):
     counts = (1, state.config.splits_kv, 2) if state.config.use_split_kv else (1,)
     for count in counts:
         if state.config.use_split_kv:
-            wrapper._runtime_plan.prepared[
-                next(reversed(wrapper._runtime_plan.prepared))
-            ] = replace(state, requested_splits=count)
+            wrapper._plan_state = replace(state, requested_splits=count)
         run(out=out, lse=lse)
         torch.testing.assert_close(out.float(), ref, atol=0.02, rtol=0.05)
         torch.testing.assert_close(lse, expected, atol=0.015, rtol=0.002)

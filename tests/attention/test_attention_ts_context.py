@@ -516,9 +516,10 @@ def _plan_wrapper(wrapper: BatchPrefillTSWrapper, case: _ContextCase) -> None:
         sm_scale=case.sm_scale,
         output_scale=case.output_scale,
         out_dtype=case.output_dtype,
+        batch_size=len(case.q_lengths),
+        max_seq_len_q=max(case.q_lengths),
+        max_kv_len=max(case.k_lengths),
     )
-
-    _run_wrapper(wrapper, case)
 
 
 def _run_wrapper(
@@ -528,8 +529,6 @@ def _run_wrapper(
 ) -> torch.Tensor:
     """Launch a contiguous plan with the request metadata owned by ``case``."""
 
-    kwargs.setdefault("max_seq_len_q", max(case.q_lengths))
-    kwargs.setdefault("max_kv_len", max(case.k_lengths))
     return wrapper.run(
         case.q,
         case.k,
@@ -579,17 +578,11 @@ def _plan_paged_wrapper(
         uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
         paged_v_tail_is_zero=paged_v_tail_is_zero,
-    )
-    wrapper.run(
-        reference.q,
-        case.k_cache,
-        case.v_cache,
-        metadata.qo_indptr,
-        metadata.block_tables,
-        metadata.seq_lens_kv,
+        batch_size=len(reference.q_lengths),
         max_seq_len_q=max_seq_len_q,
         max_kv_len=max_kv_len,
     )
+
     return metadata
 
 
@@ -608,8 +601,6 @@ def _run_paged_wrapper(
         metadata.qo_indptr,
         metadata.block_tables,
         metadata.seq_lens_kv,
-        max_seq_len_q=wrapper._plan_state.geometry.max_seq_len_q,
-        max_kv_len=wrapper._plan_state.geometry.max_kv_len,
         out=out,
         validate=validate,
     )
@@ -630,17 +621,7 @@ def _capture_context_graph(
 
     def launch() -> torch.Tensor:
         if paged_metadata is None:
-            return wrapper.run(
-                q,
-                k,
-                v,
-                qo_indptr,
-                kv_indptr,
-                max_seq_len_q=wrapper._plan_state.geometry.max_seq_len_q,
-                max_kv_len=wrapper._plan_state.geometry.max_seq_len_k,
-                out=out,
-                validate=False,
-            )
+            return wrapper.run(q, k, v, qo_indptr, kv_indptr, out=out, validate=False)
         return wrapper.run(
             q,
             k,
@@ -648,8 +629,6 @@ def _capture_context_graph(
             paged_metadata.qo_indptr,
             paged_metadata.block_tables,
             paged_metadata.seq_lens_kv,
-            max_seq_len_q=wrapper._plan_state.geometry.max_seq_len_q,
-            max_kv_len=wrapper._plan_state.geometry.max_kv_len,
             out=out,
             validate=False,
         )
@@ -791,6 +770,9 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert tuple(plan_parameters) == (
         "self",
         "device",
+        "batch_size",
+        "max_seq_len_q",
+        "max_kv_len",
         "num_qo_heads",
         "num_kv_heads",
         "head_dim",
@@ -799,15 +781,15 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "v_dtype",
         "out_dtype",
         "page_size",
-        "uniform_packed_lengths",
-        "has_q_offset",
-        "paged_v_tail_is_zero",
         "mask_type",
         "window_left",
         "sm_scale",
         "output_scale",
         "lse_mode",
         "use_attention_sinks",
+        "uniform_packed_lengths",
+        "has_q_offset",
+        "paged_v_tail_is_zero",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -829,8 +811,6 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "scale_softmax_log2",
         "output_scale",
         "validate",
-        "max_seq_len_q",
-        "max_kv_len",
     )
     assert run_parameters["validate"].kind is inspect.Parameter.KEYWORD_ONLY
     assert run_parameters["validate"].default is True
@@ -866,6 +846,9 @@ def test_attention_ts_context_paged_plan_rejects_non_bool_zero_tail_contract(
             q_dtype=torch.float16,
             k_dtype=torch.float16,
             paged_v_tail_is_zero=invalid_value,
+            batch_size=1,
+            max_seq_len_q=64,
+            max_kv_len=64,
         )
 
 
@@ -876,14 +859,17 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
     assert tuple(plan_parameters) == (
         "self",
         "device",
+        "batch_size",
+        "max_seq_len_q",
+        "max_kv_len",
         "num_qo_heads",
         "num_kv_heads",
         "head_dim",
+        "head_dim_vo",
         "q_dtype",
         "k_dtype",
         "v_dtype",
         "out_dtype",
-        "head_dim_vo",
         "packed",
         "mask_type",
         "window_left",
@@ -914,8 +900,6 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "scale_softmax_log2",
         "output_scale",
         "validate",
-        "max_seq_len_q",
-        "max_kv_len",
     )
     assert plan_parameters["head_dim_vo"].default is None
     assert run_parameters["qo_indptr"].default is None
@@ -1069,7 +1053,7 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert resolve_kwargs["qo_indptr"] is qo_indptr
     assert resolve_kwargs["block_tables"] is block_tables
     assert resolve_kwargs["seq_lens_kv"] is seq_lens_kv
-    assert calls["run"][1]["max_kv_len"] == 65
+    assert calls["plan"]["max_kv_len"] == 65
     assert calls["plan"]["uniform_packed_lengths"] is False
     assert calls["plan"]["has_q_offset"] is False
     assert calls["plan"]["paged_v_tail_is_zero"] is False
@@ -1079,8 +1063,6 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert run_args[4] is block_tables
     assert run_args[5] is seq_lens_kv
     assert tuple(run_kwargs) == (
-        "max_seq_len_q",
-        "max_kv_len",
         "out",
         "lse",
         "return_lse",
@@ -2252,6 +2234,9 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
             head_dim=128,
             q_dtype=q.dtype,
             k_dtype=k.dtype,
+            batch_size=1,
+            max_seq_len_q=8,
+            max_kv_len=8,
         )
 
 
@@ -2295,6 +2280,9 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
         head_dim=head_dim,
         q_dtype=dtype,
         k_dtype=dtype,
+        batch_size=1,
+        max_seq_len_q=8,
+        max_kv_len=8,
     )
 
     if invalid_contract == "packed-offset":
@@ -2661,6 +2649,9 @@ def test_attention_ts_context_paged_rejects_variable_window_before_compile(
             k_dtype=torch.float16,
             mask_type="variable_window",
             out_dtype=torch.float16,
+            batch_size=1,
+            max_seq_len_q=1,
+            max_kv_len=1,
         )
 
 
@@ -4786,17 +4777,11 @@ def test_attention_ts_context_mla_prefill(
         sm_scale=sm_scale,
         output_scale=output_scale,
         out_dtype=out_dtype,
-    )
-    actual = wrapper.run(
-        q,
-        k,
-        v,
-        qo,
-        ko,
+        batch_size=batch_size,
         max_seq_len_q=max(q_lens) + replay_shift,
         max_kv_len=max(k_lens) + int(replay_shift > 0),
-        out=out,
     )
+    actual = wrapper.run(q, k, v, qo, ko, out=out)
     assert actual is out
     assert actual.shape == expected.shape
     has_fp8 = torch.float8_e4m3fn in (dtype, out_dtype)
@@ -4821,17 +4806,7 @@ def test_attention_ts_context_mla_prefill(
     torch.testing.assert_close(allocated.float(), expected, atol=atol, rtol=rtol)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        wrapper.run(
-            q,
-            k,
-            v,
-            qo,
-            ko,
-            max_seq_len_q=max(q_lens) + replay_shift,
-            max_kv_len=max(k_lens) + int(replay_shift > 0),
-            out=out,
-            validate=False,
-        )
+        wrapper.run(q, k, v, qo, ko, out=out, validate=False)
     out.zero_()
     graph.replay()
     torch.testing.assert_close(out.float(), expected, atol=atol, rtol=rtol)
@@ -4857,26 +4832,9 @@ def test_attention_ts_context_mla_prefill(
             out.float(), reference(changed_q, changed_k), atol=atol, rtol=rtol
         )
     with pytest.raises(ValueError, match="out must have shape"):
-        wrapper.run(
-            q,
-            k,
-            v,
-            qo,
-            ko,
-            max_seq_len_q=max(q_lens) + replay_shift,
-            max_kv_len=max(k_lens) + int(replay_shift > 0),
-            out=torch.empty_like(q, dtype=torch.bfloat16),
-        )
+        wrapper.run(q, k, v, qo, ko, out=torch.empty_like(q, dtype=torch.bfloat16))
     with pytest.raises(ValueError, match="v must have"):
-        wrapper.run(
-            q,
-            k,
-            torch.empty_like(k),
-            qo,
-            ko,
-            max_seq_len_q=max(q_lens) + replay_shift,
-            max_kv_len=max(k_lens) + int(replay_shift > 0),
-        )
+        wrapper.run(q, k, torch.empty_like(k), qo, ko)
 
 
 # ---------------------------------------------------------------------------
@@ -4907,8 +4865,6 @@ def test_attention_ts_context_two_cta_matches_single_cta(
     as SM103, where it is the default.
     """
 
-    from flashinfer.attention.prims_ts.policy_cachec import shared_policy_cache
-
     case = _make_context_case(
         q_lengths=(8200, 8200),
         k_lengths=(8200, 8200),
@@ -4928,7 +4884,7 @@ def test_attention_ts_context_two_cta_matches_single_cta(
         context_module, "_default_two_cta_umma", lambda device_index: True
     )
     two_cta = BatchPrefillTSWrapper()
-    shared_policy_cache.cache_clear()
+    context_module._context_compile_spec.cache_clear()
     _plan_wrapper(two_cta, case)
     assert two_cta._plan_state is not None
     assert dict(two_cta._plan_state.policy)["scheduler"] == "nonpersistent"
@@ -4939,7 +4895,7 @@ def test_attention_ts_context_two_cta_matches_single_cta(
         context_module, "_default_two_cta_umma", lambda device_index: False
     )
     single_cta = BatchPrefillTSWrapper()
-    shared_policy_cache.cache_clear()
+    context_module._context_compile_spec.cache_clear()
     _plan_wrapper(single_cta, case)
     out_single_cta = _run_wrapper(single_cta, case)
     # Same per-row arithmetic in both forms; only the MMA M extent and the K/V
@@ -4948,24 +4904,14 @@ def test_attention_ts_context_two_cta_matches_single_cta(
         out_two_cta.float(), out_single_cta.float(), atol=2e-3, rtol=1e-2
     )
 
-    shared_policy_cache.cache_clear()
+    context_module._context_compile_spec.cache_clear()
 
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_model_variable_window():
-    """Auxiliary window metadata follows runtime sizes and stays capture-safe."""
+def test_attention_ts_context_variable_window_replanned_sizes():
+    """Replanned problem sizes retain numerical accuracy and graph replay."""
     wrapper = BatchPrefillTSWrapper()
-    wrapper.plan(
-        device="cuda",
-        num_qo_heads=4,
-        num_kv_heads=2,
-        head_dim=128,
-        q_dtype=torch.bfloat16,
-        k_dtype=torch.bfloat16,
-        mask_type="variable_window",
-        output_scale=0.75,
-    )
     for batch, sq, sk in ((2, 33, 200), (2, 33, 256), (3, 129, 385)):
         case = _make_context_case(
             q_lengths=(sq,) * batch,
@@ -4983,6 +4929,20 @@ def test_attention_ts_context_model_variable_window():
             .clone()
         )
         starts = (ends - 17).clamp_min(0)
+
+        wrapper.plan(
+            device="cuda",
+            num_qo_heads=4,
+            num_kv_heads=2,
+            head_dim=128,
+            q_dtype=torch.bfloat16,
+            k_dtype=torch.bfloat16,
+            mask_type="variable_window",
+            output_scale=0.75,
+            batch_size=batch,
+            max_seq_len_q=sq,
+            max_kv_len=sk,
+        )
 
         def run(out=None, validate=True):
             return wrapper.run(
@@ -5081,6 +5041,9 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
         output_scale=0.75,
         lse_mode=mode,
         use_attention_sinks=True,
+        batch_size=2,
+        max_seq_len_q=129,
+        max_kv_len=257,
         **plan_options,
     )
     sinks = torch.tensor([-torch.inf, 0.0, 6.0, 1000.0], device="cuda")
@@ -5102,20 +5065,10 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
     combine = torch.cat if case.packed else torch.stack
     ref = combine([r[0] for r in refs]) * 0.75
     expected = combine([r[1] for r in refs]) / (math.log(2) if mode == "base2" else 1)
-    out, lse = wrapper.run(
-        *args, attention_sinks=sinks, return_lse=True, max_seq_len_q=129, max_kv_len=257
-    )
+    out, lse = wrapper.run(*args, attention_sinks=sinks, return_lse=True)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        wrapper.run(
-            *args,
-            attention_sinks=sinks,
-            out=out,
-            lse=lse,
-            max_seq_len_q=129,
-            max_kv_len=257,
-            validate=False,
-        )
+        wrapper.run(*args, attention_sinks=sinks, out=out, lse=lse, validate=False)
     out.fill_(torch.nan)
     lse.fill_(torch.nan)
     graph.replay()

@@ -59,7 +59,7 @@ output/workspace ownership, examples, limitations, and validation commands.
 ### Unified decode entry points
 
 `batch_decode_with_paged_kv_cache` and `batch_mla_decode_with_paged_kv_cache`
-support both convenience and explicit caller-workspace execution. Convenience calls validate inputs and allocate model scratch when omitted. For allocation-free, synchronization-free
+support both convenience and explicit caller-workspace execution. Convenience calls validate inputs and allocate scratch when omitted. For allocation-free, synchronization-free
 steady-state launches, provide `workspace_buffer`, `max_kv_len`, `out`,
 and `validate=False`. Packed Q additionally requires `max_seq_len_q`
 (FMHA also accepts its non-default `seq_len_q` alias).
@@ -71,7 +71,7 @@ by planning with `initialize_workspace=False`.
 
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
 capture. Zero caller-owned FMHA scratch before its first trusted standalone
-launch; model wrappers initialize control storage by default. Their fixed
+launch; wrappers initialize control storage by default. Their fixed
 control tail supports ordinary batch/length changes without re-zeroing. Scratch and output must not
 overlap any live input or each other; each concurrent launch/graph needs its
 own scratch. Warm up the exact topology before capture, retain stable storage,
@@ -101,31 +101,33 @@ with torch.cuda.graph(graph):
 graph.replay()
 ```
 
-### Reusable model plans
+### Reusable plans
 
-`plan()` accepts model configuration and workspace, with no batch size or
-Q/KV length arguments. Batch and fixed Q lengths come from `run()` tensors.
-Packed Q requires the caller's `max_seq_len_q`; pass `max_kv_len` for trusted
-execution. Workspace queries take only model geometry and hardware information.
+`plan()` takes model configuration, exact batch size, and Q/KV bounds. It
+selects a cached policy, obtains cached compiled kernels, and binds workspace
+before execution. `run()` uses that prepared state with live tensors and
+metadata; it does not select policies or compile kernels. Replan when the
+planned shape/capacity contract changes. Growing live KV lengths within the
+planned capacity does not itself require replanning.
 
-Constructor model defaults use the existing `plan()` keyword names; explicit
-plan arguments override them. Decode/MLA accept caller workspace directly in
-the constructor or `plan()`. The optional wrapper `get_workspace_size()` query
-avoids repeating model configuration. Without caller scratch, `plan()` allocates
-it. Context needs no split scratch and both workspace queries return zero.
+Workspace queries remain independent of request sizes: they use model geometry
+and hardware capacity. Constructor defaults use the existing `plan()` keyword
+names; explicit plan arguments override them. Decode/MLA accept caller workspace
+directly in the constructor or `plan()`, without a required sizing query. The
+optional wrapper `get_workspace_size()` avoids repeating model configuration.
+Without caller scratch, `plan()` allocates it and checks the selected layout.
+Context needs no split-reduction workspace; its query returns zero.
 
 ```python
 import torch
-
-from flashinfer.attention.prims_ts import (
-    BatchDecodePagedTSWrapper,
-)
+from flashinfer.attention.prims_ts import BatchDecodePagedTSWrapper
 
 device = torch.device("cuda:0")
 dtype = torch.bfloat16
 num_qo_heads, num_kv_heads, head_dim, page_size = 32, 4, 128, 32
+batch_size, max_seq_len_q, max_kv_len = 2, 2, 128
 
-# Store model geometry once. Existing constructors and plan arguments also work.
+# Store model defaults once; query scratch before providing problem bounds.
 wrapper = BatchDecodePagedTSWrapper(
     "NHD",
     device=device,
@@ -138,63 +140,57 @@ wrapper = BatchDecodePagedTSWrapper(
     mask_type="causal",
 )
 workspace = torch.empty(wrapper.get_workspace_size(), dtype=torch.uint8, device=device)
-wrapper.plan(workspace_buffer=workspace)
+wrapper.plan(
+    batch_size=batch_size,
+    max_seq_len_q=max_seq_len_q,
+    max_kv_len=max_kv_len,
+    workspace_buffer=workspace,
+)
 
-# This execution has two requests: Q lengths [2, 1], KV lengths [128, 96].
-# The scheduler supplies both host bounds; no CUDA reduction is needed.
-max_seq_len_q, max_kv_len = 2, 128
+# Two requests: Q lengths [2, 1], KV lengths [128, 96].
 q = torch.randn(3, num_qo_heads, head_dim, dtype=dtype, device=device)
 qo_indptr = torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
 seq_lens = torch.tensor([128, 96], dtype=torch.int32, device=device)
 block_tables = torch.tensor(
     [[0, 1, 2, 3], [4, 5, 6, 0]], dtype=torch.int32, device=device
 )
-# Separate NHD K/V tensors: [pages, page_size, kv_heads, head_dim].
+# Separate NHD K/V: [pages, page_size, kv_heads, head_dim].
 k_cache = torch.randn(7, page_size, num_kv_heads, head_dim, dtype=dtype, device=device)
 v_cache = torch.randn_like(k_cache)
 out = torch.empty_like(q)
 
-run_args = dict(
-    qo_indptr=qo_indptr,
-    max_seq_len_q=max_seq_len_q,
-    max_kv_len=max_kv_len,
-    out=out,
-)
-# Validate and warm the selected kernels outside CUDA graph capture.
-wrapper.run(q, (k_cache, v_cache), seq_lens, block_tables, **run_args)
-
-# Reuse the same plan/workspace for subsequent ordered executions.
+wrapper.run(q, (k_cache, v_cache), seq_lens, block_tables, qo_indptr=qo_indptr, out=out)
 result = wrapper.run(
-    q, (k_cache, v_cache), seq_lens, block_tables, validate=False, **run_args
+    q, (k_cache, v_cache), seq_lens, block_tables,
+    qo_indptr=qo_indptr, out=out, validate=False,
 )
 print(f"Workspace: {workspace.numel():,} bytes; output: {tuple(result.shape)}")
 ```
 
-An existing arena can instead be passed directly as
-`BatchDecodePagedTSWrapper("NHD", workspace_buffer=existing_workspace)`;
-then supply model geometry to `plan()`. No sizing query is required. Standalone
-workspace queries retain their problem-specific form; queries return
-the same hardware bound as reusable plans.
+An existing arena can instead be supplied directly as
+`BatchDecodePagedTSWrapper("NHD", workspace_buffer=existing_workspace)`.
+Standalone workspace-size queries return the same hardware-based bound. A
+selected auxiliary/forced format that exceeds that bound is checked in `plan()`.
 
-Each new execution geometry resolves a tensor-free CPU policy shared
-across layers, complementing the persistent compilation and occupancy caches
-from [#6529](https://github.com/flashinfer-ai/flashinfer/pull/6529). Scales,
-workspace views and variable-window buffers remain layer-owned. CPU policy records use an unbounded cache; GPU bindings stay wrapper-owned.
-Model-key hashing is prepared once during planning.
+CPU policy/spec resolvers and compiled-callable caches use `functools.cache`,
+so equivalent plans across layers reuse selection and compiled code. The
+persistent compilation and occupancy caches from
+[#6529](https://github.com/flashinfer-ai/flashinfer/pull/6529) remain in use.
+Each wrapper retains one prepared execution state and owns its resource
+bindings; there is no additional shared-policy or multi-key GPU-binding cache.
 
-Warm each execution shape before capture. Owned scratch may grow during warmup
-for auxiliary or forced-split formats; caller scratch must already fit. The
-first capture freezes the workspace address and retains resource owners.
-Decode counters occupy a fixed tail outside partial-result views, allowing
-ordered calls and graphs of different sizes to reuse one arena. Concurrent
-execution needs separate wrappers and workspace.
+Complete planning and representative validation before CUDA graph capture.
+Capture subsequent `run()` calls with `validate=False` and caller output/LSE
+buffers. Graph replay executes captured GPU work without Python planning or
+dispatch. Keep all captured addresses and owners alive; replanning invalidates
+the previous graph contract and requires prior launches/replays to finish.
+Decode controls occupy a fixed arena tail disjoint from partial-result views.
+Concurrent execution requires independent wrappers/workspace.
 
-Use `validate=False` with host bounds and caller output/LSE buffers for trusted,
-allocation-free execution. Validation otherwise reads metadata on the host.
-Output/LSE/workspace must be disjoint from inputs and live buffers; overlap
-and lifetime remain caller obligations in both modes. Update metadata only
-between completed launches or graph replays. TensorMap shapes and all runtime
-metadata must still satisfy the selected plan's capacities.
+Validation reads metadata values on the host. With `validate=False`, callers own
+shape, dtype, stride, capacity, page-ID, offset, aliasing and lifetime conditions.
+Output/LSE/workspace must be disjoint from inputs and live buffers. Update live
+metadata only between completed launches/replays and remain within plan bounds.
 
 ## QToken-KvBlock-Sparse-Attention interface
 
@@ -546,7 +542,7 @@ exactly when `sage.v_mean` is set.
 ### Validation scope
 
 The established kernels retain their earlier SM100a/B200 qualification.
-Reusable model plans, NHD caches, final LSE/sinks, generic MLA heads, and
+Reusable eager plans, NHD caches, final LSE/sinks, generic MLA heads, and
 runtime split-KV have representative correctness and latency validation on
 SM103/GB300 with PyTorch 26.08, CUDA 13.4, and CuTe DSL 4.7.0. The contiguous
 QK192/V128 extension is also covered on that stack. This is the measured

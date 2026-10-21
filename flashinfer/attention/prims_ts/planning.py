@@ -11,10 +11,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared attention planning, runtime bindings and workspace ownership."""
+"""Shared attention plan defaults, workspace bounds and output bindings."""
 
-from dataclasses import dataclass, field
-from collections import OrderedDict
 import functools
 import inspect
 import math
@@ -31,7 +29,6 @@ from flashinfer.utils import (
     round_up,
 )
 from ._hardware import get_max_active_clusters
-from .policy_cachec import SharedPolicy, model_key, shared_policy_cache
 
 
 def _validate_scale(value: object, name: str) -> float:
@@ -70,7 +67,9 @@ def set_constructor_plan_options(wrapper: Any, options: dict[str, Any]) -> None:
 
 def get_constructor_plan_options(wrapper: Any) -> dict[str, Any]:
     """Resolve model defaults for an optional pre-plan workspace query."""
-    bound = inspect.signature(wrapper.plan).bind(**wrapper._constructor_plan_options)
+    bound = inspect.signature(wrapper.plan).bind_partial(
+        **wrapper._constructor_plan_options
+    )
     bound.apply_defaults()
     return bound.arguments
 
@@ -138,175 +137,6 @@ def reduction_workspace_bound(
     if not mla:
         size += decode_control_workspace_bytes(device)
     return round_up(size, 256)
-
-
-@dataclass
-class RuntimePlan:
-    """Per-wrapper scratch, warmed bindings and captured resource owners.
-
-    The global policy cache shares only CPU dispatch records. This local cache
-    keeps each layer's tensor bindings and captured addresses independent.
-
-    Warmup may grow owned storage for auxiliary metadata or forced-split
-    formats. The first capture freezes its address permanently. Native views
-    are rebuilt after growth, and cache misses cannot allocate during capture.
-    """
-
-    options: dict[str, Any]
-    workspace: torch.Tensor | None = None
-    owns_workspace: bool = False
-    prepared: OrderedDict[tuple, Any] = field(default_factory=OrderedDict)
-    captured_keys: set[tuple] = field(default_factory=set)
-    control_bytes: int = 0
-    initialized_control_pointer: int | None = None
-    control_reset_required: bool = False
-    family: str = ""
-    layout: str | None = None
-    empty_i32: torch.Tensor | None = None
-    model_key: frozenset = field(init=False)
-
-    def __post_init__(self):
-        self.model_key = model_key(self.options)
-
-    def problem(
-        self,
-        query,
-        *,
-        max_seq_len_q,
-        max_kv_len,
-        validate,
-        seq_lens=None,
-        qo_indptr=None,
-        kv_indptr=None,
-    ) -> tuple[int, int, int]:
-        """Resolve host execution bounds; trusted calls never read CUDA values."""
-        packed = self.options.get(
-            "packed", self.options.get("packed_query", self.family == "paged_context")
-        )
-        if packed and qo_indptr is None:
-            raise ValueError("packed execution requires qo_indptr")
-        batch = (
-            int(seq_lens.numel())
-            if seq_lens is not None
-            else (int(qo_indptr.numel()) - 1 if packed else int(query.shape[0]))
-        )
-        sq = (
-            runtime_query_length_bound(max_seq_len_q)
-            if packed
-            else (
-                1
-                if self.family == "decode" and query.ndim == 3
-                else int(query.shape[1])
-            )
-        )
-        sk = runtime_length_bound(
-            max_kv_len,
-            kv_indptr if kv_indptr is not None else seq_lens,
-            validate=validate,
-            name="max_kv_len",
-            cumulative=kv_indptr is not None,
-        )
-        return batch, sq, sk
-
-    def prepare(
-        self,
-        key: tuple,
-        factory: Callable[[], SharedPolicy],
-        bind: Callable[[SharedPolicy, torch.Tensor | None], Any],
-        required_bytes: int | Callable[[SharedPolicy], int] = 0,
-    ) -> Any:
-        device = self.options["device"]
-        with torch.cuda.device(device):
-            capturing = torch.cuda.is_current_stream_capturing()
-        prepared = self.prepared.get(key)
-        if prepared is not None:
-            if capturing:
-                self.captured_keys.add(key)
-            self.prepared.move_to_end(key)
-            return prepared
-        policy_key = (self.family, self.layout, key, self.model_key)
-        if capturing:
-            # Standalone calls create a temporary wrapper. A warmed shared
-            # decode policy can bind caller scratch using only tensor views;
-            # it needs no local cache entry or device metadata allocation.
-            policy = shared_policy_cache.peek(policy_key)
-            if policy is None or self.family not in ("decode", "mla_decode"):
-                raise RuntimeError(
-                    "warm this attention execution shape with run() before CUDA graph capture"
-                )
-        else:
-            policy = shared_policy_cache.get_or_create(policy_key, factory)
-        if callable(required_bytes):
-            required_bytes = required_bytes(policy)
-        available = 0 if self.workspace is None else self.workspace.numel()
-        if required_bytes > available:
-            if capturing or self.captured_keys or not self.owns_workspace:
-                raise ValueError(
-                    f"runtime attention needs {required_bytes} workspace bytes; "
-                    f"the plan has {available}. Supply sufficient workspace in "
-                    "plan() and warm the execution shapes before graph capture."
-                )
-            if self.workspace is not None:
-                self.workspace.record_stream(torch.cuda.current_stream(device))
-            self.workspace = torch.empty(
-                max(required_bytes, available * 2),
-                dtype=torch.int8,
-                device=device,
-            )
-            self.prepared.clear()
-        prepared = bind(policy, self.workspace)
-        self.prepared[key] = prepared
-        if capturing:
-            self.captured_keys.add(key)
-        # Captured resource owners remain pinned. Bound eager metadata
-        # caching so a growing KV length does not retain one child per token.
-        while len(self.prepared) > len(self.captured_keys) + 32:
-            oldest = next(k for k in self.prepared if k not in self.captured_keys)
-            retired = self.prepared.pop(oldest)
-            state = retired
-            for name in (
-                "empty_i32",
-                "variable_window_padded_starts",
-                "variable_window_cta_starts",
-            ):
-                tensor = getattr(state, name, None)
-                if isinstance(tensor, torch.Tensor):
-                    tensor.record_stream(torch.cuda.current_stream(device))
-        return prepared
-
-
-def runtime_query_length_bound(value: int | None) -> int:
-    """Require a caller-provided packed-Q bound without reading CUDA offsets."""
-    if value is None:
-        raise ValueError(
-            "packed Q requires max_seq_len_q; supply it in run() or plan()"
-        )
-    return runtime_length_bound(value, None, validate=False, name="max_seq_len_q")
-
-
-def runtime_length_bound(
-    value: int | None,
-    metadata: torch.Tensor | None,
-    *,
-    validate: bool,
-    name: str,
-    cumulative: bool = False,
-) -> int:
-    """Resolve a host length bound, reading live metadata only during validation."""
-    if value is not None:
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer")
-        return value
-    if not validate:
-        raise ValueError(f"validate=False requires runtime {name}")
-    if metadata is None:
-        raise ValueError(f"execution requires {name} or length metadata")
-    lengths = (
-        metadata[1:].to(torch.int64) - metadata[:-1].to(torch.int64)
-        if cumulative
-        else metadata
-    )
-    return max(int(lengths.max().item()), 1)
 
 
 def validate_lse_mode(mode: str) -> Literal["none", "base2"]:
