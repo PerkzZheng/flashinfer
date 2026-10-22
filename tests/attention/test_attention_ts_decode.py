@@ -6754,10 +6754,9 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
             return 4
 
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
-    # Keep this launch-mode unit test on the generic KV128 profile. A selected
-    # Q64 16-bit D128 auto candidate uses KV256 and changes the physical
-    # Q CTAs used by the wave boundary below.
-    config_args: dict[str, object] = {"tile_size_kv": 128}
+    # Pin Q8/KV128 so this tests launch-mode persistence at a fixed Q grid.
+    # Joint grouped-Q selection has its own occupancy search.
+    config_args: dict[str, object] = {"tile_size_q": 8, "tile_size_kv": 128}
     if packed_q:
         config_args["use_variable_seqlens_q"] = True
     common = dict(

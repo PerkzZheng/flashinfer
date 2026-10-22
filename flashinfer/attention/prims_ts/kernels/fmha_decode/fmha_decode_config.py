@@ -4375,24 +4375,27 @@ def _apply_auto_grouped_q_mma_config(
     max_splits_kv: int | None,
     split_kv: bool = True,
 ) -> GroupedQLaunchCandidate | None:
-    """Select a legal fixed multi-Q MMA and KV-split recipe when unpinned.
+    """Select a legal multi-Q MMA and KV-split recipe when unpinned.
 
-    SQ1, packed/variable Q, explicit launch modes, ungrouped layouts, and
+    SQ1, sliding windows, explicit launch modes, ungrouped layouts, and
     caller-provided MMA fields retain the existing path. Explicit fanout
     controls bypass this selector together with explicit launch and MMA fields.
     Mixed-precision candidates use SwapsMmaAb since Keeps is not supported yet.
+
+    Fanout arguments here are caller overrides, before automatic selection.
+    Each Q candidate gets its own automatic split search; final KV/reduction
+    choices are applied after the joint recipe has been selected.
     """
+    # TODO: Refine short-KV setup/epilogue costs. Wider dense Q tiles can
+    # regress even when their current mainloop/reduction proxy scores lower.
     if (
         not auto_tuner
         or split_kv_mode != "disabled"
         or seq_len_q <= 1
-        or cfg.use_variable_seqlens_q
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
         or cfg.num_tokens_per_page != 32
-        or cfg.mask_type != CAUSAL
         or cfg.use_sliding_window_causal
-        or cfg.use_attention_sinks
         or bool(_MMA_SELECTION_FIELDS & explicit_fields)
         or bool(_LAUNCH_SELECTION_FIELDS & explicit_fields)
         or splits_kv != -1
@@ -5333,8 +5336,8 @@ def make_decode_config(
     2. Fill profile-derived defaults: dtype fields, paged-KV metadata, the
        dense/causal mask, sliding-window flags, attention-sink flags, default
        grouped-Q metadata for fixed or packed launches, and the SMEM-derived
-       KV stage count. For an unpinned fixed multi-Q paged-causal page-32
-       launch, the Q selector first enumerates Swaps8/16/32 and Keeps64/128
+       KV stage count. For an unpinned multi-Q page-32 launch without a sliding
+       window, the Q selector first enumerates Swaps8/16/32 and Keeps64/128
        tiles and every useful direct/split recipe through the first
        capacity-crossing fanout.
        Production-valid recipes minimize the empirical TileQ
@@ -5363,8 +5366,8 @@ def make_decode_config(
        downward for a one-wave cluster split.
     6. Validate the final profile combination before returning the config.
 
-    Attention-sink paths skip automatic launch-mode selection. Explicit launch
-    modes are still validated.
+    Outside joint grouped-Q selection, attention-sink paths retain their
+    existing launch mode. Explicit launch modes are still validated.
 
     ``split_kv`` is a common planning control for every FMHA kernel family.
     True permits supported automatic split recipes; False restricts selection
@@ -5477,8 +5480,8 @@ def make_decode_config(
             "fixed-Q max_seq_len_q must equal seq_len_q; use "
             "use_variable_seqlens_q for a runtime-varying Q length"
         )
-    # Resolve Q first. The KV selector consumes the multi-Q cost-model result
-    # instead of forcing a Q64 profile ahead of the established Q policy.
+    # Score Q geometry with candidate KV fanouts on the common KV128 basis.
+    # Finalize the KV tile and reduction mode after selecting that joint recipe.
     auto_selection_explicit_fields = set(explicit_fields)
     selected_grouped_q_recipe = _apply_auto_grouped_q_mma_config(
         cfg,
