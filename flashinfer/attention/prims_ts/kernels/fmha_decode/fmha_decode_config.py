@@ -836,8 +836,8 @@ class FmhaDecodeConfig:
 
     @property
     def uses_scattered_page_route(self) -> bool:
-        """Whether native paged loads consume one locator per page fragment."""
-        return self.has_storage_subpages or self.use_q_token_kv_block_sparse_route
+        """Whether a prepared sparse route supplies page-fragment locators."""
+        return self.use_q_token_kv_block_sparse_route
 
     @property
     def uses_page_offsets_task(self) -> bool:

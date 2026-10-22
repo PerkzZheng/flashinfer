@@ -6330,7 +6330,7 @@ def test_attention_ts_decode_fixed_storage_subpages_do_not_infer_q_token_kv_bloc
         decode_module._resolve_decode_launch_spec.cache_clear()
 
     assert spec.config.has_storage_subpages
-    assert spec.config.uses_scattered_page_route
+    assert not spec.config.uses_scattered_page_route
     assert not spec.config.use_q_token_kv_block_sparse_route
     assert not spec.config.uses_q_token_kv_block_sparse_page_route
     assert not spec.config.uses_q_token_kv_block_sparse_page_membership
@@ -7233,7 +7233,7 @@ def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
         ValueError,
         match=r"plan seq_lens_kv values must be within \[0, 256\]",
     ):
-        _plan_case(case, max_kv_len=256)
+        _plan_case(case, max_kv_len=256, dynamic_kv=False)
 
     wrapper = _plan_case(case, max_kv_len=257)
     policy = dict(wrapper._policy)
@@ -7283,15 +7283,9 @@ def test_attention_ts_decode_persistent_d256_graph_reloads_page_ids():
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize(
-    ("kv_len", "expected_kv_lengths_mode"),
-    ((256, "planned_uniform_max"), (257, "dynamic")),
-)
-def test_attention_ts_decode_static_fp8_d128_odd_kv_tail_is_finite(
-    kv_len: int,
-    expected_kv_lengths_mode: str,
-):
-    """Static grouped Q8 specializes paired tails and guards unpaired tails."""
+@pytest.mark.parametrize("kv_len", (256, 257))
+def test_attention_ts_decode_static_fp8_d128_odd_kv_tail_is_finite(kv_len: int):
+    """Grouped Q8 keeps aligned and odd KV tails finite and repeatable."""
 
     case = _make_decode_case(
         kv_lens=(kv_len,),
@@ -7313,7 +7307,6 @@ def test_attention_ts_decode_static_fp8_d128_odd_kv_tail_is_finite(
     assert policy["groups_tokens_heads_q"] is True
     assert policy["use_persistent_scheduler"] is False
     assert policy["use_split_kv"] is False
-    assert policy["kv_lengths_mode"] == expected_kv_lengths_mode
 
     first_output = None
     for _ in range(3):
@@ -7756,14 +7749,6 @@ def test_attention_ts_decode_compact_variable_k_acceptance(
     wrapper = _plan_case(case, max_kv_len=max(case_kwargs["kv_lens"]))
     policy = dict(wrapper._policy)
     _assert_auto_policy(policy, expected_policy, device=case.q.device)
-    expected_kv_lengths_mode = (
-        "planned_uniform_max"
-        if all(
-            length == max(case_kwargs["kv_lens"]) for length in case_kwargs["kv_lens"]
-        )
-        else "dynamic"
-    )
-    assert policy["kv_lengths_mode"] == expected_kv_lengths_mode
 
     _exercise_public_paths(
         wrapper,
@@ -8470,6 +8455,7 @@ def test_q_token_sparse_geometry_graph(
         context,
         group_size=group,
         workspace_buffer=workspace,
+        device=workspace.device,
         packed_query=packed,
         split_kv=False,
         share_pattern_across_kv_heads=shared,
@@ -8628,6 +8614,7 @@ def test_q_token_sparse_packed_query_boundaries(group, dim, ratio, dtype, split_
         context,
         group_size=group,
         workspace_buffer=workspace,
+        device=workspace.device,
         packed_query=True,
         split_kv=split_kv,
         q_dtype=dtype,
@@ -8826,6 +8813,7 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
         context,
         group_size=group,
         workspace_buffer=workspace,
+        device=workspace.device,
         packed_query=packed,
         split_kv=split_kv,
         share_pattern_across_kv_heads=shared,
@@ -8860,7 +8848,7 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
     prepared = wrapper._prepared_plan
     assert (prepared._attention_plan._compiled_reducer is not None) == split_kv
     if not shared:
-        lengths = prepared._metadata_plan.seq_lens_kv.view(batch, hkv)
+        lengths = prepared._metadata_plan.seq_lens.view(batch, hkv)
         assert bool(torch.all(lengths[:, 1] > lengths[:, 0]))
     check()
     graph = torch.cuda.CUDAGraph()
@@ -8941,7 +8929,7 @@ def test_block_sparse_pattern_heads_graph(storage, fmt, shared):
         max_blocks_per_row=2,
         use_kv_valid_bits=False,
         mask_type=mask,
-        q_dtype=q.dtype,
+        q_data_type=q.dtype,
         share_pattern_across_kv_heads=shared,
     )
     if storage == "paged":

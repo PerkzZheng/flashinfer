@@ -2048,6 +2048,7 @@ class ThroughputLatencyMlaDecodeTs:
                 q_latent_tma,
                 box_dims=(tma_box0, cfg.tile_size_q),
                 ragged_dim=1,
+                use_blackwell_tma_oob_workaround=True,
                 stride_order=(0, 1),
                 swizzle=cuda.TensorMapSwizzle.s128b,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
@@ -2092,6 +2093,7 @@ class ThroughputLatencyMlaDecodeTs:
                     q_rope_tma,
                     box_dims=(min(tma_box0, cfg.rope_dim), cfg.tile_size_q),
                     ragged_dim=1,
+                    use_blackwell_tma_oob_workaround=True,
                     stride_order=(0, 1),
                     swizzle=q_rope_swizzle,
                     l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
@@ -2412,6 +2414,9 @@ class ThroughputLatencyMlaDecodeTs:
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
+        if cutlass.const_expr(acc_o is not None):
+            # Match the PDL launch before reading live metadata or sparse scales.
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
