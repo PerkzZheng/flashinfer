@@ -9377,6 +9377,22 @@ def test_attention_ts_decode_final_statistics(
     torch.testing.assert_close(out.float(), ref, atol=0.02, rtol=0.05)
     torch.testing.assert_close(lse, expected, atol=0.015, rtol=0.002)
 
+    live_pages = case.block_tables.clone()
+    case.block_tables.fill_(-123)
+    for inactive_length in (0, -1, torch.iinfo(torch.int32).min):
+        lengths.fill_(inactive_length)
+        out.fill_(8)
+        lse.fill_(9)
+        graph.replay()
+        torch.testing.assert_close(out, torch.full_like(out, 8), rtol=0, atol=0)
+        torch.testing.assert_close(lse, torch.full_like(lse, 9), rtol=0, atol=0)
+    lengths.fill_(nk)
+    case.block_tables.copy_(live_pages)
+    out.fill_(torch.nan)
+    graph.replay()
+    torch.testing.assert_close(out.float(), ref, atol=0.02, rtol=0.05)
+    torch.testing.assert_close(lse, expected, atol=0.015, rtol=0.002)
+
 
 @pytest.mark.parametrize(
     "head_dim,dtype,out_dtype,page_size,tile_q,splits,seq_len_q",
@@ -9388,6 +9404,7 @@ def test_attention_ts_decode_final_statistics(
         (192, torch.bfloat16, torch.bfloat16, 64, 128, 3, 5),
         (192, _FP8, torch.float16, 128, 64, 3, 5),
         (192, _FP8, _FP8, 64, 128, 1, 5),
+        (192, torch.bfloat16, torch.bfloat16, 32, 16, 3, 5),
         (64, _FP8, _FP8, 4, 64, 1, 5),
         (128, _FP8, _FP8, 8, 128, 1, 5),
         (256, _FP8, torch.float16, 16, 64, 1, 5),
@@ -9403,7 +9420,7 @@ def test_attention_ts_decode_final_statistics(
 def test_attention_ts_decode_paged_keeps_partial_query_groups(
     monkeypatch, head_dim, dtype, out_dtype, page_size, tile_q, splits, seq_len_q
 ):
-    """Fixed-Q Keeps handles partial groups and paged direct/GMEM reduction."""
+    """Fixed-Q MMA handles partial groups and paged direct/GMEM reduction."""
     case = _make_decode_case(
         device="cuda",
         **_case(
