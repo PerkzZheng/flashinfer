@@ -3139,6 +3139,7 @@ def test_mla_final_lse(dtype, heads, nq, nk, packed, mode):
     "heads,batch,kv",
     [
         (16, 3, 2304),  # Rounded capacity changes cluster residency.
+        (64, 1, 8192),
         (64, 1, 19456),
         (128, 2, 8192),
     ],
@@ -3213,3 +3214,19 @@ def test_mla_runtime_count_changes(dtype, heads, batch, kv):
     )
     torch.testing.assert_close(out.float(), shortened, rtol=rtol, atol=atol)
     assert mla_decode_module._get_compiled_mla_decode.cache_info().misses == misses
+
+    live_lengths = case.seq_lens_kv.clone()
+    live_pages = case.block_tables.clone()
+    case.block_tables.fill_(-123)
+    for inactive_length in (0, -1):
+        case.seq_lens_kv.fill_(inactive_length)
+        out.fill_(8)
+        lse.fill_(9)
+        graph.replay()
+        torch.testing.assert_close(out, torch.full_like(out, 8), rtol=0, atol=0)
+        torch.testing.assert_close(lse, torch.full_like(lse, 9), rtol=0, atol=0)
+    case.seq_lens_kv.copy_(live_lengths)
+    case.block_tables.copy_(live_pages)
+    out.fill_(torch.nan)
+    graph.replay()
+    torch.testing.assert_close(out.float(), shortened, rtol=rtol, atol=atol)

@@ -26,8 +26,7 @@ from ...separate_reduction import (
 )
 from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
 from ..helpers.tile import runtime_split_count
-from ..helpers.math import final_lse
-from ..helpers.math import ceil_div
+from ..helpers.math import ceil_div, final_lse, ffma2
 from ..helpers.ops import (
     fmax_f32,
     warp_reduce_max_f32,
@@ -208,6 +207,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
     requested_splits=None,
+    request_is_active=True,
 ):
     """Reduce G1 partials with the compact row-shared schedule."""
 
@@ -264,7 +264,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
         )
         valid_stats = stats_head_idx < Int32(cfg.num_heads_q) and stats_query_row[4]
         if cutlass.const_expr(not finalize_attention):
-            valid_stats = valid_stats & (cache_seqs[batch_idx] > Int32(0))
+            valid_stats = valid_stats & request_is_active
         if valid_stats:
             row_lse = acc_lse[stats_head_idx, None, q_idx, batch_idx]
             lse_per_lane = ceil_div(
@@ -362,7 +362,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     # Sparse finalization must publish even if the primary source is empty:
     # the extra source may be live, and two empty sources produce zero output.
     if cutlass.const_expr(not finalize_attention):
-        valid_output = valid_output & (cache_seqs[batch_idx] > Int32(0))
+        valid_output = valid_output & request_is_active
     if valid_output:
         output_acc = cutlass.Array(
             Float32,
@@ -382,6 +382,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             head_idx,
             dim_idx,
         )
+        # Pair FP32 channels while preserving each channel's split order.
         if split_limit == Int32(cfg.num_ctas_per_seq_kv):
             for split_i in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
                 split_idx = Int32(split_i)
@@ -402,9 +403,13 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                             * cfg.partial_o_dtype_bytes,
                         ).to(Float32)
                         for elem_i in cutlass.range_constexpr(
-                            output_elements_per_thread
+                            0, output_elements_per_thread, 2
                         ):
-                            output_acc[elem_i] += partial_o[elem_i] * scale
+                            output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
+                                (partial_o[elem_i], partial_o[elem_i + 1]),
+                                (scale, scale),
+                                (output_acc[elem_i], output_acc[elem_i + 1]),
+                            )
         else:
             for split_i in cutlass.range(split_limit, unroll=1):
                 split_idx = Int32(split_i)
@@ -424,9 +429,13 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                             * cfg.partial_o_dtype_bytes,
                         ).to(Float32)
                         for elem_i in cutlass.range_constexpr(
-                            output_elements_per_thread
+                            0, output_elements_per_thread, 2
                         ):
-                            output_acc[elem_i] += partial_o[elem_i] * scale
+                            output_acc[elem_i], output_acc[elem_i + 1] = ffma2(
+                                (partial_o[elem_i], partial_o[elem_i + 1]),
+                                (scale, scale),
+                                (output_acc[elem_i], output_acc[elem_i + 1]),
+                            )
 
         output_query_row = public_query_flat_row(
             cfg,
@@ -472,6 +481,7 @@ def _run_parallel_gmem_reduction_shared_stats(
     actual_splits: cutlass.Constexpr[int],
     elements_per_slice: cutlass.Constexpr[int],
     requested_splits=None,
+    request_is_active=True,
 ):
     """Reduce split-KV with one cooperative statistics warp per output row.
 
@@ -541,7 +551,7 @@ def _run_parallel_gmem_reduction_shared_stats(
             batch_idx=batch_idx,
         )
         valid_stats = stats_head_idx < Int32(cfg.num_heads_q) and valid_stats_row
-        valid_stats = valid_stats & (cache_seqs[batch_idx] > Int32(0))
+        valid_stats = valid_stats & request_is_active
         lse_per_lane = ceil_div(local_slots, GMEM_REDUCTION_WARP_LANES)
         lane_lse = cutlass.Array(
             Float32,
@@ -631,7 +641,7 @@ def _run_parallel_gmem_reduction_shared_stats(
         and dim_idx < Int32(cfg.head_dim_v)
         and valid_output_row
     )
-    valid_output = valid_output & (cache_seqs[batch_idx] > Int32(0))
+    valid_output = valid_output & request_is_active
     local_output = cutlass.Array(
         Float32,
         output_elements_per_thread,
@@ -741,7 +751,7 @@ def _run_parallel_gmem_reduction_shared_stats(
                 batch_idx=batch_idx,
             )
             valid_stats = stats_head_idx < Int32(cfg.num_heads_q) and valid_stats_row
-            valid_stats = valid_stats & (cache_seqs[batch_idx] > Int32(0))
+            valid_stats = valid_stats & request_is_active
             peer_lse = neg_inf
             for peer_rank_i in cutlass.range_constexpr(cluster_size):
                 if valid_stats and lane_idx == Int32(peer_rank_i):
@@ -871,6 +881,12 @@ def run_parallel_gmem_reduction_kernel(
         raise ValueError("final attention output uses a single-CTA reducer per row")
     prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
 
+    # Reuse the CTA's predicate across the statistics barrier instead of
+    # reloading metadata. Sparse finalization can have a live extra source.
+    request_is_active = cutlass.Boolean(True)
+    if cutlass.const_expr(not finalize_attention):
+        request_is_active = cache_seqs[cute.arch.block_idx()[2]] > Int32(0)
+
     if cutlass.const_expr(cluster_size == 1):
         _run_parallel_gmem_reduction_g1_shared_stats(
             output,
@@ -886,6 +902,7 @@ def run_parallel_gmem_reduction_kernel(
             output_quant,
             output_quant_args,
             requested_splits=requested_splits,
+            request_is_active=request_is_active,
         )
         return
 
@@ -902,4 +919,5 @@ def run_parallel_gmem_reduction_kernel(
         actual_splits,
         elements_per_slice,
         requested_splits=requested_splits,
+        request_is_active=request_is_active,
     )

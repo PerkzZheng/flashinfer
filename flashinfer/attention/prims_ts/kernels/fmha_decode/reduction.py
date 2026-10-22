@@ -133,9 +133,10 @@ def _reduction_active_splits_kv(
 ) -> Int32:
     """Recompute the producer's useful split prefix for one output row."""
     q_group_idx = _reduction_q_group_idx(cfg, h_r, logical_output_row_idx)
+    seq_len_kv = cute.math.max(Int32(g_seqlens_kv[b_idx]), Int32(0))
     return _runtime_active_splits_kv(
         cfg,
-        Int32(g_seqlens_kv[b_idx]),
+        seq_len_kv,
         seq_len_q,
         _q_group_token_base(cfg, q_group_idx),
         requested_splits=requested_splits,
@@ -238,8 +239,8 @@ def _reduce_exact_splits_body(
             seq_len_q,
             requested_splits=requested_splits,
         )
-        # Empty producers intentionally leave scratch and output untouched.
-        valid_reduce_row = valid_reduce_row & (Int32(g_seqlens_kv[b_idx]) > Int32(0))
+        # A zero prefix publishes no partials; reuse it without reloading lengths.
+        valid_reduce_row = valid_reduce_row & (active_splits_kv > Int32(0))
 
     if valid_reduce_row:
         # The workspace retains configured-max strides, but only the runtime
@@ -606,8 +607,8 @@ def decode_gen_parallel_separate_reduction_kernel(
             seq_len_q,
             requested_splits=requested_splits,
         )
-        # Empty producers intentionally leave scratch and output untouched.
-        valid_reduce_row = valid_reduce_row & (Int32(g_seqlens_kv[b_idx]) > Int32(0))
+        # A zero prefix publishes no partials; reuse it without reloading lengths.
+        valid_reduce_row = valid_reduce_row & (active_splits_kv > Int32(0))
 
     for split_base_i in cutlass.range_constexpr(
         0, lane_splits, PARALLEL_REDUCTION_LOAD_BATCH

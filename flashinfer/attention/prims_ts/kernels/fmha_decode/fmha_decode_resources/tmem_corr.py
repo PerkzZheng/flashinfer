@@ -2031,7 +2031,11 @@ class TmemCorrResource(DecodeGenResourceBase):
                     dst_row_idx,
                     self.seq_len_q,
                 )
-                if valid_partial_row and dst_col_offset < Int32(cfg.headdim * 2):
+                # Only padded STSM head bands need a runtime column check.
+                if valid_partial_row and (
+                    cfg.swaps_output_head_dim == cfg.headdim
+                    or dst_col_offset < Int32(cfg.headdim * 2)
+                ):
                     smem_src = self._smem_base_o_i32.subview(
                         load_smem_offset >> Int32(2)
                     ).data_ptr()
@@ -2089,7 +2093,10 @@ class TmemCorrResource(DecodeGenResourceBase):
                     logical_q_group_idx,
                     dst_row_idx,
                     self.seq_len_q,
-                ) and dst_col_offset < Int32(cfg.headdim * cfg.o_dtype_bytes):
+                ) and (
+                    cfg.swaps_output_head_dim == cfg.headdim
+                    or dst_col_offset < Int32(cfg.headdim * cfg.o_dtype_bytes)
+                ):
                     smem_src = self._smem_base_o_i32.subview(
                         load_smem_offset >> Int32(2)
                     ).data_ptr()
