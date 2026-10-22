@@ -67,7 +67,7 @@ def get_prims_ts_q_token_kv_block_sparse_workspace_size(
         block_table,
         block_topk=block_topk,
         max_seq_len_kv=max_seq_len_kv,
-        o_data_type=out_dtype,
+        out_dtype=out_dtype,
         qo_indptr=qo_indptr,
         group_size=group_size,
         kv_block_size=sparse_block_size,
@@ -110,7 +110,7 @@ def prims_ts_q_token_kv_block_sparse_attention(
         sm_scale=bmm1_scale,
         v_scale=bmm2_scale,
         out=out,
-        o_data_type=out_dtype,
+        out_dtype=out_dtype,
         qo_indptr=qo_indptr,
         split_kv=split_kv,
     )
@@ -158,13 +158,13 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "device",
         "workspace_buffer",
         "group_size",
-        "use_packed_q",
+        "packed_query",
         "split_kv",
         "share_pattern_across_kv_heads",
         "mask_type",
-        "q_data_type",
-        "kv_data_type",
-        "o_data_type",
+        "q_dtype",
+        "kv_dtype",
+        "out_dtype",
     )
     run_parameters = inspect.signature(QTokenKvBlockSparsePagedTSWrapper.run).parameters
     assert tuple(run_parameters) == (
@@ -434,7 +434,7 @@ def test_unified_q_token_kv_block_sparse_workspace_8k_q_128k_kv_owns_metadata_ou
         out_dtype=torch.bfloat16,
         device="cuda",
         num_query_groups=2048,
-        use_packed_q=True,
+        packed_query=True,
         split_kv=False,
     )
 
@@ -582,13 +582,13 @@ def test_fixed_q_token_kv_block_sparse_workspace_size_rejects_mismatched_group_s
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("use_packed_q", (False, True))
+@pytest.mark.parametrize("packed_query", (False, True))
 def test_q_token_kv_block_sparse_workspace_size_enforces_q128_group_capacity(
-    use_packed_q: bool,
+    packed_query: bool,
 ) -> None:
     group_size = 8
     num_qo_heads = 24
-    if use_packed_q:
+    if packed_query:
         query = torch.empty(
             (group_size, num_qo_heads, 256),
             dtype=torch.bfloat16,
@@ -841,8 +841,8 @@ def test_q1_page_prefix_and_causal_tail_graph(dtype):
         context,
         device=query.device,
         workspace_buffer=workspace,
-        q_data_type=dtype,
-        o_data_type=out.dtype,
+        q_dtype=dtype,
+        out_dtype=out.dtype,
     )
 
     def run():
@@ -3674,9 +3674,9 @@ def test_q_token_kv_block_sparse_attention_unified_workspace_matches_two_step_cu
         group_size=group_size,
         device=query.device,
         workspace_buffer=unified_workspace,
-        q_data_type=query.dtype,
-        kv_data_type=k_cache.dtype,
-        o_data_type=graph_output.dtype,
+        q_dtype=query.dtype,
+        kv_dtype=k_cache.dtype,
+        out_dtype=graph_output.dtype,
     )
     graph_wrapper.run(
         query,
@@ -3931,7 +3931,7 @@ def test_grouped_cache_stride_rebinding_graph(
             table,
             block_topk=topk,
             max_seq_len_kv=context,
-            o_data_type=output.dtype,
+            out_dtype=output.dtype,
             qo_indptr=qo_indptr,
             group_size=group,
             split_kv=False,
@@ -3953,10 +3953,10 @@ def test_grouped_cache_stride_rebinding_graph(
         group_size=group,
         device=query.device,
         workspace_buffer=workspace,
-        use_packed_q=True,
+        packed_query=True,
         split_kv=False,
-        q_data_type=query.dtype,
-        o_data_type=output.dtype,
+        q_dtype=query.dtype,
+        out_dtype=output.dtype,
         share_pattern_across_kv_heads=share_pattern,
     )
     tokens = torch.arange(context, device="cuda")

@@ -824,7 +824,7 @@ def build_throughput_latency_mla_task_manager(
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
-        atten_sinks=sparse_epilogue_params,
+        attention_sinks=sparse_epilogue_params,
         output_quant=output_quant,
         output_quant_args=output_quant_args,
         o_tensor=o_tensor,
@@ -845,7 +845,7 @@ def build_throughput_latency_mla_task_manager(
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
-        atten_sinks=sparse_epilogue_params,
+        attention_sinks=sparse_epilogue_params,
         output_quant=output_quant,
         output_quant_args=output_quant_args,
         o_tensor=o_tensor,
@@ -1433,7 +1433,7 @@ def _make_single_kv_pipe_task_graph(
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
-        atten_sinks=sparse_epilogue_params,
+        attention_sinks=sparse_epilogue_params,
         output_quant=output_quant,
         output_quant_args=output_quant_args,
         o_tensor=o_tensor,
@@ -2204,7 +2204,7 @@ class ThroughputLatencyMlaDecodeTs:
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
 
-        softmax_scale_log2 = softmax_scale * LOG2_E
+        scale_softmax_log2 = softmax_scale * LOG2_E
         use_gmem_reduction = cutlass.const_expr(
             cfg.use_multi_ctas_kv == 1 and cfg.use_cluster_reduction != 1
         )
@@ -2286,7 +2286,7 @@ class ThroughputLatencyMlaDecodeTs:
             acc_lse,
             cache_seqs,
             cu_seqlens_q,
-            softmax_scale_log2,
+            scale_softmax_log2,
             output_scale,
             tile_sched_params,
             block_split_kvs,
@@ -2305,9 +2305,9 @@ class ThroughputLatencyMlaDecodeTs:
                 self.use_parallel_reduction or cfg.fuse_sparse_reduction
             ):
                 reducer_cfg, topology, elements = self._parallel_reduction_setup(cfg)
-                atten_sinks = None
+                attention_sinks = None
                 if cutlass.const_expr(cfg.fuse_sparse_reduction):
-                    atten_sinks = block_split_kvs[-1]
+                    attention_sinks = block_split_kvs[-1]
                 reduction_grid, reduction_cluster = (
                     parallel_gmem_reduction_launch_shape(
                         reducer_cfg,
@@ -2330,7 +2330,7 @@ class ThroughputLatencyMlaDecodeTs:
                     acc_lse,
                     cache_seqs,
                     cu_seqlens_q,
-                    atten_sinks,
+                    attention_sinks,
                     output_quant_args,
                     requested_splits=requested_splits,
                 )
@@ -2403,7 +2403,7 @@ class ThroughputLatencyMlaDecodeTs:
         acc_lse: cute.Tensor,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
-        softmax_scale_log2: cutlass.Float32,
+        scale_softmax_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         tile_sched_params: object,
         sparse_inputs: object,
@@ -2432,7 +2432,7 @@ class ThroughputLatencyMlaDecodeTs:
             )
             if cutlass.const_expr(not cfg.sparse_static_scales):
                 # Caller scales already include Q/K/V descales.
-                softmax_scale_log2 = cutlass.Float32(sm[0]) * LOG2_E
+                scale_softmax_log2 = cutlass.Float32(sm[0]) * LOG2_E
                 output_scale = cutlass.Float32(os[0])
             sparse_epilogue_params = sinks
         else:
@@ -2553,7 +2553,7 @@ class ThroughputLatencyMlaDecodeTs:
             cta_idx_q=cta_idx_q,
             cta_idx_kv=cta_idx_kv,
             cta_idx_head_dim_v=cta_idx_head_dim_v,
-            scale_softmax_log2=softmax_scale_log2,
+            scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             sparse_epilogue_params=sparse_epilogue_params,
             output_quant=self.output_quant
@@ -2713,7 +2713,7 @@ class ThroughputLatencyMlaDecodeTs:
         acc_lse: cute.Tensor,
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor,
-        atten_sinks: cute.Tensor | None = None,
+        attention_sinks: cute.Tensor | None = None,
         output_quant_args=None,
         requested_splits=None,
     ):
@@ -2733,7 +2733,7 @@ class ThroughputLatencyMlaDecodeTs:
             topology.slots_per_rank,
             topology.actual_splits,
             elements,
-            atten_sinks,
+            attention_sinks,
             cfg.fuse_sparse_reduction,
             self.output_quant,
             output_quant_args,

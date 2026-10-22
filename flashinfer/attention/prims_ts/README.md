@@ -89,7 +89,7 @@ from flashinfer.attention.prims_ts import batch_decode_with_paged_kv_cache
 
 def decode():
     return batch_decode_with_paged_kv_cache(
-        q, paged_kv_cache, block_tables, seq_lens,
+        q, paged_kv_cache, block_tables, seq_lens_kv,
         workspace_buffer=workspace, max_kv_len=max_kv_len,
         out=out, validate=False,
     )
@@ -142,13 +142,13 @@ workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
 wrapper = BatchDecodePagedTSWrapper("NHD")
 wrapper.plan(
     device, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, max_kv_len,
-    max_seq_len_q=max_seq_len_q, q_data_type=dtype, packed_query=True,
+    max_seq_len_q=max_seq_len_q, q_dtype=dtype, packed_query=True,
     mask_type="causal", workspace_buffer=workspace,
 )
 
 # Two requests: Q lengths [2, 1], KV lengths [128, 96].
 q = torch.randn(3, num_qo_heads, head_dim, dtype=dtype, device=device)
-seq_lens = torch.tensor([128, 96], dtype=torch.int32, device=device)
+seq_lens_kv = torch.tensor([128, 96], dtype=torch.int32, device=device)
 block_tables = torch.tensor(
     [[0, 1, 2, 3], [4, 5, 6, 0]], dtype=torch.int32, device=device
 )
@@ -157,9 +157,9 @@ k_cache = torch.randn(7, page_size, num_kv_heads, head_dim, dtype=dtype, device=
 v_cache = torch.randn_like(k_cache)
 out = torch.empty_like(q)
 
-wrapper.run(q, (k_cache, v_cache), seq_lens, block_tables, qo_indptr=qo_indptr, out=out)
+wrapper.run(q, (k_cache, v_cache), seq_lens_kv, block_tables, qo_indptr=qo_indptr, out=out)
 result = wrapper.run(
-    q, (k_cache, v_cache), seq_lens, block_tables,
+    q, (k_cache, v_cache), seq_lens_kv, block_tables,
     qo_indptr=qo_indptr, out=out, validate=False,
 )
 print(f"Workspace: {workspace.numel():,} bytes; output: {tuple(result.shape)}")
@@ -223,7 +223,7 @@ revision owns mutable route and split-KV scratch, so unordered concurrent runs
 need distinct wrappers.
 
 Packed prefill uses `q[total_q, Hq, D]`, `qo_indptr`, and
-`use_packed_q=True`; planned `group_size` is the maximum request-safe route
+`packed_query=True`; planned `group_size` is the maximum request-safe route
 length. Fixed MTP decode uses `q[B, Nq, G, Hq, D]` without `qo_indptr`,
 where planned `batch_size = B * Nq` and `group_size = G`. The default
 `group_size=1` disables query grouping; pass a larger G explicitly for either
@@ -390,7 +390,7 @@ scale must be finite and positive; the kernel does not check the values.
 | Input | Supported values |
 | --- | --- |
 | Q/K dtype | Matching `torch.float8_e4m3fn`, or `torch.int8` on SM100a/B200 only |
-| V dtype (`v_data_type`) | `torch.float8_e4m3fn`; it defaults to the K dtype, so INT8 plans set it |
+| V dtype (`v_dtype`) | `torch.float8_e4m3fn`; it defaults to the K dtype, so INT8 plans set it |
 | Output dtype | `torch.bfloat16` (default) or `torch.float16` |
 | `q_block_size` | Power of two no larger than the Q tile; default 1 |
 | `k_block_size` | 1, 4, 16, 32, 64, 128 or 256; default 16 |
@@ -463,8 +463,8 @@ wrapper.plan(
     B, Sq, Skv, Hq, Hkv, D, 64, 64,
     device=device,
     use_block_sparse=False,
-    q_data_type=fp8,
-    kv_data_type=fp8,
+    q_dtype=fp8,
+    kv_dtype=fp8,
     sage_config=SageAttentionConfig(q_block_size=1, k_block_size=16),
 )
 
@@ -490,9 +490,9 @@ wrapper.plan(
     device=device,
     max_blocks_per_row=8,
     use_proxy_routes=True,
-    q_data_type=torch.int8,
-    k_data_type=torch.int8,
-    v_data_type=fp8,
+    q_dtype=torch.int8,
+    k_dtype=torch.int8,
+    v_dtype=fp8,
     sage_config=SageAttentionConfig(),
 )
 
@@ -574,6 +574,9 @@ FlashInfer FMHA/cascade statistics. Enable LSE in planning, then request
 whenever supplied to an enabled plan, even if the return flag is false.
 LSE excludes output scaling and removes internal FP8 probability amplification.
 Keep output and LSE buffers disjoint from live inputs and workspace.
+Sparse MLA retains its existing `return_lse` contract: natural-log QK LSE
+before the attention-sink contribution. Its scale arguments also accept scalar
+CUDA FP32 tensors, while dense wrappers use host scalar scale operands.
 
 Context and dense FMHA decode plans additionally support
 `use_attention_sinks=True`, binding `attention_sinks` on every run. This FP32
@@ -588,6 +591,9 @@ for allocation-free replay.
 FP8 scalar dequantization remains caller-composed: effective QK scale is
 `attention_scale * q_scale * k_scale`; effective output scale includes `v_scale`.
 Dense context, FMHA decode and MLA decode use `softmax_scale` / `output_scale`.
+Where applicable, their public interfaces use `q_dtype` / `k_dtype` / `v_dtype` /
+`kv_dtype` / `out_dtype`, `packed_query`, `num_qo_heads`, `seq_lens_kv`, and
+`max_kv_len`. Sparse MLA uses `attention_sinks` and `use_attention_sinks`.
 The QK scale is in natural-exponential units; context converts it to base two
 internally. Context planning sets defaults that `run()` may override. Context
 and FMHA decode default to `1 / sqrt(D)`; MLA retains its default of 1.

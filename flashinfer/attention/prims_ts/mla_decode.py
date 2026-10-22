@@ -88,12 +88,12 @@ class _MLADecodeCompileSpec:
 
     device_index: int
     kernel_signature: tuple[object, ...]
-    num_heads: int
+    num_qo_heads: int
     kv_lora_rank: int
     qk_rope_head_dim: int
     page_size: int
     q_dtype_key: str
-    output_dtype_key: str
+    out_dtype_key: str
     max_seq_len_q: int
     packed_query: bool
     has_kernel_workspace: bool
@@ -125,7 +125,7 @@ class _MLADecodePlanState:
 
     device: torch.device
     batch_size: int
-    num_heads: int
+    num_qo_heads: int
     max_seq_len_q: int
     packed_query: bool
     kv_lora_rank: int
@@ -133,7 +133,7 @@ class _MLADecodePlanState:
     page_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
-    output_dtype: torch.dtype
+    out_dtype: torch.dtype
     mask_type: Literal["dense", "causal"]
     max_kv_len: int
     required_page_columns: int
@@ -162,7 +162,7 @@ class _MLARuntime:
 def _make_mla_workspace_layout(
     kernel_workspace_bytes: int,
     batch_size: int,
-    num_heads: int,
+    num_qo_heads: int,
     max_seq_len_q: int = 1,
     *,
     include_lse: bool = True,
@@ -172,7 +172,7 @@ def _make_mla_workspace_layout(
     )
     lse, byte_end = _append_workspace_section(
         byte_end,
-        (batch_size, max_seq_len_q, num_heads) if include_lse else (0,),
+        (batch_size, max_seq_len_q, num_qo_heads) if include_lse else (0,),
         torch.float32,
     )
     return _MLAWorkspaceLayout(
@@ -242,19 +242,19 @@ def _validate_mla_nonnegative_int32_extent(value: int, name: str) -> int:
 def _validate_mla_query_head_extent(
     *,
     batch_size: int,
-    num_heads: int,
+    num_qo_heads: int,
     max_seq_len_q: int,
     total_q: Optional[int] = None,
 ) -> None:
     """Keep fixed-capacity and packed query-head coordinates in signed Int32."""
     _validate_mla_int32_extent(
-        batch_size * max_seq_len_q * num_heads,
-        "batch_size * max_seq_len_q * num_heads",
+        batch_size * max_seq_len_q * num_qo_heads,
+        "batch_size * max_seq_len_q * num_qo_heads",
     )
     if total_q is not None:
         _validate_mla_nonnegative_int32_extent(
-            total_q * num_heads,
-            "total_q * num_heads",
+            total_q * num_qo_heads,
+            "total_q * num_qo_heads",
         )
 
 
@@ -279,11 +279,11 @@ def _validate_mla_policy_coordinate_span(
 def _validate_mla_dtype_pair(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
-    output_dtype: torch.dtype,
+    out_dtype: torch.dtype,
 ) -> None:
     _dtype_key(q_dtype)
     _dtype_key(kv_dtype)
-    _dtype_key(output_dtype)
+    _dtype_key(out_dtype)
     if q_dtype != kv_dtype:
         raise NotImplementedError(
             "attention-ts MLA decode requires query and KV cache to use the "
@@ -293,10 +293,10 @@ def _validate_mla_dtype_pair(
         raise NotImplementedError(
             f"attention-ts MLA decode supports BF16 and FP8-E4M3 input; got {q_dtype}"
         )
-    if output_dtype not in _SUPPORTED_OUTPUT_DTYPES:
+    if out_dtype not in _SUPPORTED_OUTPUT_DTYPES:
         raise NotImplementedError(
             "attention-ts MLA decode currently supports BF16 output only; "
-            f"got {output_dtype}"
+            f"got {out_dtype}"
         )
 
 
@@ -324,7 +324,7 @@ def _validate_int32_cuda_tensor(
 
 def _validate_mla_metadata(
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
 ) -> tuple[torch.device, int, int]:
     _validate_int32_cuda_tensor(
         block_tables,
@@ -334,16 +334,16 @@ def _validate_mla_metadata(
         require_16byte_alignment=False,
     )
     _validate_int32_cuda_tensor(
-        seq_lens,
-        "seq_lens",
+        seq_lens_kv,
+        "seq_lens_kv",
         ndim=1,
         require_16byte_alignment=False,
     )
-    if block_tables.device != seq_lens.device:
-        raise ValueError("block_tables and seq_lens must be on the same device")
-    batch_size = int(seq_lens.numel())
+    if block_tables.device != seq_lens_kv.device:
+        raise ValueError("block_tables and seq_lens_kv must be on the same device")
+    batch_size = int(seq_lens_kv.numel())
     if batch_size <= 0:
-        raise ValueError("seq_lens must contain at least one request")
+        raise ValueError("seq_lens_kv must contain at least one request")
     if block_tables.shape[0] != batch_size:
         raise ValueError(
             "block_tables must have one row per request: expected "
@@ -361,11 +361,11 @@ def _validate_mla_metadata(
         )
     if block_tables.data_ptr() % 4 != 0:
         raise ValueError("block_tables must be 4-byte aligned")
-    if seq_lens.data_ptr() % 4 != 0:
-        raise ValueError("seq_lens must be 4-byte aligned")
+    if seq_lens_kv.data_ptr() % 4 != 0:
+        raise ValueError("seq_lens_kv must be 4-byte aligned")
     _validate_mla_int32_extent(batch_size, "batch_size")
     _validate_mla_int32_extent(int(block_tables.numel()), "block_tables elements")
-    return seq_lens.device, batch_size, max_num_pages
+    return seq_lens_kv.device, batch_size, max_num_pages
 
 
 def _validate_qo_indptr(
@@ -419,7 +419,7 @@ def _derive_max_seq_len_q(
 def _validate_mla_run_metadata(
     runtime: _MLARuntime,
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
     *,
     device: torch.device,
@@ -438,7 +438,7 @@ def _validate_mla_run_metadata(
     """
 
     metadata_device, metadata_batch_size, max_num_pages = _validate_mla_metadata(
-        block_tables, seq_lens
+        block_tables, seq_lens_kv
     )
     if metadata_device != device:
         raise ValueError(
@@ -483,7 +483,7 @@ def _validate_mla_run_metadata(
             raise ValueError("fixed-query MLA plan does not accept qo_indptr")
         q_lengths = (max_seq_len_q,) * batch_size
 
-    seq_lens_host = tuple(int(value) for value in seq_lens.tolist())
+    seq_lens_host = tuple(int(value) for value in seq_lens_kv.tolist())
     if any(seq_len <= 0 for seq_len in seq_lens_host):
         raise ValueError("every runtime request must contain at least one KV token")
     runtime_max_kv_len = max(seq_lens_host)
@@ -558,7 +558,7 @@ def _validate_query(
     packed_query: bool = False,
     device: Optional[torch.device] = None,
     batch_size: Optional[int] = None,
-    num_heads: Optional[int] = None,
+    num_qo_heads: Optional[int] = None,
     max_seq_len_q: Optional[int] = None,
     q_dtype: Optional[torch.dtype] = None,
     query_dim: int = _MLA_QUERY_DIM,
@@ -595,10 +595,10 @@ def _validate_query(
             f"query batch size must match the plan ({batch_size}), got {query.shape[0]}"
         )
     head_axis = 1 if packed_query else 2
-    if num_heads is not None and query.shape[head_axis] != num_heads:
+    if num_qo_heads is not None and query.shape[head_axis] != num_qo_heads:
         raise ValueError(
             "query head count must match the plan "
-            f"({num_heads}), got {query.shape[head_axis]}"
+            f"({num_qo_heads}), got {query.shape[head_axis]}"
         )
     if max_seq_len_q is not None:
         if packed_query:
@@ -615,10 +615,10 @@ def _validate_query(
                 "fixed query length must equal the planned max_seq_len_q "
                 f"({max_seq_len_q}), got {query.shape[1]}"
             )
-        if batch_size is not None and num_heads is not None:
+        if batch_size is not None and num_qo_heads is not None:
             _validate_mla_query_head_extent(
                 batch_size=batch_size,
-                num_heads=num_heads,
+                num_qo_heads=num_qo_heads,
                 max_seq_len_q=max_seq_len_q,
                 total_q=int(query.shape[0]) if packed_query else None,
             )
@@ -680,11 +680,11 @@ def _validate_out(
     *,
     device: torch.device,
     batch_size: int,
-    num_heads: int,
+    num_qo_heads: int,
     max_seq_len_q: int,
     packed_query: bool,
     total_q: Optional[int] = None,
-    output_dtype: torch.dtype,
+    out_dtype: torch.dtype,
 ) -> None:
     if not isinstance(out, torch.Tensor):
         raise TypeError("out must be a torch.Tensor")
@@ -692,15 +692,15 @@ def _validate_out(
         if total_q is None:
             raise ValueError("total_q is required to validate packed output")
         expected_shape: tuple[int, ...]
-        expected_shape = (total_q, num_heads, _MLA_LATENT_DIM)
+        expected_shape = (total_q, num_qo_heads, _MLA_LATENT_DIM)
     else:
-        expected_shape = (batch_size, max_seq_len_q, num_heads, _MLA_LATENT_DIM)
+        expected_shape = (batch_size, max_seq_len_q, num_qo_heads, _MLA_LATENT_DIM)
     if out.shape != expected_shape:
         raise ValueError(
             f"out must have shape {expected_shape}, got {tuple(out.shape)}"
         )
-    if out.dtype != output_dtype:
-        raise ValueError(f"out must have dtype {output_dtype}, got {out.dtype}")
+    if out.dtype != out_dtype:
+        raise ValueError(f"out must have dtype {out_dtype}, got {out.dtype}")
     if out.device != device:
         raise ValueError(f"out must be on {device}, got {out.device}")
     if not out.is_contiguous():
@@ -750,14 +750,14 @@ def _separate_reducer_provenance(
 def _resolve_mla_decode_launch_spec(
     device_index: int,
     batch_size: int,
-    num_heads: int,
+    num_qo_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     page_size: int,
     max_kv_len: int,
     q_dtype_key: str,
     kv_dtype_key: str,
-    output_dtype_key: str,
+    out_dtype_key: str,
     mask_type: str,
     seq_len_q: int = 1,
 ):
@@ -795,18 +795,18 @@ def _resolve_mla_decode_launch_spec(
     seq_len_q = _validate_positive_int(seq_len_q, "seq_len_q")
     _validate_mla_query_head_extent(
         batch_size=batch_size,
-        num_heads=num_heads,
+        num_qo_heads=num_qo_heads,
         max_seq_len_q=seq_len_q,
     )
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
     qkv_dtype_name = _kernel_dtype_name(q_dtype_key)
-    output_dtype_name = _kernel_dtype_name(output_dtype_key)
+    output_dtype_name = _kernel_dtype_name(out_dtype_key)
 
     with torch.cuda.device(device_index):
         max_active_one_cta_clusters = get_max_active_clusters(1)
         max_active_two_cta_clusters = get_max_active_clusters(2)
         one_cta_launch_shape = resolve_auto_flat_query_launch_shape(
-            num_heads_q=num_heads,
+            num_heads_q=num_qo_heads,
             seq_len_q=seq_len_q,
         )
         one_cta_base_work = q_tile_work_count(
@@ -821,7 +821,9 @@ def _resolve_mla_decode_launch_spec(
             base_work=one_cta_base_work,
             target_work=max_active_one_cta_clusters,
         )
-        two_cta_launch_shape = FlatQueryTileLayout.for_tile(num_heads, seq_len_q, 128)
+        two_cta_launch_shape = FlatQueryTileLayout.for_tile(
+            num_qo_heads, seq_len_q, 128
+        )
         two_cta_split_kv = compute_split_kv(
             batch_size=batch_size,
             num_q_tiles=two_cta_launch_shape.num_tiles,
@@ -834,7 +836,7 @@ def _resolve_mla_decode_launch_spec(
         two_cta_split_kv = min(two_cta_split_kv, sm_count)
         requested_policy, policy_source = resolve_mla_kernel_policy(
             None,
-            num_heads,
+            num_qo_heads,
             seq_len_q,
             one_cta_split_kv=one_cta_split_kv,
             two_cta_split_kv=two_cta_split_kv,
@@ -899,7 +901,7 @@ def _resolve_mla_decode_launch_spec(
                 out_dtype=output_dtype_name,
                 profile=decision.profile_name,
                 reduction_mode=reduction_mode,
-                logical_num_heads=num_heads,
+                logical_num_heads=num_qo_heads,
                 logical_seq_len_q=seq_len_q,
                 tile_size_q=launch_shape.tile_size_q,
                 explicit_split_kv=None,
@@ -948,7 +950,7 @@ def _resolve_mla_decode_launch_spec(
             decision = select_mla_ts_kernel(
                 requested_policy=requested_policy,
                 batch_size=batch_size,
-                num_heads=num_heads,
+                num_heads=num_qo_heads,
                 seq_len_q=seq_len_q,
                 seq_len_k=max_kv_len,
                 latent_dim=kv_lora_rank,
@@ -987,7 +989,7 @@ def _resolve_mla_decode_launch_spec(
                 qkv_dtype=qkv_dtype_name,
                 out_dtype=output_dtype_name,
                 rope_dim=qk_rope_head_dim,
-                num_heads=num_heads,
+                num_heads=num_qo_heads,
                 seq_len_q=seq_len_q,
                 batch_size=batch_size,
                 mask_type=mask_type,
@@ -1065,12 +1067,12 @@ def _make_mla_decode_compile_spec(
     launch_spec: _MLADecodeLaunchSpec,
     *,
     device_index: int,
-    num_heads: int,
+    num_qo_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     page_size: int,
     q_dtype_key: str,
-    output_dtype_key: str,
+    out_dtype_key: str,
     max_seq_len_q: int,
     packed_query: bool,
     lse_mode: str = "none",
@@ -1085,12 +1087,12 @@ def _make_mla_decode_compile_spec(
     return _MLADecodeCompileSpec(
         device_index=device_index,
         kernel_signature=_mla_kernel_compile_signature(kernel),
-        num_heads=num_heads,
+        num_qo_heads=num_qo_heads,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         page_size=page_size,
         q_dtype_key=q_dtype_key,
-        output_dtype_key=output_dtype_key,
+        out_dtype_key=out_dtype_key,
         max_seq_len_q=max_seq_len_q,
         packed_query=packed_query,
         has_kernel_workspace=launch_spec.kernel_workspace_bytes > 0,
@@ -1116,7 +1118,7 @@ def _get_compiled_mla_decode(
     import cutlass.cute as cute
 
     device_index = compile_spec.device_index
-    num_heads = compile_spec.num_heads
+    num_qo_heads = compile_spec.num_qo_heads
     kv_lora_rank = compile_spec.kv_lora_rank
     qk_rope_head_dim = compile_spec.qk_rope_head_dim
     query_dim = kv_lora_rank + qk_rope_head_dim
@@ -1133,7 +1135,7 @@ def _get_compiled_mla_decode(
         "float8_e4m3fn": cutlass.Float8E4M3FN,
     }
     qkv_dtype = dtype_map[compile_spec.q_dtype_key]
-    output_dtype = dtype_map[compile_spec.output_dtype_key]
+    out_dtype = dtype_map[compile_spec.out_dtype_key]
     physical_pages = cute.sym_int()
     batch_size = cute.sym_int()
     runtime_total_q = cute.sym_int()
@@ -1141,19 +1143,19 @@ def _get_compiled_mla_decode(
     # These fake tensors pin the public ABI while allowing runtime page counts,
     # table widths/row strides, and batch metadata pointers to vary.
     q_stride_h = query_dim
-    q_stride_q = num_heads * query_dim
+    q_stride_q = num_qo_heads * query_dim
     q_latent_shape: tuple[int, ...]
     q_rope_shape: tuple[int, ...]
     q_stride: tuple[int, ...]
     if packed_query:
-        q_latent_shape = (num_heads, kv_lora_rank, runtime_total_q)
-        q_rope_shape = (num_heads, rope_view_dim, runtime_total_q)
+        q_latent_shape = (num_qo_heads, kv_lora_rank, runtime_total_q)
+        q_rope_shape = (num_qo_heads, rope_view_dim, runtime_total_q)
         q_stride = (q_stride_h, 1, q_stride_q)
     else:
         q_stride_batch = max_seq_len_q * q_stride_q
-        q_latent_shape = (num_heads, kv_lora_rank, max_seq_len_q, batch_size)
+        q_latent_shape = (num_qo_heads, kv_lora_rank, max_seq_len_q, batch_size)
         q_rope_shape = (
-            num_heads,
+            num_qo_heads,
             rope_view_dim,
             max_seq_len_q,
             batch_size,
@@ -1191,24 +1193,24 @@ def _get_compiled_mla_decode(
         stride=(1, runtime_page_row_stride),
         assumed_align=4,
     )
-    out_stride_row = num_heads * kv_lora_rank
+    out_stride_row = num_qo_heads * kv_lora_rank
     out_shape: tuple[int, ...]
     out_stride: tuple[int, ...]
     lse_shape: tuple[int, ...]
     lse_stride: tuple[int, ...]
     if packed_query:
-        out_shape = (num_heads, kv_lora_rank, runtime_total_q)
+        out_shape = (num_qo_heads, kv_lora_rank, runtime_total_q)
         out_stride = (kv_lora_rank, 1, out_stride_row)
-        lse_shape = (num_heads, runtime_total_q)
-        lse_stride = (1, num_heads)
+        lse_shape = (num_qo_heads, runtime_total_q)
+        lse_stride = (1, num_qo_heads)
     else:
         out_stride_batch = max_seq_len_q * out_stride_row
-        out_shape = (num_heads, kv_lora_rank, max_seq_len_q, batch_size)
+        out_shape = (num_qo_heads, kv_lora_rank, max_seq_len_q, batch_size)
         out_stride = (kv_lora_rank, 1, out_stride_row, out_stride_batch)
-        lse_shape = (num_heads, max_seq_len_q, batch_size)
-        lse_stride = (1, num_heads, max_seq_len_q * num_heads)
+        lse_shape = (num_qo_heads, max_seq_len_q, batch_size)
+        lse_stride = (1, num_qo_heads, max_seq_len_q * num_qo_heads)
     out_fake = cute.runtime.make_fake_tensor(
-        output_dtype, out_shape, stride=out_stride, assumed_align=16
+        out_dtype, out_shape, stride=out_stride, assumed_align=16
     )
     lse_fake = (
         cute.runtime.make_fake_tensor(
@@ -1256,7 +1258,7 @@ def _get_compiled_mla_decode(
             cutlass.Float32, (1,), stride_order=(0,), assumed_align=4
         )
         sink = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (num_heads,), stride_order=(0,), assumed_align=4
+            cutlass.Float32, (num_qo_heads,), stride_order=(0,), assumed_align=4
         )
         sparse_inputs_fake = (
             sparse_indices(kernel.direct_sparse_capacities[0]),
@@ -1309,11 +1311,11 @@ def _get_compiled_mla_decode(
 
 def get_prims_ts_batch_mla_decode_workspace_size(
     batch_size: int,
-    num_heads: int,
+    num_qo_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     page_size: int,
-    max_seq_len: int,
+    max_kv_len: int,
     *,
     seq_len_q: Optional[int] = None,
     max_seq_len_q: Optional[int] = None,
@@ -1338,10 +1340,10 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     """
 
     batch_size = _validate_positive_int(batch_size, "batch_size")
-    num_heads = _validate_positive_int(num_heads, "num_heads")
+    num_qo_heads = _validate_positive_int(num_qo_heads, "num_qo_heads")
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
     page_size = _validate_page_size(page_size)
-    max_seq_len = _validate_mla_max_kv_len(max_seq_len, "max_seq_len")
+    max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
     max_seq_len_q = _resolve_max_seq_len_q_alias(
         seq_len_q=seq_len_q,
         max_seq_len_q=max_seq_len_q,
@@ -1350,7 +1352,7 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     assert max_seq_len_q is not None
     _validate_mla_query_head_extent(
         batch_size=batch_size,
-        num_heads=num_heads,
+        num_qo_heads=num_qo_heads,
         max_seq_len_q=max_seq_len_q,
     )
     _validate_mask(mask_type)
@@ -1363,11 +1365,11 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     spec = _resolve_mla_decode_launch_spec(
         device_index,
         batch_size,
-        num_heads,
+        num_qo_heads,
         kv_lora_rank,
         qk_rope_head_dim,
         page_size,
-        max_seq_len,
+        max_kv_len,
         _dtype_key(q_dtype),
         _dtype_key(kv_dtype),
         _dtype_key(out_dtype),
@@ -1377,7 +1379,7 @@ def get_prims_ts_batch_mla_decode_workspace_size(
     return _make_mla_workspace_layout(
         spec.kernel_workspace_bytes,
         batch_size,
-        num_heads,
+        num_qo_heads,
         max_seq_len_q,
         include_lse=False,
     ).total_bytes
@@ -1389,14 +1391,14 @@ def _prepare_mla_runtime(
     *,
     device: torch.device,
     batch_size: int,
-    num_heads: int,
+    num_qo_heads: int,
     max_seq_len_q: int,
     packed_query: bool,
     qo_indptr: Optional[torch.Tensor],
     page_size: int,
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
-    output_dtype: torch.dtype,
+    out_dtype: torch.dtype,
     softmax_scale: float,
     output_scale: float,
     out: Optional[torch.Tensor],
@@ -1420,7 +1422,7 @@ def _prepare_mla_runtime(
             packed_query=packed_query,
             device=device,
             batch_size=batch_size,
-            num_heads=num_heads,
+            num_qo_heads=num_qo_heads,
             max_seq_len_q=max_seq_len_q,
             q_dtype=q_dtype,
         )
@@ -1449,21 +1451,21 @@ def _prepare_mla_runtime(
     total_q = int(query.shape[0]) if packed_query else None
     if out is None:
         out_shape = (
-            (total_q, num_heads, _MLA_LATENT_DIM)
+            (total_q, num_qo_heads, _MLA_LATENT_DIM)
             if packed_query
-            else (batch_size, max_seq_len_q, num_heads, _MLA_LATENT_DIM)
+            else (batch_size, max_seq_len_q, num_qo_heads, _MLA_LATENT_DIM)
         )
-        out = torch.empty(out_shape, device=device, dtype=output_dtype)
+        out = torch.empty(out_shape, device=device, dtype=out_dtype)
     elif validate:
         _validate_out(
             out,
             device=device,
             batch_size=batch_size,
-            num_heads=num_heads,
+            num_qo_heads=num_qo_heads,
             max_seq_len_q=max_seq_len_q,
             packed_query=packed_query,
             total_q=total_q,
-            output_dtype=output_dtype,
+            out_dtype=out_dtype,
         )
     return _MLARuntime(
         query=query,
@@ -1479,7 +1481,7 @@ def _launch_mla_decode(
     runtime: _MLARuntime,
     *,
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
     qo_indptr: Optional[torch.Tensor],
     packed_query: bool,
     kv_lora_rank: int,
@@ -1526,7 +1528,7 @@ def _launch_mla_decode(
         lse_kernel,
         workspace.kernel_workspace,
         split_kv,
-        seq_lens,
+        seq_lens_kv,
         qo_indptr,
         runtime.sparse_inputs,
         runtime.softmax_scale,
@@ -1553,7 +1555,7 @@ class BatchMLADecodePagedTSWrapper:
         self,
         device: int | str | torch.device,
         batch_size: int,
-        num_heads: int,
+        num_qo_heads: int,
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         page_size: int,
@@ -1561,9 +1563,9 @@ class BatchMLADecodePagedTSWrapper:
         *,
         max_seq_len_q: int,
         packed_query: bool,
-        q_data_type: torch.dtype,
-        kv_data_type: torch.dtype,
-        o_data_type: torch.dtype,
+        q_dtype: torch.dtype,
+        kv_dtype: torch.dtype,
+        out_dtype: torch.dtype,
         mask_type: Literal["dense", "causal"] = "causal",
         lse_mode: Literal["none", "base2"] = "none",
         workspace_buffer: Optional[torch.Tensor] = None,
@@ -1589,17 +1591,17 @@ class BatchMLADecodePagedTSWrapper:
             _validate_mask(mask_type)
             batch_size = _validate_positive_int(batch_size, "batch_size")
             _validate_mla_int32_extent(batch_size, "batch_size")
-            num_heads = _validate_positive_int(num_heads, "num_heads")
+            num_qo_heads = _validate_positive_int(num_qo_heads, "num_qo_heads")
             _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
             page_size = _validate_page_size(page_size)
             max_kv_len = _validate_mla_max_kv_len(max_kv_len, "max_kv_len")
             max_seq_len_q = _validate_positive_int(max_seq_len_q, "max_seq_len_q")
             _validate_mla_query_head_extent(
                 batch_size=batch_size,
-                num_heads=num_heads,
+                num_qo_heads=num_qo_heads,
                 max_seq_len_q=max_seq_len_q,
             )
-            _validate_mla_dtype_pair(q_data_type, kv_data_type, o_data_type)
+            _validate_mla_dtype_pair(q_dtype, kv_dtype, out_dtype)
 
         device, device_index = _resolve_cuda_device(device)
         if validate:
@@ -1610,14 +1612,14 @@ class BatchMLADecodePagedTSWrapper:
         spec_key = (
             device_index,
             batch_size,
-            num_heads,
+            num_qo_heads,
             kv_lora_rank,
             qk_rope_head_dim,
             page_size,
             max_kv_len,
-            _dtype_key(q_data_type),
-            _dtype_key(kv_data_type),
-            _dtype_key(o_data_type),
+            _dtype_key(q_dtype),
+            _dtype_key(kv_dtype),
+            _dtype_key(out_dtype),
             mask_type,
             max_seq_len_q,
         )
@@ -1625,12 +1627,12 @@ class BatchMLADecodePagedTSWrapper:
         compile_spec = _cached_mla_decode_compile_spec(
             spec,
             device_index=device_index,
-            num_heads=num_heads,
+            num_qo_heads=num_qo_heads,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             page_size=page_size,
-            q_dtype_key=_dtype_key(q_data_type),
-            output_dtype_key=_dtype_key(o_data_type),
+            q_dtype_key=_dtype_key(q_dtype),
+            out_dtype_key=_dtype_key(out_dtype),
             max_seq_len_q=max_seq_len_q,
             packed_query=packed_query,
             lse_mode=lse_mode,
@@ -1641,7 +1643,7 @@ class BatchMLADecodePagedTSWrapper:
         workspace_layout = _make_mla_workspace_layout(
             spec.kernel_workspace_bytes,
             batch_size,
-            num_heads,
+            num_qo_heads,
             max_seq_len_q,
             include_lse=False,
         )
@@ -1663,15 +1665,15 @@ class BatchMLADecodePagedTSWrapper:
         self._plan_state = _MLADecodePlanState(
             device=device,
             batch_size=batch_size,
-            num_heads=num_heads,
+            num_qo_heads=num_qo_heads,
             max_seq_len_q=max_seq_len_q,
             packed_query=packed_query,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
             page_size=page_size,
-            q_dtype=q_data_type,
-            kv_dtype=kv_data_type,
-            output_dtype=o_data_type,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            out_dtype=out_dtype,
             mask_type=mask_type,
             max_kv_len=max_kv_len,
             required_page_columns=required_page_columns,
@@ -1690,7 +1692,7 @@ class BatchMLADecodePagedTSWrapper:
         query: torch.Tensor,
         kv_cache: torch.Tensor,
         block_tables: torch.Tensor,
-        seq_lens: torch.Tensor,
+        seq_lens_kv: torch.Tensor,
         *,
         qo_indptr: Optional[torch.Tensor] = None,
         softmax_scale: float = 1.0,
@@ -1715,7 +1717,7 @@ class BatchMLADecodePagedTSWrapper:
         Fixed queries use [B, Sq, H, 576]; packed queries use [total_q, H, 576] and
         qo_indptr with nonnegative per-request deltas. All-empty packed Q is a no-op.
         softmax_scale and output_scale are finite positive host QK and V/output scales.
-        The dense MLA interface does not expose attention sinks."""
+        The dense MLA interface does not expose attention attention_sinks."""
 
         if not isinstance(validate, bool):
             raise TypeError("validate must be a bool")
@@ -1729,14 +1731,14 @@ class BatchMLADecodePagedTSWrapper:
             kv_cache,
             device=state.device,
             batch_size=state.batch_size,
-            num_heads=state.num_heads,
+            num_qo_heads=state.num_qo_heads,
             max_seq_len_q=state.max_seq_len_q,
             packed_query=state.packed_query,
             qo_indptr=runtime_qo_indptr,
             page_size=state.page_size,
             q_dtype=state.q_dtype,
             kv_dtype=state.kv_dtype,
-            output_dtype=state.output_dtype,
+            out_dtype=state.out_dtype,
             softmax_scale=softmax_scale,
             output_scale=output_scale,
             out=out,
@@ -1746,7 +1748,7 @@ class BatchMLADecodePagedTSWrapper:
             _validate_mla_run_metadata(
                 runtime,
                 block_tables,
-                seq_lens,
+                seq_lens_kv,
                 qo_indptr,
                 device=state.device,
                 batch_size=state.batch_size,
@@ -1767,7 +1769,7 @@ class BatchMLADecodePagedTSWrapper:
         result = _launch_mla_decode(
             runtime,
             block_tables=block_tables,
-            seq_lens=seq_lens,
+            seq_lens_kv=seq_lens_kv,
             qo_indptr=runtime_qo_indptr,
             packed_query=state.packed_query,
             kv_lora_rank=state.kv_lora_rank,
@@ -1784,7 +1786,7 @@ def batch_mla_decode_with_paged_kv_cache(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
     block_tables: torch.Tensor,
-    seq_lens: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
     *,
     qo_indptr: Optional[torch.Tensor] = None,
     max_seq_len_q: Optional[int] = None,
@@ -1804,7 +1806,7 @@ def batch_mla_decode_with_paged_kv_cache(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """One-shot convenience wrapper for fixed or packed-query MLA decode.
 
-    Without caller scratch, this helper may read ``seq_lens`` on the host
+    Without caller scratch, this helper may read ``seq_lens_kv`` on the host
     to derive the K/V bound and constructs a temporary wrapper outside capture.
     Packed Q requires a caller-provided ``max_seq_len_q`` in either mode.
     See Notes for the explicit capture-safe mode.
@@ -1818,7 +1820,7 @@ def batch_mla_decode_with_paged_kv_cache(
     block_tables : torch.Tensor
         Dense physical-page table for each request. Rows must be inner
         contiguous and non-overlapping, but may have padding between them.
-    seq_lens : torch.Tensor
+    seq_lens_kv : torch.Tensor
         Live K/V sequence lengths.
     qo_indptr : torch.Tensor, optional
         Cumulative query offsets selecting packed-query mode.
@@ -1903,7 +1905,9 @@ def batch_mla_decode_with_paged_kv_cache(
         raise ValueError("packed Q requires max_seq_len_q")
     if validate:
         _validate_query(query, packed_query=packed_query)
-        metadata_device, batch_size, _ = _validate_mla_metadata(block_tables, seq_lens)
+        metadata_device, batch_size, _ = _validate_mla_metadata(
+            block_tables, seq_lens_kv
+        )
         if metadata_device != query.device:
             raise ValueError(
                 f"MLA metadata must be on {query.device}, got {metadata_device}"
@@ -1919,25 +1923,25 @@ def batch_mla_decode_with_paged_kv_cache(
                 f"got SQ={query.shape[1]} and max_seq_len_q={max_seq_len_q}"
             )
     else:
-        batch_size = int(seq_lens.shape[0])
+        batch_size = int(seq_lens_kv.shape[0])
         normalized_cache = kv_cache[:, 0] if kv_cache.ndim == 4 else kv_cache
         page_size = int(normalized_cache.shape[1])
-    num_heads = int(query.shape[-2])
+    num_qo_heads = int(query.shape[-2])
     if not packed_query and max_seq_len_q is None:
         max_seq_len_q = int(query.shape[1])
     if max_kv_len is None:
-        max_kv_len = int(seq_lens.max().item())
+        max_kv_len = int(seq_lens_kv.max().item())
     assert max_seq_len_q is not None
     if validate and out is not None:
         _validate_out(
             out,
             device=query.device,
             batch_size=batch_size,
-            num_heads=num_heads,
+            num_qo_heads=num_qo_heads,
             max_seq_len_q=max_seq_len_q,
             packed_query=packed_query,
             total_q=int(query.shape[0]) if packed_query else None,
-            output_dtype=out_dtype,
+            out_dtype=out_dtype,
         )
     wrapper = BatchMLADecodePagedTSWrapper()
     wrapper.plan(
@@ -1945,14 +1949,14 @@ def batch_mla_decode_with_paged_kv_cache(
         batch_size=batch_size,
         max_seq_len_q=max_seq_len_q,
         max_kv_len=max_kv_len,
-        num_heads=num_heads,
+        num_qo_heads=num_qo_heads,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         page_size=page_size,
         packed_query=packed_query,
-        q_data_type=query.dtype,
-        kv_data_type=normalized_cache.dtype,
-        o_data_type=out_dtype,
+        q_dtype=query.dtype,
+        kv_dtype=normalized_cache.dtype,
+        out_dtype=out_dtype,
         mask_type=mask_type,
         workspace_buffer=workspace_buffer,
         validate=validate,
@@ -1964,7 +1968,7 @@ def batch_mla_decode_with_paged_kv_cache(
         query,
         normalized_cache,
         block_tables,
-        seq_lens,
+        seq_lens_kv,
         qo_indptr=qo_indptr,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
@@ -1996,7 +2000,7 @@ def _make_sparse_output_quant(heads, block_size, scale_format, groups):
         raise ValueError("out_scale_format must be 'fp32' or 'ue8m0'")
     groups = _validate_positive_int(groups, "num_output_groups")
     if heads % groups:
-        raise ValueError("num_output_groups must divide num_heads")
+        raise ValueError("num_output_groups must divide num_qo_heads")
     from .kernels.mla_decode.helpers.output_quant import MlaOutputQuant
 
     return MlaOutputQuant(block_size, scale_format == "ue8m0", heads, groups)
@@ -2136,15 +2140,15 @@ def _prepare_sparse_output_quant(
 def _resolve_sparse_mla_plan(
     device,
     batch_size,
-    num_heads,
+    num_qo_heads,
     *,
     max_topk,
     max_extra_topk=0,
     max_seq_len_q=1,
     packed_query=False,
-    q_data_type=torch.bfloat16,
+    q_dtype=torch.bfloat16,
     kv_layout="NHD",
-    has_sinks=False,
+    use_attention_sinks=False,
     return_lse=False,
     assume_valid_prefix=False,
     output_quant_block_size=None,
@@ -2174,22 +2178,22 @@ def _resolve_sparse_mla_plan(
         raise NotImplementedError("sparse TS MLA requires SM100 or SM103")
     for name, value in (
         ("batch_size", batch_size),
-        ("num_heads", num_heads),
+        ("num_qo_heads", num_qo_heads),
         ("max_seq_len_q", max_seq_len_q),
     ):
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
-    if num_heads > 128:
-        raise ValueError("num_heads must be at most 128")
+    if num_qo_heads > 128:
+        raise ValueError("num_qo_heads must be at most 128")
     output_quant = _make_sparse_output_quant(
-        num_heads, output_quant_block_size, out_scale_format, num_output_groups
+        num_qo_heads, output_quant_block_size, out_scale_format, num_output_groups
     )
     for value in (max_topk, max_extra_topk):
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError("source capacities must be nonnegative integers")
     if max_topk == 0:
         raise ValueError("the primary selected-slot capacity must be positive")
-    if q_data_type not in (torch.bfloat16, torch.float8_e4m3fn):
+    if q_dtype not in (torch.bfloat16, torch.float8_e4m3fn):
         raise ValueError("native BF16 or E4M3 is required")
     if kv_layout not in ("NHD", "HND"):
         raise ValueError("kv_layout must be NHD or HND")
@@ -2198,20 +2202,20 @@ def _resolve_sparse_mla_plan(
         256,
         ((max_topk + 127) // 128 + (max_extra_topk + 127) // 128) * 128,
     )
-    if max_rows * num_heads >= 2**31 or capacity >= 2**31 - 32768:
+    if max_rows * num_qo_heads >= 2**31 or capacity >= 2**31 - 32768:
         raise ValueError("query/route extent exceeds the int32 kernel domain")
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     profile = select_sparse_mla_profile(
         rows=max_rows,
-        heads=num_heads,
+        heads=num_qo_heads,
         query_length=max_seq_len_q,
         capacity=capacity,
-        dtype="bf16" if q_data_type == torch.bfloat16 else "fp8",
+        dtype="bf16" if q_dtype == torch.bfloat16 else "fp8",
         sm_count=sm_count,
     )
     family, tile = profile.family, profile.tile_size_q
     splits, head_dim_ctas = profile.split_kv, profile.head_dim_ctas
-    dtype_name = "bf16" if q_data_type == torch.bfloat16 else "e4m3"
+    dtype_name = "bf16" if q_dtype == torch.bfloat16 else "e4m3"
     if family == "2cta":
         kernel = MlaDecodeTs(
             page_size=1,
@@ -2223,7 +2227,7 @@ def _resolve_sparse_mla_plan(
             qkv_dtype=dtype_name,
             out_dtype="bf16",
             rope_dim=0,
-            num_heads=num_heads,
+            num_heads=num_qo_heads,
             seq_len_q=1,
             batch_size=max_rows,
             mask_type="dense",
@@ -2256,7 +2260,7 @@ def _resolve_sparse_mla_plan(
         kernel = ThroughputLatencyMlaDecodeTs(
             batch_size=max_rows,
             num_heads=tile,
-            seq_len_q=(num_heads + tile - 1) // tile,
+            seq_len_q=(num_qo_heads + tile - 1) // tile,
             seq_len_k=capacity,
             rope_dim=0,
             page_size=1,
@@ -2265,7 +2269,7 @@ def _resolve_sparse_mla_plan(
             out_dtype="bf16",
             profile=kernel_profile,
             reduction_mode=profile.reduction,
-            logical_num_heads=num_heads,
+            logical_num_heads=num_qo_heads,
             logical_seq_len_q=1,
             tile_size_q=tile,
             sparse_profile=profile,
@@ -2279,12 +2283,12 @@ def _resolve_sparse_mla_plan(
     spec = _make_mla_decode_compile_spec(
         _MLADecodeLaunchSpec(kernel, (), core_bytes, splits),
         device_index=device.index,
-        num_heads=num_heads,
+        num_qo_heads=num_qo_heads,
         kv_lora_rank=512,
         qk_rope_head_dim=0,
         page_size=1,
-        q_dtype_key=str(q_data_type).removeprefix("torch."),
-        output_dtype_key="float8_e4m3fn" if output_quant is not None else "bfloat16",
+        q_dtype_key=str(q_dtype).removeprefix("torch."),
+        out_dtype_key="float8_e4m3fn" if output_quant is not None else "bfloat16",
         max_seq_len_q=1,
         packed_query=False,
     )
@@ -2292,7 +2296,7 @@ def _resolve_sparse_mla_plan(
     byte_end = 0
     for name, shape, dtype in (
         ("core", (core_bytes,), torch.int8),
-        ("public_lse", (max_rows, num_heads), torch.float32),
+        ("public_lse", (max_rows, num_qo_heads), torch.float32),
     ):
         sections[name], byte_end = _append_workspace_section(byte_end, shape, dtype)
     return device, profile, spec, sections, byte_end, capacity, output_quant
@@ -2337,15 +2341,15 @@ class BatchSparseMLADecodePagedTSWrapper:
         self,
         device,
         batch_size,
-        num_heads,
+        num_qo_heads,
         *,
         max_topk,
         max_extra_topk=0,
         max_seq_len_q=1,
         packed_query=False,
-        q_data_type=torch.bfloat16,
+        q_dtype=torch.bfloat16,
         kv_layout="NHD",
-        has_sinks=False,
+        use_attention_sinks=False,
         return_lse=False,
         assume_valid_prefix=False,
         output_quant_block_size=None,
@@ -2368,14 +2372,14 @@ class BatchSparseMLADecodePagedTSWrapper:
             _resolve_sparse_mla_plan(
                 device,
                 batch_size,
-                num_heads,
+                num_qo_heads,
                 max_topk=max_topk,
                 max_extra_topk=max_extra_topk,
                 max_seq_len_q=max_seq_len_q,
                 packed_query=packed_query,
-                q_data_type=q_data_type,
+                q_dtype=q_dtype,
                 kv_layout=kv_layout,
-                has_sinks=has_sinks,
+                use_attention_sinks=use_attention_sinks,
                 return_lse=return_lse,
                 assume_valid_prefix=assume_valid_prefix,
                 output_quant_block_size=output_quant_block_size,
@@ -2422,16 +2426,16 @@ class BatchSparseMLADecodePagedTSWrapper:
         )
         self._state = dict(
             device=device,
-            batch=batch_size,
-            heads=num_heads,
-            max_q=max_seq_len_q,
+            batch_size=batch_size,
+            num_qo_heads=num_qo_heads,
+            max_seq_len_q=max_seq_len_q,
             max_rows=max_rows,
-            packed=packed_query,
-            dtype=q_data_type,
-            ks=max_topk,
-            kc=max_extra_topk,
+            packed_query=packed_query,
+            q_dtype=q_dtype,
+            max_topk=max_topk,
+            max_extra_topk=max_extra_topk,
             kv_layout=kv_layout,
-            has_sinks=has_sinks,
+            use_attention_sinks=use_attention_sinks,
             return_lse=return_lse,
             output_quant=output_quant,
             buffers=buffers,
@@ -2439,14 +2443,14 @@ class BatchSparseMLADecodePagedTSWrapper:
             compiled=compiled,
             compiled_static=compiled_static,
             assume_valid_prefix=assume_valid_prefix,
-            splits=splits,
+            requested_splits=splits,
             default_cl=torch.full(
                 (max_rows,), max_extra_topk, device=device, dtype=torch.int32
             ),
             dummy_indices=torch.zeros((max_rows, 1), device=device, dtype=torch.int32),
-            dummy_cache=torch.zeros((1, 1, 512), device=device, dtype=q_data_type),
-            default_sinks=torch.full(
-                (num_heads,), -torch.inf, device=device, dtype=torch.float32
+            dummy_cache=torch.zeros((1, 1, 512), device=device, dtype=q_dtype),
+            default_attention_sinks=torch.full(
+                (num_qo_heads,), -torch.inf, device=device, dtype=torch.float32
             ),
         )
 
@@ -2506,7 +2510,7 @@ class BatchSparseMLADecodePagedTSWrapper:
                 f"{name} must have shape [pages,page_size,512] with nonempty pages"
             )
         page_size = cache.shape[1]
-        if cache.device != state["device"] or cache.dtype != state["dtype"]:
+        if cache.device != state["device"] or cache.dtype != state["q_dtype"]:
             raise ValueError(f"{name} must match the planned device and dtype")
         if (
             cache.stride(-1) != 1
@@ -2575,7 +2579,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         qo_indptr=None,
         softmax_scale=512**-0.5,
         output_scale=1.0,
-        sinks=None,
+        attention_sinks=None,
         out=None,
         lse=None,
         token_positions=None,
@@ -2609,7 +2613,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         keep their tensor addresses stable for CUDA Graphs.
 
         Caller-owned inputs and plan workspace must outlive graph replay,
-        including tensor scales and sinks, and must not alias writable output
+        including tensor scales and attention_sinks, and must not alias writable output
         or workspace storage. Q and native KV are used directly; flattening
         padded pages only creates a tensor view. Required attention reductions
         remain included. Caller-owned LSE must be contiguous FP32 and 16-byte
@@ -2644,32 +2648,36 @@ class BatchSparseMLADecodePagedTSWrapper:
             raise RuntimeError("plan() must be called before run()")
         _validate_query(
             query,
-            packed_query=state["packed"],
+            packed_query=state["packed_query"],
             device=state["device"],
-            batch_size=state["batch"],
-            num_heads=state["heads"],
-            max_seq_len_q=state["max_q"],
-            q_dtype=state["dtype"],
+            batch_size=state["batch_size"],
+            num_qo_heads=state["num_qo_heads"],
+            max_seq_len_q=state["max_seq_len_q"],
+            q_dtype=state["q_dtype"],
             query_dim=512,
         )
         prefix = tuple(query.shape[:-2])
         rows = math.prod(prefix)
-        if state["packed"]:
+        if state["packed_query"]:
             _validate_qo_indptr(
-                qo_indptr, device=state["device"], batch_size=state["batch"]
+                qo_indptr, device=state["device"], batch_size=state["batch_size"]
             )
             if validate:
                 maximum, total, _ = _derive_max_seq_len_q(
-                    qo_indptr, batch_size=state["batch"]
+                    qo_indptr, batch_size=state["batch_size"]
                 )
-                if total != rows or maximum > state["max_q"]:
+                if total != rows or maximum > state["max_seq_len_q"]:
                     raise ValueError("invalid packed query offsets")
         elif qo_indptr is not None:
             raise ValueError("fixed queries do not accept qo_indptr")
 
         primary = self._pool(kv_cache, "kv_cache")
         if extra_kv_cache is None:
-            if state["kc"] or extra_indices is not None or extra_lengths is not None:
+            if (
+                state["max_extra_topk"]
+                or extra_indices is not None
+                or extra_lengths is not None
+            ):
                 raise ValueError("extra pool and indices are required by the plan")
             extra = state["dummy_cache"]
         else:
@@ -2678,7 +2686,7 @@ class BatchSparseMLADecodePagedTSWrapper:
         si, sl = self._source_metadata(
             indices,
             lengths,
-            state["ks"],
+            state["max_topk"],
             primary.shape[0],
             "primary",
             rows=rows,
@@ -2687,25 +2695,25 @@ class BatchSparseMLADecodePagedTSWrapper:
         ci, cl = self._source_metadata(
             extra_indices,
             extra_lengths,
-            state["kc"],
+            state["max_extra_topk"],
             extra.shape[0],
             "extra",
             rows=rows,
             validate=validate,
         )
-        if state["has_sinks"] != (sinks is not None):
-            raise ValueError("sinks presence must match the plan")
-        if sinks is None:
-            sinks = state["default_sinks"]
+        if state["use_attention_sinks"] != (attention_sinks is not None):
+            raise ValueError("attention_sinks presence must match the plan")
+        if attention_sinks is None:
+            attention_sinks = state["default_attention_sinks"]
         if (
-            sinks.shape != (state["heads"],)
-            or sinks.dtype != torch.float32
-            or sinks.device != state["device"]
-            or not sinks.is_contiguous()
+            attention_sinks.shape != (state["num_qo_heads"],)
+            or attention_sinks.dtype != torch.float32
+            or attention_sinks.device != state["device"]
+            or not attention_sinks.is_contiguous()
         ):
-            raise ValueError("sinks must be contiguous CUDA FP32[H]")
-        if validate and torch.isnan(sinks).any().item():
-            raise ValueError("sinks must not contain NaN")
+            raise ValueError("attention_sinks must be contiguous CUDA FP32[H]")
+        if validate and torch.isnan(attention_sinks).any().item():
+            raise ValueError("attention_sinks must not contain NaN")
         scale_tensors = [
             self._scalar(v, n, validate)
             for v, n in (
@@ -2725,7 +2733,7 @@ class BatchSparseMLADecodePagedTSWrapper:
             )
         elif out is None:
             out = torch.empty(
-                (*prefix, state["heads"], 512),
+                (*prefix, state["num_qo_heads"], 512),
                 device=state["device"],
                 dtype=torch.bfloat16,
             )
@@ -2733,27 +2741,29 @@ class BatchSparseMLADecodePagedTSWrapper:
             _validate_out(
                 out,
                 device=state["device"],
-                batch_size=state["batch"],
-                num_heads=state["heads"],
-                max_seq_len_q=state["max_q"],
-                packed_query=state["packed"],
-                total_q=rows if state["packed"] else None,
-                output_dtype=torch.bfloat16,
+                batch_size=state["batch_size"],
+                num_qo_heads=state["num_qo_heads"],
+                max_seq_len_q=state["max_seq_len_q"],
+                packed_query=state["packed_query"],
+                total_q=rows if state["packed_query"] else None,
+                out_dtype=torch.bfloat16,
             )
         if lse is None:
             # A returned result must survive the next call on this wrapper.
             # Use plan-owned scratch only when the LSE is not exposed.
             lse = (
                 torch.empty(
-                    (*prefix, state["heads"]),
+                    (*prefix, state["num_qo_heads"]),
                     device=state["device"],
                     dtype=torch.float32,
                 )
                 if state["return_lse"]
-                else state["buffers"]["public_lse"][:rows].view(*prefix, state["heads"])
+                else state["buffers"]["public_lse"][:rows].view(
+                    *prefix, state["num_qo_heads"]
+                )
             )
         if (
-            lse.shape != (*prefix, state["heads"])
+            lse.shape != (*prefix, state["num_qo_heads"])
             or lse.dtype != torch.float32
             or lse.device != state["device"]
             or not lse.is_contiguous()
@@ -2776,22 +2786,22 @@ class BatchSparseMLADecodePagedTSWrapper:
             cl,
             scale_tensors[0],
             scale_tensors[1],
-            sinks,
+            attention_sinks,
         )
         if rows:
             buffers = state["buffers"]
             # Quantized stores use output_quant_args, including group/bucket
             # strides. The core O view supplies compact launch geometry only.
             core_out = (
-                out.view(rows, 1, state["heads"], 512)
+                out.view(rows, 1, state["num_qo_heads"], 512)
                 if quant is None
-                else output_quant_args[0][: rows * state["heads"] * 512].view(
-                    rows, 1, state["heads"], 512
+                else output_quant_args[0][: rows * state["num_qo_heads"] * 512].view(
+                    rows, 1, state["num_qo_heads"], 512
                 )
             )
             _launch_mla_decode(
                 _MLARuntime(
-                    query.view(rows, 1, state["heads"], 512),
+                    query.view(rows, 1, state["num_qo_heads"], 512),
                     primary,
                     core_out,
                     primary.shape[0],
@@ -2802,14 +2812,14 @@ class BatchSparseMLADecodePagedTSWrapper:
                     output_quant_args=output_quant_args,
                 ),
                 block_tables=si,
-                seq_lens=sl,
+                seq_lens_kv=sl,
                 qo_indptr=None,
                 packed_query=False,
                 kv_lora_rank=512,
-                split_kv=state["splits"],
+                split_kv=state["requested_splits"],
                 workspace=_MLAWorkspaceViews(
                     buffers["core"] if buffers["core"].numel() else None,
-                    lse.view(rows, 1, state["heads"]),
+                    lse.view(rows, 1, state["num_qo_heads"]),
                 ),
                 compiled=state["compiled_static"]
                 if static_scales
@@ -2846,7 +2856,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
     kv_layout="NHD",
     softmax_scale=512**-0.5,
     output_scale=1.0,
-    sinks=None,
+    attention_sinks=None,
     out=None,
     lse=None,
     return_lse=False,
@@ -2890,9 +2900,9 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         max_extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
         max_seq_len_q=max_seq_len_q,
         packed_query=packed,
-        q_data_type=query.dtype,
+        q_dtype=query.dtype,
         kv_layout=kv_layout,
-        has_sinks=sinks is not None,
+        use_attention_sinks=attention_sinks is not None,
         return_lse=return_lse,
         assume_valid_prefix=assume_valid_prefix,
         output_quant_block_size=output_quant_block_size,
@@ -2910,7 +2920,7 @@ def batch_sparse_mla_decode_with_paged_kv_cache(
         qo_indptr=qo_indptr,
         softmax_scale=softmax_scale,
         output_scale=output_scale,
-        sinks=sinks,
+        attention_sinks=attention_sinks,
         out=out,
         lse=lse,
         token_positions=token_positions,

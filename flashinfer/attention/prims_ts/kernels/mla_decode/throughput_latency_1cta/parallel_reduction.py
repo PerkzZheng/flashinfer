@@ -203,7 +203,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
     cu_seqlens_q,
     cfg,
     elements_per_slice: cutlass.Constexpr[int],
-    atten_sinks=None,
+    attention_sinks=None,
     finalize_attention: cutlass.Constexpr[bool] = False,
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
@@ -296,9 +296,9 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             lse_sum = warp_reduce_sum_f32(lse_sum)
             global_lse = finalize_log2_sum_exp(lse_max, lse_sum)
             stats_sink_scale = Float32(1)
-            if cutlass.const_expr(finalize_attention and atten_sinks is not None):
+            if cutlass.const_expr(finalize_attention and attention_sinks is not None):
                 stats_sink_scale = attention_sink_scale(
-                    global_lse, Float32(atten_sinks[stats_query_row[1]])
+                    global_lse, Float32(attention_sinks[stats_query_row[1]])
                 )
             if (
                 lane_idx == Int32(0)
@@ -849,7 +849,7 @@ def run_parallel_gmem_reduction_kernel(
     slots_per_rank: cutlass.Constexpr[int],
     actual_splits: cutlass.Constexpr[int],
     elements_per_slice: cutlass.Constexpr[int],
-    atten_sinks=None,
+    attention_sinks=None,
     finalize_attention: cutlass.Constexpr[bool] = False,
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
@@ -871,7 +871,7 @@ def run_parallel_gmem_reduction_kernel(
             cu_seqlens_q,
             cfg,
             elements_per_slice,
-            atten_sinks,
+            attention_sinks,
             finalize_attention,
             output_quant,
             output_quant_args,

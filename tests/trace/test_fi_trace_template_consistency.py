@@ -615,13 +615,15 @@ def test_attention_ts_trace_constraints_match_cache_axes():
             if "_multi_q" in template.name_prefix:
                 assert "seq_len_q >= 2" in template.constraints
             assert "seq_len_q in (2, 4, 8)" not in template.constraints
-            assert "max_seq_len <= 16384" not in template.constraints
+            assert "max_kv_len <= 16384" not in template.constraints
     for template in prims_ts_decode_wrapper_trace_dispatch.templates:
-        assert "max_pages_per_seq * page_size >= max(seq_lens)" in template.constraints
-        assert "min(seq_lens) >= 1" in template.constraints
-        assert "max(seq_lens) <= max_kv_len" in template.constraints
+        assert (
+            "max_pages_per_seq * page_size >= max(seq_lens_kv)" in template.constraints
+        )
+        assert "min(seq_lens_kv) >= 1" in template.constraints
+        assert "max(seq_lens_kv) <= max_kv_len" in template.constraints
         plan_owns_seq_lens = bool(template.axes["plan_owns_seq_lens"].value)
-        assert template.inputs["seq_lens"].optional is plan_owns_seq_lens
+        assert template.inputs["seq_lens_kv"].optional is plan_owns_seq_lens
         assert (
             f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}"
             in template.tags
@@ -995,14 +997,14 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     v_cache = torch.empty_like(k_cache)
     kv_indices = torch.arange(num_pages, dtype=torch.int32)
     fmha_block_tables = kv_indices.reshape(batch_size, pages_per_request)
-    seq_lens = torch.full((batch_size,), seq_len_k, dtype=torch.int32)
+    seq_lens_kv = torch.full((batch_size,), seq_len_k, dtype=torch.int32)
     workspace = torch.empty(4096, dtype=torch.uint8)
 
     fmha_kwargs = {
         "q": q,
         "paged_kv_cache": (k_cache, v_cache),
         "block_tables": fmha_block_tables,
-        "seq_lens_kv": seq_lens,
+        "seq_lens_kv": seq_lens_kv,
         "seq_len_q": seq_len_q,
         "mask_type": "causal",
     }
@@ -1011,7 +1013,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         "paged_kv_cache": (k_cache, v_cache),
         "workspace_buffer": workspace,
         "block_tables": fmha_block_tables,
-        "seq_lens_kv": seq_lens,
+        "seq_lens_kv": seq_lens_kv,
         "max_kv_len": seq_len_k,
         "seq_len_q": seq_len_q,
         "mask_type": "causal",
@@ -1022,15 +1024,15 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     fmha_wrapper._plan_state = SimpleNamespace(
         page_size=page_size,
         storage_page_size=page_size,
-        use_packed_q=False,
+        packed_query=False,
         seq_len_q=seq_len_q,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         mask_type="causal",
         window_left=-1,
         max_kv_len=seq_len_k,
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
-        planned_seq_lens_device=None,
+        planned_seq_lens_kv_device=None,
     )
     fmha_definitions = (
         batch_decode_with_paged_kv_cache.fi_trace(**fmha_kwargs),
@@ -1039,7 +1041,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
             fmha_wrapper.run,
             q=q,
             paged_kv_cache=(k_cache, v_cache),
-            seq_lens=seq_lens,
+            seq_lens_kv=seq_lens_kv,
             block_tables=fmha_block_tables,
             validate=False,
         ),
@@ -1059,7 +1061,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": rope_dim,
         "block_tables": block_tables,
-        "seq_lens": seq_lens,
+        "seq_lens_kv": seq_lens_kv,
         "mask_type": "causal",
     }
     mla_wrapper = BatchMLADecodePagedTSWrapper()
@@ -1083,7 +1085,7 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
             query=mla_q,
             kv_cache=mla_cache,
             block_tables=block_tables,
-            seq_lens=seq_lens,
+            seq_lens_kv=seq_lens_kv,
             validate=False,
         ),
     )
@@ -1103,14 +1105,14 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     assert {"block_tables", "seq_lens_kv"} <= fmha_definitions[0]["inputs"].keys()
     for input_name in ("block_tables", "seq_lens_kv"):
         assert "optional" not in fmha_definitions[0]["inputs"][input_name]
-    assert {"block_tables", "seq_lens"} <= fmha_definitions[2]["inputs"].keys()
-    assert {"block_tables", "seq_lens"} <= mla_definitions[2]["inputs"].keys()
+    assert {"block_tables", "seq_lens_kv"} <= fmha_definitions[2]["inputs"].keys()
+    assert {"block_tables", "seq_lens_kv"} <= mla_definitions[2]["inputs"].keys()
     for definition, required_metadata in (
         (
             fmha_definitions[2],
-            ("block_tables", "seq_lens"),
+            ("block_tables", "seq_lens_kv"),
         ),
-        (mla_definitions[2], ("block_tables", "seq_lens")),
+        (mla_definitions[2], ("block_tables", "seq_lens_kv")),
     ):
         for input_name in required_metadata:
             assert "optional" not in definition["inputs"][input_name]
@@ -1166,11 +1168,11 @@ def test_attention_ts_trace_semantic_and_storage_pages(
         attention_ts_decode_trace_dispatch,
     )
 
-    batch_size, seq_len_q, max_seq_len = 2, 4, 2 * storage_page_size
+    batch_size, seq_len_q, max_kv_len = 2, 4, 2 * storage_page_size
     encoded = semantic_page_size != storage_page_size
     num_qo_heads, num_kv_heads, head_dim = 8, 2, 64
-    num_physical_pages = batch_size * max_seq_len // storage_page_size
-    max_num_semantic_pages = max_seq_len // semantic_page_size
+    num_physical_pages = batch_size * max_kv_len // storage_page_size
+    max_num_semantic_pages = max_kv_len // semantic_page_size
     q = torch.empty(batch_size, seq_len_q, num_qo_heads, head_dim, dtype=torch.bfloat16)
     k_cache = torch.empty(
         num_physical_pages,
@@ -1184,14 +1186,14 @@ def test_attention_ts_trace_semantic_and_storage_pages(
     block_table = torch.arange(
         batch_size * max_num_semantic_pages, dtype=torch.int32
     ).reshape(batch_size, max_num_semantic_pages)
-    seq_lens = torch.full((batch_size,), max_seq_len, dtype=torch.int32)
+    seq_lens_kv = torch.full((batch_size,), max_kv_len, dtype=torch.int32)
     workspace = torch.empty(4096, dtype=torch.uint8)
 
     one_shot_kwargs = {
         "q": q,
         "paged_kv_cache": cache,
         "block_tables": block_table,
-        "seq_lens_kv": seq_lens,
+        "seq_lens_kv": seq_lens_kv,
         "seq_len_q": seq_len_q,
         "page_size": semantic_page_size,
     }
@@ -1200,8 +1202,8 @@ def test_attention_ts_trace_semantic_and_storage_pages(
         "paged_kv_cache": cache,
         "workspace_buffer": workspace,
         "block_tables": block_table,
-        "seq_lens_kv": seq_lens,
-        "max_kv_len": max_seq_len,
+        "seq_lens_kv": seq_lens_kv,
+        "max_kv_len": max_kv_len,
         "seq_len_q": seq_len_q,
         "page_size": semantic_page_size,
     }
@@ -1252,20 +1254,20 @@ def test_attention_ts_trace_semantic_and_storage_pages(
     wrapper._plan_state = SimpleNamespace(
         page_size=semantic_page_size,
         storage_page_size=storage_page_size,
-        use_packed_q=False,
+        packed_query=False,
         seq_len_q=seq_len_q,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         mask_type="causal",
         window_left=-1,
-        max_kv_len=max_seq_len,
+        max_kv_len=max_kv_len,
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
-        planned_seq_lens_device=None,
+        planned_seq_lens_kv_device=None,
     )
     wrapper_kwargs = dict(
         q=q,
         paged_kv_cache=cache,
-        seq_lens=seq_lens,
+        seq_lens_kv=seq_lens_kv,
         block_tables=block_table,
     )
     wrapper_definition = fi_trace(wrapper.run, **wrapper_kwargs)
@@ -1305,14 +1307,14 @@ def test_attention_ts_encoded_pages_trace_rejects_incompatible_storage(
     k = torch.empty(1, 2, storage_page_size, 64, dtype=torch.bfloat16)
     v = torch.empty_like(k)
     block_tables = torch.zeros(1, 1, dtype=torch.int32)
-    seq_lens = torch.ones(1, dtype=torch.int32)
+    seq_lens_kv = torch.ones(1, dtype=torch.int32)
 
     with pytest.raises(ValueError, match="larger than and divisible"):
         batch_decode_with_paged_kv_cache.fi_trace(
             q=q,
             paged_kv_cache=(k, v),
             block_tables=block_tables,
-            seq_lens_kv=seq_lens,
+            seq_lens_kv=seq_lens_kv,
             page_size=semantic_page_size,
         )
     with pytest.raises(ValueError, match="larger than and divisible"):
@@ -1321,7 +1323,7 @@ def test_attention_ts_encoded_pages_trace_rejects_incompatible_storage(
             paged_kv_cache=(k, v),
             workspace_buffer=torch.empty(4096, dtype=torch.uint8),
             block_tables=block_tables,
-            seq_lens_kv=seq_lens,
+            seq_lens_kv=seq_lens_kv,
             max_kv_len=semantic_page_size,
             page_size=semantic_page_size,
         )
@@ -1343,28 +1345,28 @@ def test_prims_ts_decode_wrapper_trace_reads_output_dtype_from_plan_state():
         dtype=torch.float8_e4m3fn,
     )
     v_cache = torch.empty_like(k_cache)
-    seq_lens = torch.full((batch_size,), page_size, dtype=torch.int32)
+    seq_lens_kv = torch.full((batch_size,), page_size, dtype=torch.int32)
     block_tables = torch.arange(num_pages, dtype=torch.int32).reshape(batch_size, -1)
 
     wrapper = BatchDecodePagedTSWrapper()
     wrapper._plan_state = SimpleNamespace(
         page_size=page_size,
         storage_page_size=page_size,
-        use_packed_q=False,
+        packed_query=False,
         seq_len_q=1,
-        output_dtype=torch.float16,
+        out_dtype=torch.float16,
         mask_type="dense",
         window_left=-1,
         max_kv_len=page_size,
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
-        planned_seq_lens_device=None,
+        planned_seq_lens_kv_device=None,
     )
     definition = fi_trace(
         wrapper.run,
         q=q,
         paged_kv_cache=(k_cache, v_cache),
-        seq_lens=seq_lens,
+        seq_lens_kv=seq_lens_kv,
         block_tables=block_tables,
     )
 
@@ -1385,21 +1387,21 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
 
     total_q, page_size = 5, 32
     qo_indptr = torch.tensor((0, 2, total_q), dtype=torch.int32)
-    seq_lens = torch.tensor((page_size, 2 * page_size), dtype=torch.int32)
+    seq_lens_kv = torch.tensor((page_size, 2 * page_size), dtype=torch.int32)
 
     fmha_wrapper = BatchDecodePagedTSWrapper()
     fmha_wrapper._plan_state = SimpleNamespace(
         page_size=page_size,
         storage_page_size=page_size,
-        use_packed_q=True,
+        packed_query=True,
         seq_len_q=3,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         mask_type="causal",
         window_left=-1,
         max_kv_len=2 * page_size,
         kv_prefix_mode="dynamic",
         kv_lengths_mode="dynamic",
-        planned_seq_lens_device=None,
+        planned_seq_lens_kv_device=None,
     )
     fmha_kwargs = {
         "q": torch.empty(total_q, 8, 128, dtype=torch.bfloat16),
@@ -1407,12 +1409,12 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
             torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
             torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
         ),
-        "seq_lens": seq_lens,
+        "seq_lens_kv": seq_lens_kv,
         "block_tables": torch.tensor(((0, -1), (1, 2)), dtype=torch.int32),
         "qo_indptr": qo_indptr,
     }
     for missing_name in (
-        "seq_lens",
+        "seq_lens_kv",
         "block_tables",
         "qo_indptr",
     ):
@@ -1425,11 +1427,11 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
     fmha_wrapper._plan_state = SimpleNamespace(
         **{
             **vars(fmha_wrapper._plan_state),
-            "planned_seq_lens_device": seq_lens,
+            "planned_seq_lens_kv_device": seq_lens_kv,
         }
     )
-    plan_owned_kwargs = {**fmha_kwargs, "seq_lens": None}
-    with pytest.raises(ValueError, match=r"plan-owned.*seq_lens=None"):
+    plan_owned_kwargs = {**fmha_kwargs, "seq_lens_kv": None}
+    with pytest.raises(ValueError, match=r"plan-owned.*seq_lens_kv=None"):
         fi_trace(fmha_wrapper.run, **fmha_kwargs)
     for missing_name in ("block_tables", "qo_indptr"):
         incomplete_kwargs = dict(plan_owned_kwargs)
@@ -1437,8 +1439,8 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
         with pytest.raises(ValueError, match=missing_name):
             fi_trace(fmha_wrapper.run, **incomplete_kwargs)
     plan_owned_definition = fi_trace(fmha_wrapper.run, **plan_owned_kwargs)
-    assert plan_owned_definition["inputs"]["seq_lens"]["optional"] is True
-    assert plan_owned_definition["inputs"]["seq_lens"]["dtype"] == "int32"
+    assert plan_owned_definition["inputs"]["seq_lens_kv"]["optional"] is True
+    assert plan_owned_definition["inputs"]["seq_lens_kv"]["dtype"] == "int32"
     assert "seq-lens-source:plan" in plan_owned_definition["tags"]
     assert "_plan_seq_lens_" in plan_owned_definition["name"]
 
@@ -1455,10 +1457,10 @@ def test_prims_ts_bound_wrapper_traces_require_every_per_run_metadata_tensor():
         "query": torch.empty(total_q, 8, 576, dtype=torch.bfloat16),
         "kv_cache": torch.empty(4, page_size, 576, dtype=torch.bfloat16),
         "block_tables": torch.tensor(((0, 1), (2, 3)), dtype=torch.int32),
-        "seq_lens": seq_lens,
+        "seq_lens_kv": seq_lens_kv,
         "qo_indptr": qo_indptr,
     }
-    for missing_name in ("block_tables", "seq_lens", "qo_indptr"):
+    for missing_name in ("block_tables", "seq_lens_kv", "qo_indptr"):
         incomplete_kwargs = dict(mla_kwargs)
         incomplete_kwargs.pop(missing_name)
         with pytest.raises(ValueError, match=missing_name):
@@ -1479,41 +1481,41 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
 
     total_q, page_size = 5, 32
     qo_indptr = torch.tensor((0, 2, total_q), dtype=torch.int32)
-    seq_lens = torch.tensor((page_size, 2 * page_size), dtype=torch.int32)
+    seq_lens_kv = torch.tensor((page_size, 2 * page_size), dtype=torch.int32)
     fmha_kwargs = {
         "q": torch.empty(total_q, 8, 128, dtype=torch.bfloat16),
         "paged_kv_cache": (
             torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
             torch.empty(4, 2, page_size, 128, dtype=torch.bfloat16),
         ),
-        "seq_lens": seq_lens,
+        "seq_lens_kv": seq_lens_kv,
         "block_tables": torch.tensor(((0, -1), (1, 2)), dtype=torch.int32),
         "qo_indptr": qo_indptr,
     }
     fmha_base = {
         "page_size": page_size,
         "storage_page_size": page_size,
-        "use_packed_q": True,
+        "packed_query": True,
         "seq_len_q": 3,
-        "output_dtype": torch.bfloat16,
+        "out_dtype": torch.bfloat16,
         "mask_type": "dense",
         "window_left": -1,
         "max_kv_len": 2 * page_size,
         "kv_prefix_mode": "dynamic",
         "kv_lengths_mode": "dynamic",
-        "planned_seq_lens_device": None,
+        "planned_seq_lens_kv_device": None,
     }
     fmha_variants = (
-        (fmha_base, seq_lens),
-        ({**fmha_base, "mask_type": "causal"}, seq_lens),
-        ({**fmha_base, "seq_len_q": 8}, seq_lens),
-        ({**fmha_base, "max_kv_len": 4 * page_size}, seq_lens),
-        ({**fmha_base, "planned_seq_lens_device": seq_lens}, None),
+        (fmha_base, seq_lens_kv),
+        ({**fmha_base, "mask_type": "causal"}, seq_lens_kv),
+        ({**fmha_base, "seq_len_q": 8}, seq_lens_kv),
+        ({**fmha_base, "max_kv_len": 4 * page_size}, seq_lens_kv),
+        ({**fmha_base, "planned_seq_lens_kv_device": seq_lens_kv}, None),
         (
             {
                 **fmha_base,
                 "kv_prefix_mode": "planned_full",
-                "planned_seq_lens_device": seq_lens,
+                "planned_seq_lens_kv_device": seq_lens_kv,
             },
             None,
         ),
@@ -1521,12 +1523,12 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
             {
                 **fmha_base,
                 "kv_lengths_mode": "planned_uniform_max",
-                "planned_seq_lens_device": seq_lens,
+                "planned_seq_lens_kv_device": seq_lens_kv,
             },
             None,
         ),
-        ({**fmha_base, "mask_type": "causal", "window_left": 16}, seq_lens),
-        ({**fmha_base, "policy": (("split_kv_allowed", False),)}, seq_lens),
+        ({**fmha_base, "mask_type": "causal", "window_left": 16}, seq_lens_kv),
+        ({**fmha_base, "policy": (("split_kv_allowed", False),)}, seq_lens_kv),
     )
     fmha_wrapper = BatchDecodePagedTSWrapper()
     fmha_definitions = []
@@ -1535,7 +1537,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
         fmha_definitions.append(
             fi_trace(
                 fmha_wrapper.run,
-                **{**fmha_kwargs, "seq_lens": run_seq_lens},
+                **{**fmha_kwargs, "seq_lens_kv": run_seq_lens},
             )
         )
     assert len({definition["name"] for definition in fmha_definitions}) == len(
@@ -1559,7 +1561,7 @@ def test_prims_ts_bound_wrapper_trace_names_preserve_plan_identity():
         "query": torch.empty(total_q, 8, 576, dtype=torch.bfloat16),
         "kv_cache": torch.empty(4, page_size, 576, dtype=torch.bfloat16),
         "block_tables": torch.tensor(((0, 1), (2, 3)), dtype=torch.int32),
-        "seq_lens": seq_lens,
+        "seq_lens_kv": seq_lens_kv,
         "qo_indptr": qo_indptr,
     }
     mla_base = {

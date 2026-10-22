@@ -920,7 +920,7 @@ def fmha_decode_separate_reduction_launch(
     partial_o_iter: cute.Pointer,
     partial_stats_iter: cute.Pointer,
     attention_sinks_iter: cute.Pointer,
-    scale_s: Float32,
+    softmax_scale: Float32,
     output_scale: Float32,
     stream: cuda_drv.CUstream,
     cfg: cutlass.Constexpr[FmhaDecodeConfig],
@@ -932,7 +932,7 @@ def fmha_decode_separate_reduction_launch(
 
     The serial reference grid is ``(slice, kv_head, batch)`` with 8 KiB slices.
     The production reducer keeps that geometry for compact S2-S4 and otherwise
-    maps cluster ranks into grid.x for each 2 KiB slice. ``scale_s`` and
+    maps cluster ranks into grid.x for each 2 KiB slice. ``softmax_scale`` and
     ``output_scale`` remain parameters for launch-ABI compatibility; producer
     CTAs already applied them to log2-LSE and normalized partial O, respectively.
     ``seqlens_kv_iter`` is internal reducer metadata used only to

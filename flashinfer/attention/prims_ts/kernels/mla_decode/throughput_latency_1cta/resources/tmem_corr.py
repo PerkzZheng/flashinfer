@@ -117,7 +117,7 @@ class TmemCorrResource(MlaResource):
     inst_id: cutlass.Constexpr[int] = 0
     scale_softmax_log2: Float32 = None
     output_scale: Float32 = None
-    atten_sinks: object = None
+    attention_sinks: object = None
     output_quant: cutlass.Constexpr = None
     output_quant_args: object = None
     o_tensor: object = None
@@ -851,7 +851,7 @@ class TmemCorrResource(MlaResource):
                                 head = storage_flat_query_row % Int32(
                                     cfg.logical_num_heads_q
                                 )
-                                sink = Float32(self.atten_sinks[head])
+                                sink = Float32(self.attention_sinks[head])
                                 sink_scale = Float32(0)
                                 if has_finite_mass and sink != Float32(Float32.inf):
                                     delta = sink * Float32(LOG2_E) - global_lse
@@ -1474,7 +1474,7 @@ class TmemCorrResource(MlaResource):
                     count = Float32(final_max[scale_idx] != neg_max_f32())
                     norm_scale = Float32(0)
                     if logical_head < cfg.logical_num_heads_q and count > Float32(0):
-                        sink = Float32(self.atten_sinks[logical_head])
+                        sink = Float32(self.attention_sinks[logical_head])
                         if sink == Float32(-Float32.inf):
                             norm_scale = self.output_scale / reduced_sum[scale_idx]
                         elif sink != Float32(Float32.inf):

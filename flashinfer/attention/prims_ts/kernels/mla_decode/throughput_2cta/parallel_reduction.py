@@ -216,7 +216,7 @@ def run_parallel_reduction_kernel(
     actual_splits: cutlass.Constexpr[int],
     cluster_size: cutlass.Constexpr[int],
     slots_per_rank: cutlass.Constexpr[int],
-    atten_sinks=None,
+    attention_sinks=None,
     finalize_attention: cutlass.Constexpr[bool] = False,
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
@@ -343,11 +343,11 @@ def run_parallel_reduction_kernel(
         # Keep this warp-local value distinct from the post-barrier SMEM load.
         stats_lse_value = finalize_log2_sum_exp(local_exp_frame, local_sum_lse)
         sink_scale = Float32(1)
-        if cutlass.const_expr(finalize_attention and atten_sinks is not None):
+        if cutlass.const_expr(finalize_attention and attention_sinks is not None):
             sink_scale = Float32(0)
             if query_is_valid:
                 sink_scale = attention_sink_scale(
-                    stats_lse_value, Float32(atten_sinks[logical_head_idx])
+                    stats_lse_value, Float32(attention_sinks[logical_head_idx])
                 )
         if lane_idx == Int32(0):
             smem_local_lse[0] = stats_lse_value

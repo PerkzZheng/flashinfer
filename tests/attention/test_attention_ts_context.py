@@ -65,7 +65,7 @@ _FP8 = torch.float8_e4m3fn
 
 @dataclass(frozen=True)
 class _ContextCase:
-    """One fixed or packed-ragged context-attention problem."""
+    """One fixed or packed_query-ragged context-attention problem."""
 
     q: torch.Tensor
     k: torch.Tensor
@@ -78,16 +78,16 @@ class _ContextCase:
     window_left: int
     softmax_scale: float
     output_scale: float
-    output_dtype: torch.dtype
+    out_dtype: torch.dtype
 
     @property
-    def packed(self) -> bool:
+    def packed_query(self) -> bool:
         return self.qo_indptr is not None
 
 
 @dataclass(frozen=True)
 class _PagedContextCase:
-    """Paged storage plus its independent packed logical reference."""
+    """Paged storage plus its independent packed_query logical reference."""
 
     reference: _ContextCase
     k_cache: torch.Tensor
@@ -122,16 +122,16 @@ def _make_context_case(
     num_qo_heads: int,
     num_kv_heads: int,
     qkv_dtype: torch.dtype,
-    packed: bool,
+    packed_query: bool,
     mask_type: str,
     head_dim: int = _HEAD_DIM,
     window_left: int = -1,
-    output_dtype: Optional[torch.dtype] = None,
+    out_dtype: Optional[torch.dtype] = None,
     output_scale: float = 0.75,
     device: str | torch.device = "cuda",
     seed: int = 0,
 ) -> _ContextCase:
-    """Create deterministic compact BSHD or packed THD input storage."""
+    """Create deterministic compact BSHD or packed_query THD input storage."""
 
     q_lengths = tuple(int(length) for length in q_lengths)
     k_lengths = tuple(int(length) for length in k_lengths)
@@ -139,13 +139,13 @@ def _make_context_case(
         raise ValueError("Q and KV lengths must describe the same non-empty batch")
     if min(q_lengths) <= 0 or min(k_lengths) <= 0:
         raise ValueError("sequence lengths must be positive")
-    if not packed and (len(set(q_lengths)) != 1 or len(set(k_lengths)) != 1):
+    if not packed_query and (len(set(q_lengths)) != 1 or len(set(k_lengths)) != 1):
         raise ValueError("fixed storage requires uniform Q and KV lengths")
 
     device = torch.device(device)
     generator = torch.Generator(device=device).manual_seed(seed)
     input_scale = 0.125 if qkv_dtype == _FP8 else 0.2
-    if packed:
+    if packed_query:
         q_shape = (sum(q_lengths), num_qo_heads, head_dim)
         kv_shape = (sum(k_lengths), num_kv_heads, head_dim)
     else:
@@ -164,7 +164,7 @@ def _make_context_case(
         input_scale
         * torch.randn(kv_shape, generator=generator, device=device, dtype=torch.float32)
     ).to(qkv_dtype)
-    if packed:
+    if packed_query:
         qo_indptr = torch.tensor(
             _cumulative(q_lengths), dtype=torch.int32, device=device
         )
@@ -187,7 +187,7 @@ def _make_context_case(
         window_left=window_left,
         softmax_scale=1.0 / math.sqrt(head_dim),
         output_scale=output_scale,
-        output_dtype=qkv_dtype if output_dtype is None else output_dtype,
+        out_dtype=qkv_dtype if out_dtype is None else out_dtype,
     )
 
 
@@ -203,11 +203,11 @@ def _make_paged_context_case(
     v_dtype: Optional[torch.dtype] = None,
     page_size: int = 32,
     window_left: int = -1,
-    output_dtype: Optional[torch.dtype] = None,
+    out_dtype: Optional[torch.dtype] = None,
     output_scale: float = 0.75,
     seed: int = 0,
 ) -> _PagedContextCase:
-    """Create nonidentity HND pages and the matching packed logical tensors.
+    """Create nonidentity HND pages and the matching packed_query logical tensors.
 
     ``v_dtype`` overrides the V cache element type for mixed QK/PV cases. The
     reference V is quantized the same way.
@@ -292,7 +292,7 @@ def _make_paged_context_case(
         window_left=window_left,
         softmax_scale=1.0 / math.sqrt(head_dim),
         output_scale=output_scale,
-        output_dtype=qk_dtype if output_dtype is None else output_dtype,
+        out_dtype=qk_dtype if out_dtype is None else out_dtype,
     )
     return _PagedContextCase(
         reference=reference,
@@ -331,9 +331,9 @@ def _request_slice(
     lengths: tuple[int, ...],
     batch_idx: int,
     *,
-    packed: bool,
+    packed_query: bool,
 ) -> torch.Tensor:
-    if not packed:
+    if not packed_query:
         return tensor[batch_idx]
     begin = sum(lengths[:batch_idx])
     return tensor[begin : begin + lengths[batch_idx]]
@@ -363,15 +363,21 @@ def _visible_kv_bounds(
 
 @torch.no_grad()
 def _context_reference(case: _ContextCase) -> torch.Tensor:
-    """Independent FP32 MHA/GQA oracle for fixed and packed context inputs."""
+    """Independent FP32 MHA/GQA oracle for fixed and packed_query context inputs."""
 
     outputs = []
     for batch_idx, (q_length, k_length) in enumerate(
         zip(case.q_lengths, case.k_lengths, strict=True)
     ):
-        q = _request_slice(case.q, case.q_lengths, batch_idx, packed=case.packed)
-        k = _request_slice(case.k, case.k_lengths, batch_idx, packed=case.packed)
-        v = _request_slice(case.v, case.k_lengths, batch_idx, packed=case.packed)
+        q = _request_slice(
+            case.q, case.q_lengths, batch_idx, packed_query=case.packed_query
+        )
+        k = _request_slice(
+            case.k, case.k_lengths, batch_idx, packed_query=case.packed_query
+        )
+        v = _request_slice(
+            case.v, case.k_lengths, batch_idx, packed_query=case.packed_query
+        )
         q = q.float()
         k = k.float()
         v = v.float()
@@ -397,7 +403,7 @@ def _context_reference(case: _ContextCase) -> torch.Tensor:
                 * case.output_scale
             )
         outputs.append(torch.stack(request_output))
-    return torch.cat(outputs) if case.packed else torch.stack(outputs)
+    return torch.cat(outputs) if case.packed_query else torch.stack(outputs)
 
 
 @torch.no_grad()
@@ -408,7 +414,7 @@ def _variable_window_reference(
 ) -> torch.Tensor:
     """Independent FP32 oracle for fixed per-Q inclusive window bounds."""
 
-    if case.packed:
+    if case.packed_query:
         raise ValueError("variable-window test reference requires fixed storage")
     outputs = []
     for batch_idx in range(len(case.q_lengths)):
@@ -445,15 +451,15 @@ def _assert_context_correct(
     if expected is None:
         expected = _context_reference(case)
     assert actual.shape == case.q.shape
-    assert actual.dtype == case.output_dtype
+    assert actual.dtype == case.out_dtype
     assert torch.isfinite(actual.float()).all()
     # Select by the least precise input/output type. FP8 includes the kernel's
     # E4M3 probability quantization as well as optional E4M3 output rounding.
     # A QK-BF16/PV-FP8 case should use FP8 error as the E4M3 V cache and the kernel
     # P-cast dominate the error budget.
-    if _FP8 in (case.q.dtype, case.v.dtype, case.output_dtype):
+    if _FP8 in (case.q.dtype, case.v.dtype, case.out_dtype):
         rtol, atol, max_relative_l2 = 5e-2, 1.3e-1, 1e-1
-    elif case.q.dtype == torch.bfloat16 or case.output_dtype == torch.bfloat16:
+    elif case.q.dtype == torch.bfloat16 or case.out_dtype == torch.bfloat16:
         rtol, atol, max_relative_l2 = 2e-2, 1e-2, 2e-2
     else:
         rtol, atol, max_relative_l2 = 1e-2, 2e-3, 1e-2
@@ -510,12 +516,12 @@ def _plan_wrapper(wrapper: BatchPrefillTSWrapper, case: _ContextCase) -> None:
         q_dtype=case.q.dtype,
         k_dtype=case.k.dtype,
         v_dtype=case.v.dtype,
-        packed=case.packed,
+        packed_query=case.packed_query,
         mask_type=case.mask_type,
         window_left=case.window_left,
         softmax_scale=case.softmax_scale,
         output_scale=case.output_scale,
-        out_dtype=case.output_dtype,
+        out_dtype=case.out_dtype,
         batch_size=len(case.q_lengths),
         max_seq_len_q=max(case.q_lengths),
         max_kv_len=max(case.k_lengths),
@@ -569,7 +575,7 @@ def _plan_paged_wrapper(
         q_dtype=reference.q.dtype,
         k_dtype=case.k_cache.dtype,
         v_dtype=case.v_cache.dtype,
-        out_dtype=reference.output_dtype,
+        out_dtype=reference.out_dtype,
         page_size=case.page_size,
         mask_type=reference.mask_type,
         window_left=reference.window_left,
@@ -653,7 +659,7 @@ def _run_one_shot(case: _ContextCase, *, out: Optional[torch.Tensor] = None):
         window_left=case.window_left,
         softmax_scale=case.softmax_scale,
         output_scale=case.output_scale,
-        out_dtype=case.output_dtype,
+        out_dtype=case.out_dtype,
         out=out,
     )
 
@@ -861,7 +867,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "k_dtype",
         "v_dtype",
         "out_dtype",
-        "packed",
+        "packed_query",
         "mask_type",
         "window_left",
         "softmax_scale",
@@ -1003,7 +1009,7 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         head_dim=128,
         qk_dtype=torch.float16,
         pv_dtype=torch.float16,
-        output_dtype=torch.float16,
+        out_dtype=torch.float16,
         uniform_packed_lengths=False,
         has_q_offset=False,
         paged_v_tail_is_zero=False,
@@ -1109,7 +1115,7 @@ def test_attention_ts_context_paged_one_shot_validates_fixed_table(
         page_size=32,
         mask_type="dense",
         window_left=-1,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
     )
 
     assert geometry.max_kv_len == 65
@@ -1148,7 +1154,7 @@ def test_attention_ts_context_paged_one_shot_rejects_invalid_fixed_metadata(
             page_size=32,
             mask_type="dense",
             window_left=-1,
-            output_dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
         )
 
 
@@ -1167,7 +1173,7 @@ def test_attention_ts_context_variable_window_validates_nondecreasing_ends(
     monkeypatch.setattr(context_module, "_validate_tensor", lambda *_args: None)
     geometry = SimpleNamespace(
         device=torch.device("cpu"),
-        packed=False,
+        packed_query=False,
         batch_size=2,
         max_seq_len_q=3,
         max_seq_len_k=4,
@@ -1242,7 +1248,7 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(packed=False, mask_type="dense"),
+        geometry=SimpleNamespace(packed_query=False, mask_type="dense"),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
@@ -1284,9 +1290,7 @@ def test_attention_ts_context_paged_run_keeps_lifecycle_check_without_validation
 def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
-        geometry=SimpleNamespace(
-            device=torch.device("cpu"), output_dtype=torch.float32
-        ),
+        geometry=SimpleNamespace(device=torch.device("cpu"), out_dtype=torch.float32),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         compiled=lambda *_: None,
@@ -1530,7 +1534,7 @@ def test_attention_ts_context_fixed_oracle_is_bottom_right_causal():
         num_qo_heads=2,
         num_kv_heads=1,
         qkv_dtype=torch.float32,
-        packed=False,
+        packed_query=False,
         mask_type="causal",
         output_scale=1.0,
         device="cpu",
@@ -1567,7 +1571,7 @@ def test_attention_ts_context_packed_oracle_applies_left_window_per_row():
         num_qo_heads=2,
         num_kv_heads=1,
         qkv_dtype=torch.float32,
-        packed=True,
+        packed_query=True,
         mask_type="causal",
         window_left=1,
         output_scale=1.0,
@@ -1612,7 +1616,7 @@ def test_attention_ts_context_run_requires_plan(wrapper_type):
 @pytest.mark.parametrize(
     (
         "input_dtype",
-        "output_dtype",
+        "out_dtype",
         "is_causal",
         "is_clc_dynamic",
     ),
@@ -1657,7 +1661,7 @@ def test_attention_ts_context_run_requires_plan(wrapper_type):
 def test_attention_ts_context_d256_pipeline_policy_is_semantic_and_capacity_safe(
     use_paged_kv: bool,
     input_dtype,
-    output_dtype,
+    out_dtype,
     is_causal: bool,
     is_clc_dynamic: bool,
 ):
@@ -1666,7 +1670,7 @@ def test_attention_ts_context_d256_pipeline_policy_is_semantic_and_capacity_safe
     kernel = FmhaTs(
         in_qk_dtype=input_dtype,
         in_pv_dtype=input_dtype,
-        out_dtype=output_dtype,
+        out_dtype=out_dtype,
         d=256,
         is_persistent=True,
         is_causal=is_causal,
@@ -1891,7 +1895,7 @@ def test_attention_ts_context_paged_clc_policy_is_structural(
     (
         "single_qkv_instance",
         "head_paired",
-        "packed",
+        "packed_query",
         "uniform_packed_lengths",
         "is_causal",
         "has_q_offset",
@@ -1909,7 +1913,7 @@ def test_attention_ts_context_paged_clc_policy_is_structural(
 def test_attention_ts_context_contiguous_clc_policy_is_structural(
     single_qkv_instance: bool,
     head_paired: bool,
-    packed: bool,
+    packed_query: bool,
     uniform_packed_lengths: bool,
     is_causal: bool,
     has_q_offset: bool,
@@ -1921,7 +1925,7 @@ def test_attention_ts_context_contiguous_clc_policy_is_structural(
         context_module._contiguous_context_uses_clc_scheduler(
             single_qkv_instance=single_qkv_instance,
             head_paired=head_paired,
-            packed=packed,
+            packed_query=packed_query,
             uniform_packed_lengths=uniform_packed_lengths,
             is_causal=is_causal,
             has_q_offset=has_q_offset,
@@ -1934,7 +1938,7 @@ def test_attention_ts_context_contiguous_clc_policy_is_structural(
     (
         "single_qkv_instance",
         "head_paired",
-        "packed",
+        "packed_query",
         "uniform_packed_lengths",
         "logical_work_tiles",
         "is_causal",
@@ -1953,7 +1957,7 @@ def test_attention_ts_context_contiguous_clc_policy_is_structural(
 def test_attention_ts_context_contiguous_persistence_follows_wave_count(
     single_qkv_instance: bool,
     head_paired: bool,
-    packed: bool,
+    packed_query: bool,
     uniform_packed_lengths: bool,
     logical_work_tiles: int,
     is_causal: bool,
@@ -1966,7 +1970,7 @@ def test_attention_ts_context_contiguous_persistence_follows_wave_count(
         context_module._contiguous_context_uses_persistent_scheduler(
             single_qkv_instance=single_qkv_instance,
             head_paired=head_paired,
-            packed=packed,
+            packed_query=packed_query,
             uniform_packed_lengths=uniform_packed_lengths,
             logical_work_tiles=logical_work_tiles,
             max_active_clusters=148,
@@ -2241,14 +2245,14 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
         ),
         ("head-dim", NotImplementedError, "supports head_dim"),
         ("head-ratio", ValueError, "Q head count must be divisible"),
-        ("packed-offset", ValueError, "final qo_indptr offset"),
+        ("packed_query-offset", ValueError, "final qo_indptr offset"),
         (
             "dense-window",
             ValueError,
             "positive window_left requires mask_type='causal'",
         ),
     ),
-    ids=("dtype", "head-dim", "head-ratio", "packed-offset", "mask-window"),
+    ids=("dtype", "head-dim", "head-ratio", "packed_query-offset", "mask-window"),
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
@@ -2276,14 +2280,16 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
         max_kv_len=8,
     )
 
-    if invalid_contract == "packed-offset":
+    if invalid_contract == "packed_query-offset":
         q = torch.empty((2, num_qo_heads, head_dim), dtype=dtype, device=device)
         k = torch.empty((2, num_kv_heads, head_dim), dtype=dtype, device=device)
         v = torch.empty_like(k)
         # The terminal Q offset must cover both packed query rows.
         qo_indptr = torch.tensor((0, 1), dtype=torch.int32, device=device)
         kv_indptr = torch.tensor((0, 2), dtype=torch.int32, device=device)
-        plan_kwargs.update(batch_size=1, max_seq_len_q=2, max_kv_len=2, packed=True)
+        plan_kwargs.update(
+            batch_size=1, max_seq_len_q=2, max_kv_len=2, packed_query=True
+        )
     else:
         q = torch.empty((1, 8, num_qo_heads, head_dim), dtype=dtype, device=device)
         k = torch.empty((1, 8, num_kv_heads, head_dim), dtype=dtype, device=device)
@@ -2292,7 +2298,7 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
         plan_kwargs["window_left"] = 1
 
     with pytest.raises(error_type, match=message):
-        if invalid_contract == "packed-offset":
+        if invalid_contract == "packed_query-offset":
             batch_prefill(q, k, v, qo_indptr=qo_indptr, kv_indptr=kv_indptr)
         else:
             BatchPrefillTSWrapper().plan(**plan_kwargs)
@@ -2341,7 +2347,7 @@ def test_attention_ts_context_paged_supported_page_sizes_accuracy(
         qk_dtype=qkv_dtype,
         mask_type=mask_type,
         page_size=page_size,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         output_scale=1.0,
         seed=2026072000 + page_size + head_dim,
     )
@@ -2367,7 +2373,7 @@ def test_attention_ts_context_paged_zero_fills_nan_v_tail():
         qk_dtype=torch.bfloat16,
         mask_type="causal",
         page_size=32,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         output_scale=1.0,
         seed=2026090301,
     )
@@ -2381,7 +2387,7 @@ def test_attention_ts_context_paged_zero_fills_nan_v_tail():
     _assert_context_correct(output, case.reference)
 
 
-@pytest.mark.parametrize("paged", (False, True), ids=("packed", "paged"))
+@pytest.mark.parametrize("paged", (False, True), ids=("packed_query", "paged"))
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
@@ -2405,7 +2411,7 @@ def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
             num_qo_heads=4,
             num_kv_heads=4,
             qkv_dtype=torch.bfloat16,
-            packed=True,
+            packed_query=True,
             mask_type="causal",
             device="cuda",
             seed=2026071930,
@@ -2460,7 +2466,7 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
         pv_dtype=torch.bfloat16,
         page_size=32,
         window_left=-1,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
     )
     causal_geometry = context_module._resolve_paged_plan_geometry(
         **common,
@@ -2675,7 +2681,7 @@ def test_attention_ts_context_paged_plan_ignores_aggregate_kv_capacity(monkeypat
         page_size=32,
         mask_type="dense",
         window_left=-1,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
     )
 
     assert geometry.max_kv_len == 65
@@ -2760,7 +2766,7 @@ _CONTEXT_SMOKE_CASES = (
         -1,
         torch.bfloat16,
         False,
-        id="packed-bf16-asymmetric-max-offset-one-shot",
+        id="packed_query-bf16-asymmetric-max-offset-one-shot",
     ),
     pytest.param(
         torch.float16,
@@ -2773,7 +2779,7 @@ _CONTEXT_SMOKE_CASES = (
         -1,
         torch.float16,
         False,
-        id="packed-fp16-dense-mixed-k-lengths-one-shot",
+        id="packed_query-fp16-dense-mixed-k-lengths-one-shot",
     ),
     pytest.param(
         _FP8,
@@ -2877,7 +2883,7 @@ _CONTEXT_SMOKE_CASES = (
         64,
         torch.bfloat16,
         False,
-        id="packed-bf16-window-clipped-aligned-misaligned-one-shot",
+        id="packed_query-bf16-window-clipped-aligned-misaligned-one-shot",
     ),
 )
 
@@ -2885,14 +2891,14 @@ _CONTEXT_SMOKE_CASES = (
 @pytest.mark.parametrize(
     (
         "qkv_dtype",
-        "packed",
+        "packed_query",
         "q_lengths",
         "k_lengths",
         "num_qo_heads",
         "num_kv_heads",
         "mask_type",
         "window_left",
-        "output_dtype",
+        "out_dtype",
         "use_wrapper",
     ),
     _CONTEXT_SMOKE_CASES,
@@ -2901,14 +2907,14 @@ _CONTEXT_SMOKE_CASES = (
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_bounded_public_correctness_matrix(
     qkv_dtype: torch.dtype,
-    packed: bool,
+    packed_query: bool,
     q_lengths: tuple[int, ...],
     k_lengths: tuple[int, ...],
     num_qo_heads: int,
     num_kv_heads: int,
     mask_type: str,
     window_left: int,
-    output_dtype: torch.dtype,
+    out_dtype: torch.dtype,
     use_wrapper: bool,
 ):
     case = _make_context_case(
@@ -2917,12 +2923,12 @@ def test_attention_ts_context_bounded_public_correctness_matrix(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         qkv_dtype=qkv_dtype,
-        packed=packed,
+        packed_query=packed_query,
         mask_type=mask_type,
         window_left=window_left,
-        output_dtype=output_dtype,
+        out_dtype=out_dtype,
         device="cuda",
-        seed=2026071410 + int(packed) + num_qo_heads,
+        seed=2026071410 + int(packed_query) + num_qo_heads,
     )
     if use_wrapper:
         wrapper = BatchPrefillTSWrapper()
@@ -2951,10 +2957,10 @@ def test_attention_ts_context_variable_window_t1_i1_t2_i2(
         num_qo_heads=2,
         num_kv_heads=1,
         qkv_dtype=torch.float16,
-        packed=False,
+        packed_query=False,
         mask_type="variable_window",
         head_dim=head_dim,
-        output_dtype=torch.float16,
+        out_dtype=torch.float16,
         output_scale=1.0,
         device="cuda",
         seed=2026073001 + head_dim,
@@ -3026,10 +3032,10 @@ def test_attention_ts_context_variable_window_uses_cta_minimum_start(head_dim: i
         num_qo_heads=2,
         num_kv_heads=1,
         qkv_dtype=torch.float16,
-        packed=False,
+        packed_query=False,
         mask_type="variable_window",
         head_dim=head_dim,
-        output_dtype=torch.float16,
+        out_dtype=torch.float16,
         output_scale=1.0,
         device="cuda",
         seed=2026081901 + head_dim,
@@ -3066,10 +3072,10 @@ def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int
         num_qo_heads=2,
         num_kv_heads=2,
         qkv_dtype=torch.float16,
-        packed=False,
+        packed_query=False,
         mask_type="variable_window",
         head_dim=head_dim,
-        output_dtype=torch.float16,
+        out_dtype=torch.float16,
         output_scale=1.0,
         device="cuda",
         seed=2026082701 + head_dim,
@@ -3095,9 +3101,9 @@ def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int
 
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-@pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
+@pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed_query"))
 def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
-    packed: bool,
+    packed_query: bool,
 ):
     """One resolved context topology accepts different batch extents."""
 
@@ -3109,9 +3115,9 @@ def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
             num_qo_heads=4,
             num_kv_heads=4,
             qkv_dtype=torch.float16,
-            packed=packed,
+            packed_query=packed_query,
             mask_type="dense",
-            output_dtype=torch.float16,
+            out_dtype=torch.float16,
             device="cuda",
             seed=2026071420 + batch_size,
         )
@@ -3143,7 +3149,7 @@ def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes(
             head_dim=128,
             qk_dtype=torch.float16,
             mask_type="dense",
-            output_dtype=torch.float16,
+            out_dtype=torch.float16,
             seed=2026071430 + batch_size,
         )
         wrapper = BatchPrefillPagedTSWrapper()
@@ -3171,10 +3177,10 @@ def test_attention_ts_context_variable_window_graph_reloads_runtime_bounds():
         num_qo_heads=2,
         num_kv_heads=1,
         qkv_dtype=torch.float16,
-        packed=False,
+        packed_query=False,
         mask_type="variable_window",
         head_dim=128,
-        output_dtype=torch.float16,
+        out_dtype=torch.float16,
         output_scale=1.0,
         device="cuda",
         seed=2026090401,
@@ -3183,7 +3189,7 @@ def test_attention_ts_context_variable_window_graph_reloads_runtime_bounds():
     ends = torch.full((1, seq_len), seq_len - 1, dtype=torch.int32, device="cuda")
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    graph_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
+    graph_out = torch.full_like(case.q, float("nan"), dtype=case.out_dtype)
 
     assert (
         _run_wrapper(
@@ -3253,9 +3259,9 @@ def test_attention_ts_context_fixed_dense_k_tail_excludes_tma_padding():
         num_qo_heads=4,
         num_kv_heads=4,
         qkv_dtype=torch.float16,
-        packed=False,
+        packed_query=False,
         mask_type="dense",
-        output_dtype=torch.float16,
+        out_dtype=torch.float16,
         output_scale=0.75,
         device="cuda",
         seed=2026071422,
@@ -3315,10 +3321,10 @@ def test_attention_ts_context_fixed_dense_k_tail_accuracy(
         num_qo_heads=4,
         num_kv_heads=4,
         qkv_dtype=torch.bfloat16,
-        packed=False,
+        packed_query=False,
         mask_type="dense",
         head_dim=head_dim,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         device="cuda",
         seed=2026091602 + k_length + head_dim,
     )
@@ -3341,9 +3347,9 @@ def test_attention_ts_context_packed_dense_k_bounds_exclude_peer_requests():
         num_qo_heads=4,
         num_kv_heads=4,
         qkv_dtype=torch.float16,
-        packed=True,
+        packed_query=True,
         mask_type="dense",
-        output_dtype=torch.float16,
+        out_dtype=torch.float16,
         output_scale=0.75,
         device="cuda",
         seed=2026071423,
@@ -3374,7 +3380,7 @@ def test_attention_ts_context_packed_dense_k_bounds_exclude_peer_requests():
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_packed_query_tails(paged: bool, window_left: int) -> None:
-    """Partial packed Q tiles stay correct in eager launches and graph replay."""
+    """Partial packed_query Q tiles stay correct in eager launches and graph replay."""
 
     # Cover a tile crossing into the next request, a partial second tile,
     # and a final tile extending beyond the packed allocation.
@@ -3386,7 +3392,7 @@ def test_attention_ts_context_packed_query_tails(paged: bool, window_left: int) 
         head_dim=128,
         mask_type="causal",
         window_left=window_left,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         output_scale=1.0,
         seed=2026101401,
     )
@@ -3400,7 +3406,7 @@ def test_attention_ts_context_packed_query_tails(paged: bool, window_left: int) 
         q, k, v = reference.q, case.k_cache, case.v_cache
     else:
         reference = _make_context_case(
-            qkv_dtype=torch.bfloat16, packed=True, **case_args
+            qkv_dtype=torch.bfloat16, packed_query=True, **case_args
         )
         wrapper = BatchPrefillTSWrapper()
         _plan_wrapper(wrapper, reference)
@@ -3408,7 +3414,7 @@ def test_attention_ts_context_packed_query_tails(paged: bool, window_left: int) 
         q, k, v = reference.q, reference.k, reference.v
     _assert_context_correct(actual, reference)
 
-    graph_out = torch.full_like(q, float("nan"), dtype=reference.output_dtype)
+    graph_out = torch.full_like(q, float("nan"), dtype=reference.out_dtype)
     graph = _capture_context_graph(
         wrapper,
         q,
@@ -3436,9 +3442,9 @@ def test_attention_ts_context_uniform_aligned_packed_dense_accuracy():
         num_kv_heads=4,
         head_dim=256,
         qkv_dtype=_FP8,
-        packed=True,
+        packed_query=True,
         mask_type="dense",
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         device="cuda",
         seed=2026071510,
     )
@@ -3459,9 +3465,9 @@ def test_attention_ts_context_uniform_packed_offsets_accuracy():
         num_kv_heads=4,
         head_dim=128,
         qkv_dtype=_FP8,
-        packed=True,
+        packed_query=True,
         mask_type="dense",
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         device="cuda",
         seed=2026071810,
     )
@@ -3482,10 +3488,10 @@ def test_attention_ts_context_uniform_packed_window_offsets_accuracy():
         num_kv_heads=2,
         head_dim=128,
         qkv_dtype=torch.bfloat16,
-        packed=True,
+        packed_query=True,
         mask_type="causal",
         window_left=31,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         device="cuda",
         seed=2026071811,
     )
@@ -3513,9 +3519,9 @@ def test_attention_ts_context_qkbf16_pvfp8_accuracy(head_dim: int, mask_type: st
         num_kv_heads=4,
         head_dim=head_dim,
         qkv_dtype=torch.bfloat16,
-        packed=True,
+        packed_query=True,
         mask_type=mask_type,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         device="cuda",
         seed=2026082701 + head_dim,
     )
@@ -3542,7 +3548,7 @@ def test_attention_ts_context_paged_qkbf16_pvfp8_accuracy(
         qk_dtype=torch.bfloat16,
         v_dtype=_FP8,
         mask_type=mask_type,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         output_scale=1.0,
         seed=2026082702 + head_dim,
     )
@@ -3579,7 +3585,7 @@ def test_attention_ts_context_paged_dense_k_mask_accuracy(
     )
     case = replace(
         case,
-        reference=replace(case.reference, output_dtype=torch.bfloat16),
+        reference=replace(case.reference, out_dtype=torch.bfloat16),
     )
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
@@ -3687,7 +3693,7 @@ def test_attention_ts_context_d128_paged_s16k_runtime(qkv_dtype: torch.dtype):
         )
     case = replace(
         case,
-        reference=replace(case.reference, output_dtype=torch.bfloat16),
+        reference=replace(case.reference, out_dtype=torch.bfloat16),
     )
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
@@ -3709,10 +3715,10 @@ def test_attention_ts_context_fixed_window_tail_excludes_left_marker():
         num_qo_heads=8,
         num_kv_heads=2,
         qkv_dtype=torch.bfloat16,
-        packed=False,
+        packed_query=False,
         mask_type="causal",
         window_left=31,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         output_scale=1.0,
         device="cuda",
         seed=2026071419,
@@ -3741,10 +3747,10 @@ def test_attention_ts_context_fixed_window_loop_excludes_right_marker():
         num_qo_heads=8,
         num_kv_heads=2,
         qkv_dtype=torch.float16,
-        packed=False,
+        packed_query=False,
         mask_type="causal",
         window_left=63,
-        output_dtype=torch.float16,
+        out_dtype=torch.float16,
         output_scale=1.0,
         device="cuda",
         seed=2026071424,
@@ -3769,10 +3775,10 @@ def test_attention_ts_context_d256_fixed_head_paired_window_runtime():
         num_kv_heads=2,
         head_dim=256,
         qkv_dtype=torch.bfloat16,
-        packed=False,
+        packed_query=False,
         mask_type="causal",
         window_left=63,
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         output_scale=1.0,
         device="cuda",
         seed=2026071623,
@@ -3801,9 +3807,9 @@ def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
         num_kv_heads=2,
         head_dim=256,
         qkv_dtype=torch.bfloat16,
-        packed=False,
+        packed_query=False,
         mask_type="dense",
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         device="cuda",
         seed=2026071625,
     )
@@ -3818,7 +3824,7 @@ def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.parametrize(
-    ("qk_dtype", "output_dtype", "kv_length", "v_dtype"),
+    ("qk_dtype", "out_dtype", "kv_length", "v_dtype"),
     (
         pytest.param(torch.bfloat16, torch.bfloat16, 256, None, id="bf16-full-ring"),
         pytest.param(
@@ -3841,7 +3847,7 @@ def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
 )
 def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
     qk_dtype: torch.dtype,
-    output_dtype: torch.dtype,
+    out_dtype: torch.dtype,
     kv_length: int,
     v_dtype: Optional[torch.dtype],
 ):
@@ -3860,7 +3866,7 @@ def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
         mask_type="dense",
         seed=2026071826,
     )
-    case = replace(case, reference=replace(case.reference, output_dtype=output_dtype))
+    case = replace(case, reference=replace(case.reference, out_dtype=out_dtype))
     if kv_length % case.page_size:
         # A 993-token domain still occupies 32 pages, selecting the reused
         # page-window schedule while leaving the final V page tail invalid.
@@ -3907,7 +3913,7 @@ def test_attention_ts_context_d256_fp8_paged_dense_crosses_page_windows():
     )
     case = replace(
         case,
-        reference=replace(case.reference, output_dtype=torch.bfloat16),
+        reference=replace(case.reference, out_dtype=torch.bfloat16),
     )
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
@@ -3991,7 +3997,7 @@ def test_attention_ts_context_d256_paged_dynamic_causal_runtime(
     direct_out = torch.full_like(
         case.reference.q,
         float("nan"),
-        dtype=case.reference.output_dtype,
+        dtype=case.reference.out_dtype,
     )
     _run_paged_wrapper(wrapper, case, metadata, out=direct_out)
     graph_out = torch.full_like(direct_out, float("nan"))
@@ -4147,7 +4153,7 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
         mask_type=case.reference.mask_type,
         softmax_scale=case.reference.softmax_scale,
         output_scale=case.reference.output_scale,
-        out_dtype=case.reference.output_dtype,
+        out_dtype=case.reference.out_dtype,
     )
 
     _assert_context_correct(graph_out, runtime_reference, expected=expected)
@@ -4164,9 +4170,9 @@ def test_attention_ts_context_d256_fixed_causal_single_tile_runtime():
         num_kv_heads=2,
         head_dim=256,
         qkv_dtype=torch.bfloat16,
-        packed=False,
+        packed_query=False,
         mask_type="causal",
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         device="cuda",
         seed=2026071519,
     )
@@ -4206,7 +4212,7 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
         mask_type="causal",
         softmax_scale=case.reference.softmax_scale,
         output_scale=case.reference.output_scale,
-        out_dtype=case.reference.output_dtype,
+        out_dtype=case.reference.out_dtype,
         out=output,
     )
     assert returned is output
@@ -4216,7 +4222,7 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
 
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
-@pytest.mark.parametrize("paged", (False, True), ids=("packed", "paged"))
+@pytest.mark.parametrize("paged", (False, True), ids=("packed_query", "paged"))
 @pytest.mark.parametrize(
     "qkv_dtype",
     (torch.bfloat16, _FP8),
@@ -4261,7 +4267,7 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
         )
         paged_case = replace(
             paged_case,
-            reference=replace(paged_case.reference, output_dtype=torch.bfloat16),
+            reference=replace(paged_case.reference, out_dtype=torch.bfloat16),
         )
         reference = paged_case.reference
         reference.q.zero_()
@@ -4306,9 +4312,9 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
             num_kv_heads=4,
             head_dim=head_dim,
             qkv_dtype=qkv_dtype,
-            packed=True,
+            packed_query=True,
             mask_type="causal",
-            output_dtype=torch.bfloat16,
+            out_dtype=torch.bfloat16,
             output_scale=1.0,
             device="cuda",
             seed=2026071931 + head_dim + (1 if qkv_dtype == _FP8 else 0),
@@ -4329,7 +4335,7 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
     assert wrapper._plan_state is not None
     policy = wrapper._plan_state.policy
     assert dict(policy)["scheduler"] == "clc_dynamic_persistent"
-    graph_out = torch.full_like(q, float("nan"), dtype=reference.output_dtype)
+    graph_out = torch.full_like(q, float("nan"), dtype=reference.out_dtype)
     graph = _capture_context_graph(
         wrapper,
         q,
@@ -4349,7 +4355,7 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
     )
     expected = _context_reference(runtime_reference)
 
-    direct_out = torch.full_like(q, float("nan"), dtype=reference.output_dtype)
+    direct_out = torch.full_like(q, float("nan"), dtype=reference.out_dtype)
     if paged_metadata is None:
         wrapper.run(
             q,
@@ -4394,9 +4400,9 @@ def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
         num_kv_heads=4,
         head_dim=128,
         qkv_dtype=torch.bfloat16,
-        packed=True,
+        packed_query=True,
         mask_type="causal",
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         output_scale=1.0,
         device="cuda",
         seed=2026071932,
@@ -4418,7 +4424,7 @@ def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
     assert dict(wrapper._plan_state.policy)["pairing"] == "query"
     assert dict(wrapper._plan_state.policy)["uniform_packed_lengths"] is False
 
-    graph_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
+    graph_out = torch.full_like(case.q, float("nan"), dtype=case.out_dtype)
     graph = _capture_context_graph(
         wrapper,
         case.q,
@@ -4442,7 +4448,7 @@ def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
     )
     expected = _context_reference(runtime_reference)
 
-    direct_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
+    direct_out = torch.full_like(case.q, float("nan"), dtype=case.out_dtype)
     _run_wrapper(wrapper, case, out=direct_out)
     graph_out.fill_(float("nan"))
     graph.replay()
@@ -4467,9 +4473,9 @@ def test_attention_ts_context_live_k_redistribution_graph_replay():
         num_kv_heads=4,
         head_dim=128,
         qkv_dtype=torch.bfloat16,
-        packed=True,
+        packed_query=True,
         mask_type="causal",
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         output_scale=1.0,
         device="cuda",
         seed=2026071937,
@@ -4489,7 +4495,7 @@ def test_attention_ts_context_live_k_redistribution_graph_replay():
 
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    graph_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
+    graph_out = torch.full_like(case.q, float("nan"), dtype=case.out_dtype)
     graph = _capture_context_graph(
         wrapper,
         case.q,
@@ -4507,7 +4513,7 @@ def test_attention_ts_context_live_k_redistribution_graph_replay():
     runtime_reference = replace(case, k_lengths=replay_k_lengths)
     expected = _context_reference(runtime_reference)
 
-    direct_out = torch.full_like(case.q, float("nan"), dtype=case.output_dtype)
+    direct_out = torch.full_like(case.q, float("nan"), dtype=case.out_dtype)
     _run_wrapper(wrapper, case, out=direct_out)
     graph_out.fill_(float("nan"))
     graph.replay()
@@ -4520,7 +4526,7 @@ def test_attention_ts_context_live_k_redistribution_graph_replay():
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_paged_window_live_q_redistribution_graph_replay():
-    """Finite-window start and right masks follow live packed Q offsets."""
+    """Finite-window start and right masks follow live packed_query Q offsets."""
 
     plan_q_lengths = (48, 16)
     replay_q_lengths = (16, 48)
@@ -4539,7 +4545,7 @@ def test_attention_ts_context_paged_window_live_q_redistribution_graph_replay():
     wrapper = BatchPrefillPagedTSWrapper()
     metadata = _plan_paged_wrapper(wrapper, case)
     graph_out = torch.full_like(
-        case.reference.q, float("nan"), dtype=case.reference.output_dtype
+        case.reference.q, float("nan"), dtype=case.reference.out_dtype
     )
     graph = _capture_context_graph(
         wrapper,
@@ -4610,9 +4616,9 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
         num_qo_heads=8,
         num_kv_heads=2,
         qkv_dtype=torch.bfloat16,
-        packed=False,
+        packed_query=False,
         mask_type="causal",
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         device="cuda",
         seed=2026071420,
     )
@@ -4622,9 +4628,9 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
         num_qo_heads=8,
         num_kv_heads=2,
         qkv_dtype=torch.bfloat16,
-        packed=False,
+        packed_query=False,
         mask_type="causal",
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         device="cuda",
         seed=2026071421,
     )
@@ -4632,7 +4638,7 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, first)
 
-    shared_out = torch.full_like(first.q, float("nan"), dtype=first.output_dtype)
+    shared_out = torch.full_like(first.q, float("nan"), dtype=first.out_dtype)
     returned = _run_wrapper(wrapper, first, out=shared_out)
     assert returned is shared_out
     _assert_context_correct(shared_out, first)
@@ -4650,7 +4656,7 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     _assert_context_correct(shared_out, second)
     assert not torch.equal(shared_out, first_result)
 
-    graph_out = torch.full_like(second.q, float("nan"), dtype=second.output_dtype)
+    graph_out = torch.full_like(second.q, float("nan"), dtype=second.out_dtype)
     _run_wrapper(wrapper, second, out=graph_out)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
@@ -4669,20 +4675,20 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
-    ("packed", "q_lens", "k_lens", "large_masked_scores"),
+    ("packed_query", "q_lens", "k_lens", "large_masked_scores"),
     [
         pytest.param(False, (65,), (65,), False, id="fixed-b1-single-tile"),
         pytest.param(False, (257, 257), (513, 513), False, id="fixed-b2-partial"),
         pytest.param(False, (128,) * 4, (256,) * 4, False, id="fixed-b4-aligned"),
-        pytest.param(True, (257,), (513,), False, id="packed-b1-partial"),
-        pytest.param(True, (256, 256), (512, 512), False, id="packed-b2-replay"),
-        pytest.param(True, (65, 257), (129, 513), False, id="packed-b2-mixed"),
+        pytest.param(True, (257,), (513,), False, id="packed_query-b1-partial"),
+        pytest.param(True, (256, 256), (512, 512), False, id="packed_query-b2-replay"),
+        pytest.param(True, (65, 257), (129, 513), False, id="packed_query-b2-mixed"),
         pytest.param(
             True,
             (1, 127, 128, 385),
             (65, 128, 257, 513),
             False,
-            id="packed-b4-mixed",
+            id="packed_query-b4-mixed",
         ),
         pytest.param(False, (257,), (513,), True, id="fixed-b1-large-masked-scores"),
     ],
@@ -4691,12 +4697,12 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_mla_prefill(
-    dtype, out_dtype, packed, q_lens, k_lens, large_masked_scores, causal
+    dtype, out_dtype, packed_query, q_lens, k_lens, large_masked_scores, causal
 ):
     """Validate batched MLA with fixed/ragged lengths, dtype pairs and graph replay."""
     torch.manual_seed(123)
     batch_size = len(q_lens)
-    hq, hkv = (8, 2) if packed else (96, 1)
+    hq, hkv = (8, 2) if packed_query else (96, 1)
     q = torch.randn(sum(q_lens), hq, 192, device="cuda")
     k = torch.randn(sum(k_lens), hkv, 192, device="cuda")
     v = torch.randn(sum(k_lens), hkv, 128, device="cuda")
@@ -4719,12 +4725,12 @@ def test_attention_ts_context_mla_prefill(
     output_scale = 0.75 / operand_scale
     qo = (
         torch.tensor(_cumulative(q_lens), device="cuda", dtype=torch.int32)
-        if packed
+        if packed_query
         else None
     )
     ko = (
         torch.tensor(_cumulative(k_lens), device="cuda", dtype=torch.int32)
-        if packed
+        if packed_query
         else None
     )
 
@@ -4749,7 +4755,7 @@ def test_attention_ts_context_mla_prefill(
         return torch.cat(expected)
 
     expected = reference(q_lens, k_lens)
-    if not packed:
+    if not packed_query:
         q = q.reshape(batch_size, q_lens[0], hq, 192)
         k = k.reshape(batch_size, k_lens[0], hkv, 192)
         v = v.reshape(batch_size, k_lens[0], hkv, 128)
@@ -4757,7 +4763,7 @@ def test_attention_ts_context_mla_prefill(
     out = torch.empty((*q.shape[:-1], 128), dtype=out_dtype, device="cuda")
     replay_shift = (
         min(129, q_lens[-1] - 1, k_lens[0] - q_lens[0])
-        if packed and batch_size > 1
+        if packed_query and batch_size > 1
         else 0
     )
     wrapper = BatchPrefillTSWrapper()
@@ -4769,7 +4775,7 @@ def test_attention_ts_context_mla_prefill(
         head_dim_vo=128,
         q_dtype=dtype,
         k_dtype=dtype,
-        packed=packed,
+        packed_query=packed_query,
         mask_type="causal" if causal else "dense",
         softmax_scale=softmax_scale,
         output_scale=output_scale,
@@ -4868,9 +4874,9 @@ def test_attention_ts_context_two_cta_matches_single_cta(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         qkv_dtype=qk_dtype,
-        packed=False,
+        packed_query=False,
         mask_type="dense",
-        output_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
         output_scale=1.0,
         seed=2026092201,
     )
@@ -4916,7 +4922,7 @@ def test_attention_ts_context_variable_window_replanned_sizes():
             num_qo_heads=4,
             num_kv_heads=2,
             qkv_dtype=torch.bfloat16,
-            packed=False,
+            packed_query=False,
             mask_type="variable_window",
             seed=90800 + sq,
         )
@@ -4990,14 +4996,14 @@ def _softmax_statistics_reference(q, k, v, *, scale, sinks, window=-1, causal=Tr
     "dtype,dim,kind,mode",
     (
         (torch.bfloat16, 128, "fixed", "base2"),
-        (_FP8, 128, "packed", "base2"),
+        (_FP8, 128, "packed_query", "base2"),
         (_FP8, 128, "paged", "base2"),
         (torch.bfloat16, 256, "paged", "base2"),
     ),
 )
 def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
     """Sinks, final LSE and FP8/FP16 agree with an independent causal oracle."""
-    output_dtype = torch.float16 if dtype == _FP8 else dtype
+    out_dtype = torch.float16 if dtype == _FP8 else dtype
     options = dict(
         q_lengths=(129, 129),
         k_lengths=(257, 257),
@@ -5005,7 +5011,7 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
         num_kv_heads=2,
         head_dim=dim,
         mask_type="causal",
-        output_dtype=output_dtype,
+        out_dtype=out_dtype,
     )
     if kind == "paged":
         paged = _make_paged_context_case(**options, qk_dtype=dtype)
@@ -5022,10 +5028,12 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
         )
         plan_options = dict(page_size=32)
     else:
-        case = _make_context_case(**options, qkv_dtype=dtype, packed=kind == "packed")
+        case = _make_context_case(
+            **options, qkv_dtype=dtype, packed_query=kind == "packed_query"
+        )
         wrapper = BatchPrefillTSWrapper()
         args = (case.q, case.k, case.v, case.qo_indptr, case.kv_indptr)
-        plan_options = dict(packed=case.packed)
+        plan_options = dict(packed_query=case.packed_query)
     runtime_softmax_scale = 8 * case.softmax_scale
     wrapper.plan(
         device="cuda",
@@ -5034,7 +5042,7 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
         head_dim=dim,
         q_dtype=dtype,
         k_dtype=dtype,
-        out_dtype=output_dtype,
+        out_dtype=out_dtype,
         mask_type="causal",
         output_scale=0.75,
         lse_mode=mode,
@@ -5048,7 +5056,7 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
     refs = [
         _softmax_statistics_reference(
             *[
-                _request_slice(t, lengths, b, packed=case.packed)
+                _request_slice(t, lengths, b, packed_query=case.packed_query)
                 for t, lengths in (
                     (case.q, case.q_lengths),
                     (case.k, case.k_lengths),
@@ -5060,7 +5068,7 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
         )
         for b in range(2)
     ]
-    combine = torch.cat if case.packed else torch.stack
+    combine = torch.cat if case.packed_query else torch.stack
     ref = combine([r[0] for r in refs]) * 0.75
     expected = combine([r[1] for r in refs]) / (math.log(2) if mode == "base2" else 1)
     out, lse = wrapper.run(

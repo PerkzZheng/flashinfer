@@ -95,9 +95,9 @@ on the metadata device. `block_tables` is a 4-byte-aligned CUDA
 `torch.int32[B, max_num_pages]` view with contiguous, non-overlapping rows:
 `stride(1) == 1` and `stride(0) >= max_num_pages`. This includes both compact
 tables and a plane view sliced from `[B, 2, max_num_pages]` metadata.
-`seq_lens` is compact, 4-byte-aligned CUDA `torch.int32`; packed `qo_indptr`
+`seq_lens_kv` is compact, 4-byte-aligned CUDA `torch.int32`; packed `qo_indptr`
 is contiguous CUDA `torch.int32`. A caller-provided `out` must not overlap
-query, cache, `block_tables`, `seq_lens`, packed `qo_indptr`, or caller-owned
+query, cache, `block_tables`, `seq_lens_kv`, packed `qo_indptr`, or caller-owned
 workspace.
 Storage overlap is an unchecked caller precondition in both validation modes.
 The default API returns O; an enabled LSE plan can also return final FP32 LSE.
@@ -117,7 +117,7 @@ Public LSE is independent of the split-reduction workspace.
   dimensions.
 - Dense page table: inner-contiguous, non-overlapping CUDA
   `int32[B, max_num_pages]` `block_tables`. Padding between rows is accepted.
-- Runtime lengths: contiguous CUDA `int32[B]` `seq_lens`. Every length is
+- Runtime lengths: contiguous CUDA `int32[B]` `seq_lens_kv`. Every length is
   positive and no larger than the static K/V bound.
 
 Internally, the query-token and query-head axes form one affine row space,
@@ -136,7 +136,7 @@ rectangular tiles beyond a shorter request's active prefix retire scheduler
 bookkeeping without issuing Q/K/V or output accesses.
 
 For causal request `b`, query row `i` can attend through
-`seq_lens[b] - query_length[b] + i`. `softmax_scale` and `output_scale` default to
+`seq_lens_kv[b] - query_length[b] + i`. `softmax_scale` and `output_scale` default to
 1 and must be finite, positive Python scalars representable as positive
 `float32` values.
 
@@ -146,12 +146,12 @@ length must index the physical cache. Packed offsets start at zero, are
 nondecreasing, end at `total_q`, and have every nonnegative per-request delta
 no greater than `max_seq_len_q`.
 
-The wrapper receives `block_tables`, `seq_lens`, and packed `qo_indptr` on
+The wrapper receives `block_tables`, `seq_lens_kv`, and packed `qo_indptr` on
 every run. Their storage and values may change between completed launches
 without replanning while page IDs remain valid, K/V lengths stay positive and
 within the static bound, packed-Q deltas stay nonnegative and within their bound,
 and the final packed offset equals the current query/output extent. Causal
-metadata must also preserve `q_len[b] <= seq_lens[b]` for every request.
+metadata must also preserve `q_len[b] <= seq_lens_kv[b]` for every request.
 Individual packed requests may be empty. An all-empty packed launch requires a
 positive `max_seq_len_q` and returns an empty output without GPU dispatch.
 
@@ -238,13 +238,13 @@ kv_cache = torch.randn(
 block_tables = torch.arange(
     num_pages, device=device, dtype=torch.int32
 ).view(B, pages_per_request)
-seq_lens = torch.full(
+seq_lens_kv = torch.full(
     (B,), pages_per_request * page_size, device=device, dtype=torch.int32
 )
 
 wrapper = BatchMLADecodePagedTSWrapper()
-wrapper.plan(query.device, batch_size=B, max_seq_len_q=1, max_kv_len=pages_per_request * page_size, num_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=False, q_data_type=query.dtype, kv_data_type=kv_cache.dtype, o_data_type=torch.bfloat16, mask_type='causal')
-out = wrapper.run(query, kv_cache, block_tables, seq_lens)
+wrapper.plan(query.device, batch_size=B, max_seq_len_q=1, max_kv_len=pages_per_request * page_size, num_qo_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=False, q_dtype=query.dtype, kv_dtype=kv_cache.dtype, out_dtype=torch.bfloat16, mask_type='causal')
+out = wrapper.run(query, kv_cache, block_tables, seq_lens_kv)
 assert out.shape == (B, 1, H, latent_dim)
 
 # Packed Q uses cumulative per-request offsets and compact token-major rows.
@@ -256,12 +256,12 @@ packed_query = torch.randn(
     dtype=torch.bfloat16,
 )
 packed_wrapper = BatchMLADecodePagedTSWrapper()
-packed_wrapper.plan(packed_query.device, batch_size=B, max_seq_len_q=max(q_lens), max_kv_len=pages_per_request * page_size, num_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=True, q_data_type=packed_query.dtype, kv_data_type=kv_cache.dtype, o_data_type=torch.bfloat16, mask_type='causal')
+packed_wrapper.plan(packed_query.device, batch_size=B, max_seq_len_q=max(q_lens), max_kv_len=pages_per_request * page_size, num_qo_heads=H, kv_lora_rank=latent_dim, qk_rope_head_dim=rope_dim, page_size=page_size, packed_query=True, q_dtype=packed_query.dtype, kv_dtype=kv_cache.dtype, out_dtype=torch.bfloat16, mask_type='causal')
 packed_out = packed_wrapper.run(
     packed_query,
     kv_cache,
     block_tables,
-    seq_lens,
+    seq_lens_kv,
     qo_indptr=qo_indptr,
 )
 assert packed_out.shape == (sum(q_lens), H, latent_dim)

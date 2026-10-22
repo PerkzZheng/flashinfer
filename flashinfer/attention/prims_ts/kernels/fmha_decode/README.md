@@ -101,7 +101,7 @@ extensions for the new capabilities are deferred.
 `plan()` takes model configuration, exact batch size, Q/KV bounds and optional
 scratch. It selects cached policy, obtains compiled kernels and binds resources.
 Every `run()` supplies query/cache, page tables and packed-Q offsets when needed.
-Live K/V lengths come from each run unless `plan(seq_lens=...)` owns a CUDA copy.
+Live K/V lengths come from each run unless `plan(seq_lens_kv=...)` owns a CUDA copy.
 Fixed Q length is exact; packed Q lengths stay within planned `max_seq_len_q`.
 Validation is enabled by default and may synchronize metadata to the host.
 
@@ -122,7 +122,7 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 page-32 profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
 | Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
-| V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_data_type`; defaults to `k_data_type`) |
+| V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_dtype`; defaults to `k_dtype`) |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
 | K/V layout | HND or NHD paged cache, combined or separate K/V tensors; a V dtype that differs from K requires separate tensors |
 | Page size | 4, 8, 16, 32, 64, or 128 tokens; a logical fragment must divide the physical cache page |
@@ -133,7 +133,7 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Accumulation | FP32 QK/PV and softmax state |
 
 FP8-E4M3 Q with FP8-E4M3 or NVFP4 K/V can write BF16 directly. Set
-`o_data_type=torch.bfloat16` when planning a wrapper, or
+`out_dtype=torch.bfloat16` when planning a wrapper, or
 `out_dtype=torch.bfloat16` for one-shot execution and workspace sizing.
 Prepared launches also accept BF16 output buffers. Both 16-bit output types
 share split/reduction eligibility, including cluster SMEM reduction and the
@@ -177,8 +177,8 @@ have padded storage.
   non-overlapping row stride of at least `C`; padding between rows is
   supported. Packed runs additionally supply contiguous `qo_indptr[B + 1]`.
   The one-shot argument is named `seq_lens_kv`; wrapper and standalone entry
-  points use `seq_lens`. The standalone launch also takes a static
-  `max_seq_len` upper bound. A convenience call may read metadata and allocate
+  points use `seq_lens_kv`. The standalone launch also takes a static
+  `max_kv_len` upper bound. A convenience call may read metadata and allocate
   scratch. The unified one-shot API also supports trusted capture-safe calls
   with caller workspace, `out`, explicit `max_kv_len`, and `validate=False`;
   packed Q additionally requires `max_seq_len_q`. Warm the selected execution
@@ -186,7 +186,7 @@ have padded storage.
   contract for workspace initialization and lifetime rules.
 
 For every request `b`, the fixed table must satisfy
-`ceil(seq_lens[b] / page_size) <= C`. Only that active row prefix must contain
+`ceil(seq_lens_kv[b] / page_size) <= C`. Only that active row prefix must contain
 valid physical page IDs; inactive tail entries are never read.
 Query offsets start at zero, increase strictly, end at the packed Q extent,
 and have every delta no larger than the planned `max_seq_len_q`. Causal
@@ -271,27 +271,27 @@ kv = torch.randn(
 block_tables = torch.arange(num_pages, device=device, dtype=torch.int32).view(
     B, pages_per_request
 )
-max_seq_len = pages_per_request * page_size
-seq_lens = torch.full((B,), max_seq_len, device=device, dtype=torch.int32)
+max_kv_len = pages_per_request * page_size
+seq_lens_kv = torch.full((B,), max_kv_len, device=device, dtype=torch.int32)
 
 wrapper = BatchDecodePagedTSWrapper(kv_layout="HND")
-wrapper.plan(q.device, batch_size=B, max_seq_len_q=1, max_kv_len=max_seq_len, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size, packed_query=False, q_data_type=q.dtype, k_data_type=kv.dtype, v_data_type=kv.dtype, o_data_type=q.dtype, mask_type='causal')
-out = wrapper.run(q, kv, seq_lens, block_tables)
+wrapper.plan(q.device, batch_size=B, max_seq_len_q=1, max_kv_len=max_kv_len, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size, packed_query=False, q_dtype=q.dtype, k_dtype=kv.dtype, v_dtype=kv.dtype, out_dtype=q.dtype, mask_type='causal')
+out = wrapper.run(q, kv, seq_lens_kv, block_tables)
 assert out.shape == q.shape
 
 # The standalone API uses caller-owned scratch and explicit K/V lengths.
 workspace_bytes = get_prims_ts_batch_decode_workspace_size(
     batch_size=B, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D,
-    page_size=page_size, max_seq_len=max_seq_len, q_dtype=q.dtype, device=q.device,
+    page_size=page_size, max_kv_len=max_kv_len, q_dtype=q.dtype, device=q.device,
 )
 workspace = torch.zeros(workspace_bytes, device=device, dtype=torch.int8)
 standalone_out = batch_decode_with_paged_kv_cache(
     q,
     kv,
     block_tables,
-    seq_lens,
+    seq_lens_kv,
     workspace_buffer=workspace,
-    max_kv_len=max_seq_len,
+    max_kv_len=max_kv_len,
     mask_type="causal",
 )
 assert standalone_out.shape == q.shape
@@ -322,7 +322,7 @@ that responsibility to the caller. Tensor-bound prepared plans also require
 reinitialization before sharing scratch with a different prepared layout. Do not share it
 between concurrent launches or captured graphs. It must not overlap Q, K/V
 cache, metadata, or output storage. The standalone hot path trusts
-`block_tables`, `seq_lens`, and
+`block_tables`, `seq_lens_kv`, and
 packed-Q values: keep lengths positive and within their static bounds, keep
 enough table columns for every request, and keep all active page IDs valid.
 Sequence lengths, page IDs, and packed-Q offsets may change between
