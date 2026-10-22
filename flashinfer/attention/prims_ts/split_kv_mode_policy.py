@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared split-KV reduction-mode policy for FMHA and MLA decode."""
+"""Shared split-KV capacity and reduction-mode policy for FMHA and MLA."""
 
 from collections.abc import Iterable
 
@@ -92,3 +92,18 @@ def select_split_kv_modes(
         )
 
     return tuple(modes_by_name[mode] for mode in mode_order if mode in modes_by_name)
+
+
+def split_capacity(policy_bound: int, sm_count: int) -> int:
+    """Round a proven plan-wide policy bound into a shared reduction range.
+
+    This sizes every count the policy can select under the plan, rather than
+    depending on the first launch's active prefix. Counts remain runtime.
+    """
+    bound = min(policy_bound, sm_count)
+    for upper in (1, 4, 8, 16, 32, 64):
+        if bound <= upper:
+            return min(upper, sm_count)
+    # Sixteen-slot ranges retain the reducer topology near warp boundaries
+    # and avoid excessive scratch/grid padding on devices above128 SMs.
+    return min(((bound + 15) // 16) * 16, sm_count)

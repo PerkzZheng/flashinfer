@@ -24,7 +24,8 @@ from ...separate_reduction import (
     normalized_lse_weight,
     attention_sink_scale,
 )
-from ..helpers.constants import LN_2, SPLIT_REDUCTION_SCALE_BARRIER_ID
+from ..helpers.constants import SPLIT_REDUCTION_SCALE_BARRIER_ID
+from ..helpers.math import final_lse
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.math import ceil_div
 from ..helpers.ops import fmax_f32, warp_reduce_max_f32, warp_reduce_sum_f32
@@ -59,6 +60,7 @@ def _parallel_reduction_row_state(
     query_tile_idx,
     batch_idx,
     cfg,
+    split_divisor=None,
 ):
     """Return logical row coordinates and its runtime active split count.
 
@@ -129,6 +131,7 @@ def _parallel_reduction_row_state(
         row_k_tile_total,
         tile_k_tile_total,
         split_kv_cap,
+        split_divisor=split_divisor,
     )
     return (
         logical_head_idx,
@@ -156,16 +159,17 @@ def _store_parallel_reduction_result(
     finalize_attention: cutlass.Constexpr[bool] = False,
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
+    base_on_e: cutlass.Constexpr[bool] = False,
 ):
     """Publish one normalized FP32 output fragment and final LSE."""
 
-    if cutlass.const_expr(finalize_attention):
-        global_lse *= Float32(LN_2)
-    if tidx == Int32(0) and query_is_valid:
-        if cutlass.const_expr(cu_seqlens_q is not None):
-            lse[logical_head_idx, storage_q_idx] = global_lse
-        else:
-            lse[logical_head_idx, logical_q_idx, batch_idx] = global_lse
+    if cutlass.const_expr(lse is not None):
+        if tidx == Int32(0) and query_is_valid:
+            value = final_lse(global_lse, base_on_e or finalize_attention)
+            if cutlass.const_expr(cu_seqlens_q is not None):
+                lse[logical_head_idx, storage_q_idx] = value
+            else:
+                lse[logical_head_idx, logical_q_idx, batch_idx] = value
 
     if cutlass.const_expr(output_quant is not None):
         if query_is_valid:
@@ -214,10 +218,11 @@ def run_parallel_reduction_kernel(
     actual_splits: cutlass.Constexpr[int],
     cluster_size: cutlass.Constexpr[int],
     slots_per_rank: cutlass.Constexpr[int],
-    atten_sinks=None,
+    attention_sinks=None,
     finalize_attention: cutlass.Constexpr[bool] = False,
     output_quant: cutlass.Constexpr = None,
     output_quant_args=None,
+    split_divisor=None,
 ):
     """Reduce one D=512 row cooperatively across a padded CTA cluster.
 
@@ -270,6 +275,7 @@ def run_parallel_reduction_kernel(
             query_tile_idx,
             batch_idx,
             cfg,
+            split_divisor=split_divisor,
         )
 
     element_idx = tidx * Int32(PARALLEL_REDUCTION_ELEMENTS_PER_THREAD)
@@ -339,11 +345,11 @@ def run_parallel_reduction_kernel(
         # Keep this warp-local value distinct from the post-barrier SMEM load.
         stats_lse_value = finalize_log2_sum_exp(local_exp_frame, local_sum_lse)
         sink_scale = Float32(1)
-        if cutlass.const_expr(finalize_attention and atten_sinks is not None):
+        if cutlass.const_expr(finalize_attention and attention_sinks is not None):
             sink_scale = Float32(0)
             if query_is_valid:
                 sink_scale = attention_sink_scale(
-                    stats_lse_value, Float32(atten_sinks[logical_head_idx])
+                    stats_lse_value, Float32(attention_sinks[logical_head_idx])
                 )
         if lane_idx == Int32(0):
             smem_local_lse[0] = stats_lse_value
@@ -421,6 +427,7 @@ def run_parallel_reduction_kernel(
             finalize_attention,
             output_quant,
             output_quant_args,
+            base_on_e=cfg.lse_base_on_e,
         )
         return
 
@@ -538,6 +545,7 @@ def run_parallel_reduction_kernel(
             tidx,
             batch_idx,
             cu_seqlens_q,
+            base_on_e=cfg.lse_base_on_e,
         )
 
     prims.barrier_cluster_arrive_relaxed()
