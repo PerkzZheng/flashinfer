@@ -1927,14 +1927,16 @@ class SmemPageOffsetsKvResource(MemoryResource):
             return self._smem_page_offsets.load(
                 offset, vector_size=pages_per_tile, alignment=pages_per_tile * 4
             )
-        page_ids = cutlass.Array(Int32, pages_per_tile, space=cutlass.AddressSpace.rmem)
+        tile_page_ids = cutlass.Array(
+            Int32, pages_per_tile, space=cutlass.AddressSpace.rmem
+        )
         for chunk in cutlass.range_constexpr(pages_per_tile // 8):
             values = self._smem_page_offsets.load(
                 offset + Int32(chunk * 8), vector_size=8, alignment=32
             )
             for i in cutlass.range_constexpr(8):
-                page_ids[chunk * 8 + i] = Int32(values[i])
-        return page_ids
+                tile_page_ids[chunk * 8 + i] = Int32(values[i])
+        return tile_page_ids
 
     @cute.jit
     def _producer_load_page_offsets(

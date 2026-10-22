@@ -2974,6 +2974,33 @@ def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
 
 
 @_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("batch,sq,kv", ((2, 3, 641), (1, 5, 769)))
+def test_attention_ts_mla_packed_query_allocation_boundary(batch, sq, kv):
+    """Packed query TMA must stay within the caller's physical allocation."""
+    from tests.attention.test_attention_ts_q_token_kv_block_sparse_metadata import (
+        _query_at_unmapped_boundary,
+    )
+
+    case = _make_mla_case(
+        batch_size=batch,
+        num_qo_heads=16,
+        max_kv_len=kv,
+        seq_len_q=sq,
+        qkv_dtype=_FP8,
+        seed=90400 + batch + kv,
+    )
+    case, offsets = _pack_mla_case(case, (sq,) * batch)
+    with _query_at_unmapped_boundary(case.query.shape, case.query.dtype) as query:
+        query.copy_(case.query)
+        case = replace(case, query=query)
+        wrapper = _plan_case(case, qo_indptr=offsets, max_seq_len_q=sq)
+        output = _run_case(wrapper, case, qo_indptr=offsets)
+        _assert_case_correct(
+            output, case, dict(wrapper._plan_state.policy), qo_indptr=offsets
+        )
+
+
+@_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_standalone_reuses_caller_workspace():
     """Standalone MLA reuses caller scratch and omits unused final LSE."""
     workspace = torch.empty(
