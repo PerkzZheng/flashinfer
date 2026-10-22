@@ -5424,6 +5424,9 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
         "mask_type": "causal",
     }
     cfg = _make_auto_kv_tile_config(monkeypatch, **dtype_args)
+    explicit_kv = _make_auto_kv_tile_config(
+        monkeypatch, **dtype_args, args={"tile_size_kv": 256}
+    )
     explicit_reference = _make_auto_kv_tile_config(
         monkeypatch,
         **dtype_args,
@@ -5444,6 +5447,7 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
     assert register_cfg.softmax_task_num_registers == 152
     assert register_cfg.correction_task_num_registers == 152
     assert cfg == explicit_reference
+    assert cfg == explicit_kv
 
 
 @pytest.mark.parametrize(
@@ -5603,7 +5607,9 @@ def test_attention_ts_decode_auto_kv_tile_policy(
         return selected
 
     def _spy_kv_promoter(*args, **kwargs):
-        events.append("kv")
+        # Record final materialization, excluding eligibility probes during Q search.
+        if grouped_q_selections:
+            events.append("kv")
         return original_kv_promoter(*args, **kwargs)
 
     def _spy_make_q_recipe(*args, **kwargs):
@@ -6756,6 +6762,11 @@ def test_attention_ts_decode_runtime_q_features_use_structural_persistence(
     monkeypatch.setattr(fmha_decode_config.utils, "HardwareInfo", _FourSmHardware)
     # Pin Q8/KV128 so this tests launch-mode persistence at a fixed Q grid.
     # Joint grouped-Q selection has its own occupancy search.
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda cluster_size: 4 // cluster_size,
+    )
     config_args: dict[str, object] = {"tile_size_q": 8, "tile_size_kv": 128}
     if packed_q:
         config_args["use_variable_seqlens_q"] = True

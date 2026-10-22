@@ -3823,12 +3823,15 @@ def enumerate_auto_splits_kv(
     num_q_tiles: int,
     service_capacity: int,
     split_kv: bool = True,
+    requested_splits_kv: int = -1,
+    max_splits_kv: int | None = None,
 ) -> tuple[int, ...]:
     """Enumerate direct and useful split fanouts for an under-filled Q grid.
 
     All one-wave fanouts and the first capacity-crossing fanout participate in
     the empirical score. The latter is important when a partially filled wave
     cannot be completed by any uniform integer fanout.
+    A positive requested fanout is pinned, subject to the same KV-work cap.
     """
     if not split_kv:
         return (1,)
@@ -3840,7 +3843,10 @@ def enumerate_auto_splits_kv(
         seq_len_kv=seq_len_kv,
         tile_size_kv=tile_size_kv,
         num_insts_kv=num_insts_kv,
+        max_splits_kv=max_splits_kv,
     )
+    if requested_splits_kv > 0:
+        return (max(1, min(requested_splits_kv, max_by_work)),)
     base_grid = max(1, batch_size * num_heads_kv * num_q_tiles)
     if base_grid >= service_capacity or max_by_work <= 1:
         return (1,)
@@ -4122,8 +4128,6 @@ _MMA_SELECTION_FIELDS = {
 
 _LAUNCH_SELECTION_FIELDS = {
     "use_split_kv",
-    "splits_kv",
-    "max_splits_kv",
     "use_separate_reduction_kernel",
     "use_cluster_smem_reduction",
     "use_persistent_scheduler",
@@ -4269,6 +4273,8 @@ def _resolve_grouped_q_launch_candidates(
     num_heads_q: int,
     num_heads_kv: int,
     service_capacity: int,
+    splits_kv: int,
+    max_splits_kv: int | None,
     split_kv: bool = True,
 ) -> tuple[GroupedQLaunchCandidate, ...]:
     """Resolve one TileQ with Q-grid-aware direct and split recipes.
@@ -4296,6 +4302,19 @@ def _resolve_grouped_q_launch_candidates(
         # its Q geometry and modeled cost are identical to the qualified FP16
         # logical candidate. The KV selector materializes and validates the
         # actual BF16 profile only after the Q winner is known.
+        if cfg.tile_size_kv != 256 and not _try_apply_auto_kv256_profile(
+            probe,
+            q_candidate=candidate,
+            explicit_fields=explicit_fields,
+            auto_tuner=True,
+            split_kv_mode="disabled",
+            num_heads_q=num_heads_q,
+            num_heads_kv=num_heads_kv,
+            splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
+        ):
+            return ()
+        probe.tile_size_kv = 128
         probe.q_dtype = Float16
         probe.k_dtype = Float16
         probe.v_dtype = Float16
@@ -4305,6 +4324,13 @@ def _resolve_grouped_q_launch_candidates(
             probe,
             explicit_fields | {"tile_size_q"},
         )
+        # Explicit MMA fields constrain candidates instead of disabling the
+        # search over the remaining geometry and launch choices.
+        if any(
+            getattr(probe, field) != getattr(cfg, field)
+            for field in _MMA_SELECTION_FIELDS & explicit_fields
+        ):
+            return ()
         if probe.use_keeps_mma_ab and not probe.supports_auto_grouped_keeps:
             return ()
         cost_num_insts_kv = probe.num_insts_kv
@@ -4318,15 +4344,21 @@ def _resolve_grouped_q_launch_candidates(
     except ValueError:
         return ()
 
-    split_candidates = enumerate_auto_splits_kv(
-        seq_len_kv=seq_len_kv,
-        batch_size=batch_size,
-        num_heads_kv=num_heads_kv,
-        tile_size_kv=cost_tile_size_kv,
-        num_insts_kv=cost_num_insts_kv,
-        num_q_tiles=candidate.q_tiles,
-        service_capacity=service_capacity,
-        split_kv=split_kv,
+    split_candidates = (
+        (cfg.splits_kv if cfg.use_split_kv else 1,)
+        if _LAUNCH_SELECTION_FIELDS & explicit_fields
+        else enumerate_auto_splits_kv(
+            seq_len_kv=seq_len_kv,
+            batch_size=batch_size,
+            num_heads_kv=num_heads_kv,
+            tile_size_kv=cost_tile_size_kv,
+            num_insts_kv=cost_num_insts_kv,
+            num_q_tiles=candidate.q_tiles,
+            service_capacity=service_capacity,
+            split_kv=split_kv,
+            requested_splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
+        )
     )
     recipes = []
     for candidate_splits_kv in split_candidates:
@@ -4375,11 +4407,11 @@ def _apply_auto_grouped_q_mma_config(
     max_splits_kv: int | None,
     split_kv: bool = True,
 ) -> GroupedQLaunchCandidate | None:
-    """Select a legal multi-Q MMA and KV-split recipe when unpinned.
+    """Select a legal multi-Q MMA and KV-split recipe within caller constraints.
 
-    SQ1, sliding windows, explicit launch modes, ungrouped layouts, and
-    caller-provided MMA fields retain the existing path. Explicit fanout
-    controls bypass this selector together with explicit launch and MMA fields.
+    SQ1, sliding windows, explicit launch modes, and ungrouped layouts retain
+    the existing path. Explicit MMA fields filter candidates; explicit launch
+    fields and fanout controls constrain their launch recipes.
     Mixed-precision candidates use SwapsMmaAb since Keeps is not supported yet.
 
     Fanout arguments here are caller overrides, before automatic selection.
@@ -4396,10 +4428,6 @@ def _apply_auto_grouped_q_mma_config(
         or not cfg.use_paged_kv
         or cfg.num_tokens_per_page != 32
         or cfg.use_sliding_window_causal
-        or bool(_MMA_SELECTION_FIELDS & explicit_fields)
-        or bool(_LAUNCH_SELECTION_FIELDS & explicit_fields)
-        or splits_kv != -1
-        or max_splits_kv is not None
     ):
         return None
 
@@ -4424,6 +4452,8 @@ def _apply_auto_grouped_q_mma_config(
             num_heads_q=num_heads_q,
             num_heads_kv=num_heads_kv,
             service_capacity=service_capacity,
+            splits_kv=splits_kv,
+            max_splits_kv=max_splits_kv,
             split_kv=split_kv,
         )
     )
@@ -4442,11 +4472,17 @@ def _apply_auto_grouped_q_mma_config(
         # mainloop-aware score instead of rewarding narrow tiles that reread
         # the complete KV sequence for each additional Q tile.
         direct = tuple(recipe for recipe in supported if recipe.splits_kv == 1)
-        if not direct:
-            return None
-        selected = select_grouped_q_direct_wave_candidate(direct)
+        selected = (
+            select_grouped_q_direct_wave_candidate(direct)
+            if direct
+            else select_grouped_q_launch_candidate(supported)
+        )
     _apply_grouped_q_mma_candidate(cfg, selected.mma)
-    if selected.splits_kv == 1 and selected.base_ctas > service_capacity:
+    if (
+        selected.splits_kv == 1
+        and selected.base_ctas > service_capacity
+        and not (_LAUNCH_SELECTION_FIELDS & explicit_fields)
+    ):
         # CLC persistence pays for work discovery by reusing one resident CTA
         # wave. Select it only when the direct launch has more than one wave;
         # a single-wave grid has no launch work for persistence to eliminate.
@@ -4649,8 +4685,8 @@ def _apply_auto_launch_mode(
     if mode not in ("gmem_reduction", "persistent"):
         return split_kv_mode
 
-    # An explicitly selected MMA profile can bypass the joint selector while
-    # still leaving launch mode automatic. Probe the complete derived launch
+    # Profiles outside the joint selector can still leave launch mode
+    # automatic. Probe the complete derived launch
     # before committing it, so an unsupported Keeps split/persistent recipe
     # falls back to the caller's valid direct profile.
     probe = deepcopy(cfg)
@@ -5336,7 +5372,7 @@ def make_decode_config(
     2. Fill profile-derived defaults: dtype fields, paged-KV metadata, the
        dense/causal mask, sliding-window flags, attention-sink flags, default
        grouped-Q metadata for fixed or packed launches, and the SMEM-derived
-       KV stage count. For an unpinned multi-Q page-32 launch without a sliding
+       KV stage count. For a multi-Q page-32 launch without a sliding
        window, the Q selector first enumerates Swaps8/16/32 and Keeps64/128
        tiles and every useful direct/split recipe through the first
        capacity-crossing fanout.
@@ -5554,7 +5590,9 @@ def make_decode_config(
     # Auto launch-mode selection. Only kicks in if the caller has not already
     # opted into a specific mode. The caller's split permission is independent
     # of Q storage; unsupported automatic recipes retain their direct fallback.
-    if selected_grouped_q_recipe is not None:
+    if selected_grouped_q_recipe is not None and not (
+        _LAUNCH_SELECTION_FIELDS & explicit_fields
+    ):
         if selected_grouped_q_recipe.splits_kv > 1:
             split_kv_mode = selected_grouped_q_recipe.split_kv_mode
             splits_kv = selected_grouped_q_recipe.splits_kv
