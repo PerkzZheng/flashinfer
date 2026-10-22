@@ -276,7 +276,10 @@ out = wrapper.run(q, kv, seq_lens, block_tables)
 assert out.shape == q.shape
 
 # The standalone API uses caller-owned scratch and explicit K/V lengths.
-workspace_bytes = get_prims_ts_batch_decode_workspace_size(num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D, page_size=page_size, device=q.device)
+workspace_bytes = get_prims_ts_batch_decode_workspace_size(
+    batch_size=B, num_qo_heads=Hq, num_kv_heads=Hkv, head_dim=D,
+    page_size=page_size, max_seq_len=max_seq_len, q_dtype=q.dtype, device=q.device,
+)
 workspace = torch.zeros(workspace_bytes, device=device, dtype=torch.int8)
 standalone_out = batch_decode_with_paged_kv_cache(
     q,
@@ -306,13 +309,13 @@ may cause incorrect results or out-of-bounds access. Storage overlap is
 unsupported and unchecked in both modes. Do not mutate
 run-owned metadata concurrently with a launch or replay that reads it.
 
-For the standalone workflow, query scratch with model head geometry, page
+For the standalone workflow, query scratch with batch size, Q/KV bounds, head geometry, page
 size, device and split capability. Allocate contiguous, 32-byte-aligned CUDA
 `torch.int8` or `torch.uint8` scratch and zero it before its first trusted
-standalone launch. Wrappers initialize the fixed control tail by default;
-ordinary batch/length changes do not require re-zeroing that tail. Tensor-bound
-prepared plans retain their own layouts and require reinitialization before
-sharing scratch with a different prepared layout. Do not share it
+standalone launch and whenever workspace-layout inputs change. Wrappers
+initialize control storage by default; `initialize_workspace=False` transfers
+that responsibility to the caller. Tensor-bound prepared plans also require
+reinitialization before sharing scratch with a different prepared layout. Do not share it
 between concurrent launches or captured graphs. It must not overlap Q, K/V
 cache, metadata, or output storage. The standalone hot path trusts
 `block_tables`, `seq_lens`, and

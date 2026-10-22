@@ -1713,10 +1713,23 @@ def _run_standalone(
     # The standalone ABI owns persistent reduction counters in this buffer.
     if workspace_buffer is None:
         workspace_size = get_prims_ts_batch_decode_workspace_size(
-            num_qo_heads=case.q.shape[-2],
-            num_kv_heads=case.k_cache.shape[1],
-            head_dim=case.q.shape[-1],
-            page_size=case.k_cache.shape[2] if page_size is None else page_size,
+            case.paged_kv_indptr.numel() - 1,
+            case.q.shape[-2],
+            case.k_cache.shape[1],
+            case.q.shape[-1],
+            case.k_cache.shape[2] if page_size is None else page_size,
+            max_kv_len,
+            seq_len_q=seq_len_q,
+            qo_indptr=qo_indptr,
+            max_seq_len_q=max_seq_len_q,
+            q_dtype=case.q.dtype,
+            k_dtype=case.k_cache.dtype,
+            v_dtype=case.v_cache.dtype,
+            out_dtype=case.output_dtype,
+            mask_type=case.mask_type,
+            window_left=case.window_left,
+            kv_layout="HND",
+            storage_page_size=storage_page_size,
             device=case.q.device,
         )
         workspace = torch.zeros(workspace_size, dtype=torch.int8, device=case.q.device)
@@ -2444,10 +2457,12 @@ def test_attention_ts_decode_launch_and_plan_reject_unsafe_int32_kv_bound() -> N
     page_size = 16
     assert (
         get_prims_ts_batch_decode_workspace_size(
+            batch_size=1,
             num_qo_heads=8,
             num_kv_heads=1,
             head_dim=64,
             page_size=page_size,
+            max_seq_len=_DECODE_MAX_KV_LEN,
             device=device,
         )
         > 0
@@ -2549,8 +2564,6 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.__init__).parameters) == (
         "self",
         "kv_layout",
-        "workspace_buffer",
-        "model_config",
     )
     assert tuple(inspect.signature(BatchDecodePagedTSWrapper.plan).parameters) == (
         "self",
@@ -2682,11 +2695,6 @@ def test_attention_ts_decode_public_surfaces_have_no_internal_tuning_knobs() -> 
                 assert parameter.annotation in (bool, "bool")
                 continue
             if parameter.kind is inspect.Parameter.VAR_KEYWORD:
-                if (
-                    surface in (BatchDecodePagedTSWrapper.__init__,)
-                    and parameter.name == "model_config"
-                ):
-                    continue
                 violations.append(f"{surface.__qualname__}.**{parameter.name}")
                 continue
             tokens = tuple(parameter.name.split("_"))
@@ -3026,10 +3034,18 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
         4,
     )
     workspace_size = get_prims_ts_batch_decode_workspace_size(
-        num_qo_heads=case.q.shape[1],
-        num_kv_heads=packed_cache[0].shape[1],
-        head_dim=case.q.shape[2],
-        page_size=4,
+        case.q.shape[0],
+        case.q.shape[1],
+        packed_cache[0].shape[1],
+        case.q.shape[2],
+        4,
+        2051,
+        q_dtype=case.q.dtype,
+        k_dtype=packed_cache[0].dtype,
+        v_dtype=packed_cache[1].dtype,
+        out_dtype=case.output_dtype,
+        mask_type="causal",
+        storage_page_size=storage_page_size,
         device="cuda",
     )
     workspace = torch.full((workspace_size,), 0x55, dtype=torch.int8, device="cuda")
@@ -3152,10 +3168,18 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
         4,
     )
     workspace_size = get_prims_ts_batch_decode_workspace_size(
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=256,
-        page_size=4,
+        len(kv_lens),
+        num_qo_heads,
+        num_kv_heads,
+        256,
+        4,
+        2051,
+        q_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        v_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        mask_type="causal",
+        storage_page_size=storage_page_size,
         device="cuda",
     )
     workspace = torch.zeros(workspace_size, dtype=torch.int8, device="cuda")
@@ -3351,7 +3375,20 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
     )
     seq_lens = torch.full((1,), kv_tokens, dtype=torch.int32, device="cuda")
     workspace_size = get_prims_ts_batch_decode_workspace_size(
-        num_qo_heads=12, num_kv_heads=1, head_dim=256, page_size=4, device="cuda"
+        1,
+        12,
+        1,
+        256,
+        4,
+        kv_tokens,
+        seq_len_q=group_size,
+        q_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        v_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        mask_type="causal",
+        storage_page_size=storage_page_size,
+        device="cuda",
     )
     output = torch.empty_like(case.q)
     block_table = _dense_block_table_from_csr(
@@ -3542,7 +3579,20 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
         )
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device="cuda")
     workspace_size = get_prims_ts_batch_decode_workspace_size(
-        num_qo_heads=12, num_kv_heads=1, head_dim=256, page_size=4, device="cuda"
+        batch_size,
+        12,
+        1,
+        256,
+        4,
+        kv_tokens,
+        seq_len_q=4,
+        q_dtype=torch.bfloat16,
+        k_dtype=torch.bfloat16,
+        v_dtype=torch.bfloat16,
+        out_dtype=torch.bfloat16,
+        mask_type="causal",
+        storage_page_size=storage_page_size,
+        device="cuda",
     )
     output = torch.empty_like(case.q)
     block_table = _dense_block_table_from_csr(kernel_indptr, kernel_page_indices)
@@ -3650,10 +3700,18 @@ def test_attention_ts_decode_page4_inert_block_table_row_is_zero() -> None:
     seq_lens = torch.ones(2, dtype=torch.int32, device="cuda")
     max_seq_len = 2051
     workspace_size = get_prims_ts_batch_decode_workspace_size(
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        page_size=semantic_page_size,
+        2,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        semantic_page_size,
+        max_seq_len,
+        q_dtype=q.dtype,
+        k_dtype=k_cache.dtype,
+        v_dtype=v_cache.dtype,
+        out_dtype=q.dtype,
+        mask_type="causal",
+        storage_page_size=storage_page_size,
         device="cuda",
     )
     workspace = torch.zeros(workspace_size, dtype=torch.int8, device="cuda")
@@ -4465,10 +4523,17 @@ def test_attention_ts_decode_mixed_precision(
         case.paged_kv_indptr, case.paged_kv_last_page_len, page_size
     )
     workspace_bytes = get_prims_ts_batch_decode_workspace_size(
-        num_qo_heads=num_qo_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        page_size=page_size,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        seq_len_kv,
+        seq_len_q=seq_len_q,
+        q_dtype=q_dtype,
+        k_dtype=kv_dtype,
+        v_dtype=kv_dtype,
+        out_dtype=output_dtype,
         device=case.q.device,
     )
     workspace = torch.zeros(workspace_bytes, dtype=torch.uint8, device=case.q.device)
@@ -4682,9 +4747,6 @@ def test_attention_ts_decode_one_shot_forwards_split_kv(
 
     from flashinfer.attention.prims_ts import decode as decode_module
 
-    monkeypatch.setattr(
-        decode_module, "decode_control_workspace_bytes", lambda _device: 0
-    )
     q = torch.empty((1, 8, 64), dtype=torch.bfloat16)
     storage_head_dim = 32 if k_dtype == torch.uint8 else 64
     cache = torch.empty((1, 1, 32, storage_head_dim), dtype=k_dtype)
@@ -4741,7 +4803,7 @@ def test_attention_ts_decode_one_shot_forwards_split_kv(
     assert wrapper.plan.call_args.kwargs["split_kv"] is split_kv
     assert wrapper.plan.call_args.kwargs["k_data_type"] is cache.dtype
     assert wrapper.plan.call_args.kwargs["v_data_type"] is v_dtype
-    # Workspace sizing/allocation now belongs to model plan(), including the
+    # Workspace sizing/allocation belongs to plan(), including the
     # convenience path; this mocked wrapper does not execute that body.
     workspace_size.assert_not_called()
     assert wrapper.plan.call_args.kwargs["workspace_buffer"] is (
@@ -5162,13 +5224,21 @@ def test_attention_ts_decode_shared_arch_guard_rejects_unsupported_gpu(
     )
     workspace_queries = (
         lambda: get_prims_ts_batch_decode_workspace_size(
-            num_qo_heads=8, num_kv_heads=1, head_dim=128, page_size=32, device=device
+            batch_size=1,
+            num_qo_heads=8,
+            num_kv_heads=1,
+            head_dim=128,
+            page_size=32,
+            max_seq_len=128,
+            device=device,
         ),
         lambda: get_prims_ts_batch_mla_decode_workspace_size(
+            batch_size=1,
             num_heads=8,
             kv_lora_rank=512,
             qk_rope_head_dim=64,
             page_size=32,
+            max_seq_len=128,
             device=device,
         ),
     )
@@ -5661,10 +5731,18 @@ def test_dense_split_control_graph_and_workspace(dtype, packed, split_kv):
     lengths = torch.tensor([8192, 4096], device="cuda", dtype=torch.int32)
     out = torch.empty_like(query)
     byte_count = get_prims_ts_batch_decode_workspace_size(
-        num_qo_heads=hq,
-        num_kv_heads=1,
-        head_dim=dim,
-        page_size=page,
+        batch,
+        hq,
+        1,
+        dim,
+        page,
+        context,
+        seq_len_q=sq,
+        qo_indptr=offsets,
+        max_seq_len_q=sq if packed else None,
+        q_dtype=dtype,
+        out_dtype=dtype,
+        mask_type="causal",
         device=query.device,
         split_kv=split_kv,
     )
@@ -6886,10 +6964,20 @@ def test_attention_ts_decode_standalone_graph_reloads_all_live_metadata():
     _assert_case_correct(eager, case)
 
     workspace_size = get_prims_ts_batch_decode_workspace_size(
-        num_qo_heads=case.q.shape[-2],
-        num_kv_heads=case.k_cache.shape[1],
-        head_dim=case.q.shape[-1],
-        page_size=case.k_cache.shape[2],
+        2,
+        case.q.shape[-2],
+        case.k_cache.shape[1],
+        case.q.shape[-1],
+        case.k_cache.shape[2],
+        max_kv_len,
+        seq_len_q=1,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+        q_dtype=case.q.dtype,
+        k_dtype=case.k_cache.dtype,
+        out_dtype=case.output_dtype,
+        mask_type=case.mask_type,
+        kv_layout="HND",
         device=case.q.device,
     )
     workspace = torch.zeros(workspace_size, dtype=torch.int8, device=case.q.device)
@@ -8586,8 +8674,32 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
     output_dtype = torch.float16 if dtype == _FP8 else torch.bfloat16
     wrapper = BatchDecodePagedTSWrapper(layout)
     workspace = torch.empty(
-        get_prims_ts_batch_decode_workspace_size(
-            num_qo_heads=16, num_kv_heads=2, head_dim=128, page_size=32, device="cuda"
+        max(
+            get_prims_ts_batch_decode_workspace_size(
+                batch_size=batch,
+                num_qo_heads=16,
+                num_kv_heads=2,
+                head_dim=128,
+                page_size=32,
+                max_seq_len=sk,
+                seq_len_q=sq,
+                qo_indptr=(
+                    torch.arange(batch + 1, dtype=torch.int32, device="cuda") * sq
+                )
+                if packed_query
+                else None,
+                max_seq_len_q=sq,
+                q_dtype=dtype,
+                out_dtype=output_dtype,
+                kv_layout=layout,
+                device="cuda",
+            )
+            for batch, sq, sk in (
+                (2, 1, 8193),
+                (3, 3, 8321),
+                (1, 5, 8449),
+                (2, 1, 8194),
+            )
         ),
         dtype=torch.uint8,
         device="cuda",
@@ -8669,15 +8781,21 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
 
 
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_decode_standalone_reuses_model_workspace():
-    """The standalone interface accepts one geometry-sized arena across batches."""
+def test_attention_ts_decode_standalone_reuses_caller_workspace():
+    """The standalone interface reuses caller scratch initialized for each layout."""
     workspace = torch.zeros(
-        get_prims_ts_batch_decode_workspace_size(
-            num_qo_heads=16,
-            num_kv_heads=2,
-            head_dim=128,
-            page_size=32,
-            device="cuda",
+        max(
+            get_prims_ts_batch_decode_workspace_size(
+                batch_size=batch,
+                num_qo_heads=16,
+                num_kv_heads=2,
+                head_dim=128,
+                page_size=32,
+                max_seq_len=sk,
+                q_dtype=torch.bfloat16,
+                device="cuda",
+            )
+            for batch, sk in ((2, 513), (3, 641), (1, 769), (2, 514))
         ),
         dtype=torch.uint8,
         device="cuda",
@@ -8698,6 +8816,7 @@ def test_attention_ts_decode_standalone_reuses_model_workspace():
             seed=90600 + sk,
         )
         lengths = torch.full((batch,), sk, dtype=torch.int32, device="cuda")
+        workspace.zero_()  # Replanning may move persistent control offsets.
         output = batch_decode_with_paged_kv_cache(
             case.q,
             case.paged_kv_cache,

@@ -785,10 +785,17 @@ def _run_standalone(
         raise ValueError("packed standalone coverage requires max_seq_len_q")
     num_heads = int(case.query.shape[1] if packed_query else case.query.shape[2])
     workspace_size = get_prims_ts_batch_mla_decode_workspace_size(
-        num_heads=num_heads,
-        kv_lora_rank=_LATENT_DIM,
-        qk_rope_head_dim=_ROPE_DIM,
-        page_size=case.page_size,
+        case.block_tables.shape[0],
+        num_heads,
+        _LATENT_DIM,
+        _ROPE_DIM,
+        case.page_size,
+        case.max_seq_len,
+        max_seq_len_q=resolved_max_seq_len_q,
+        q_dtype=case.query.dtype,
+        kv_dtype=case.kv_cache.dtype,
+        out_dtype=case.output_dtype,
+        mask_type=case.mask_type,
         device=case.query.device,
     )
     workspace = torch.empty(
@@ -1146,11 +1153,6 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
     for surface in surfaces:
         for parameter in inspect.signature(surface).parameters.values():
             if parameter.kind is inspect.Parameter.VAR_KEYWORD:
-                if (
-                    surface is BatchMLADecodePagedTSWrapper.__init__
-                    and parameter.name == "model_config"
-                ):
-                    continue
                 violations.append(f"{surface.__qualname__}.**{parameter.name}")
                 continue
             tokens = tuple(parameter.name.split("_"))
@@ -1172,7 +1174,7 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
                 violations.append(f"{surface.__qualname__}.{parameter.name}")
 
     assert violations == []
-    # Constructor defaults may forward only options explicitly accepted by plan().
+    # Unknown constructor options are rejected.
     with pytest.raises(TypeError, match="kernel"):
         BatchMLADecodePagedTSWrapper(kernel="unsupported")
 
@@ -1183,7 +1185,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     init_parameters = inspect.signature(
         BatchMLADecodePagedTSWrapper.__init__
     ).parameters
-    assert tuple(init_parameters) == ("self", "workspace_buffer", "model_config")
+    assert tuple(init_parameters) == ("self",)
 
     plan_parameters = inspect.signature(BatchMLADecodePagedTSWrapper.plan).parameters
     assert tuple(plan_parameters) == (
@@ -2857,12 +2859,20 @@ def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
     """Replanned problem sizes retain numerical accuracy and graph replay."""
     wrapper = BatchMLADecodePagedTSWrapper()
     workspace = torch.empty(
-        get_prims_ts_batch_mla_decode_workspace_size(
-            num_heads=heads,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            page_size=32,
-            device="cuda",
+        max(
+            get_prims_ts_batch_mla_decode_workspace_size(
+                batch_size=batch,
+                num_heads=heads,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                page_size=32,
+                max_seq_len=sk,
+                max_seq_len_q=sq,
+                q_dtype=dtype,
+                out_dtype=torch.bfloat16,
+                device="cuda",
+            )
+            for batch, sq, sk in ((2, 1, 513), (3, 3, 641), (1, 5, 769), (2, 1, 514))
         ),
         dtype=torch.uint8,
         device="cuda",
@@ -2926,15 +2936,22 @@ def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
 
 
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_standalone_reuses_model_workspace():
-    """Standalone MLA shares one model-sized arena and omits unused final LSE."""
+def test_attention_ts_mla_standalone_reuses_caller_workspace():
+    """Standalone MLA reuses caller scratch and omits unused final LSE."""
     workspace = torch.empty(
-        get_prims_ts_batch_mla_decode_workspace_size(
-            num_heads=32,
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            page_size=32,
-            device="cuda",
+        max(
+            get_prims_ts_batch_mla_decode_workspace_size(
+                batch_size=batch,
+                num_heads=32,
+                kv_lora_rank=512,
+                qk_rope_head_dim=64,
+                page_size=32,
+                max_seq_len=sk,
+                max_seq_len_q=sq,
+                q_dtype=torch.bfloat16,
+                device="cuda",
+            )
+            for batch, sq, sk in ((2, 1, 513), (3, 3, 641), (1, 5, 769))
         ),
         dtype=torch.int8,
         device="cuda",
@@ -2973,7 +2990,9 @@ def test_attention_ts_mla_runtime_sm_split_ceiling(dtype):
         pytest.skip("requires more than 128 physical SMs")
     wrapper = BatchMLADecodePagedTSWrapper()
     workspace = torch.empty(
-        get_prims_ts_batch_mla_decode_workspace_size(16, 512, 64, 32, device="cuda"),
+        get_prims_ts_batch_mla_decode_workspace_size(
+            1, 16, 512, 64, 32, sms * 256, q_dtype=dtype, device="cuda"
+        ),
         dtype=torch.uint8,
         device="cuda",
     )

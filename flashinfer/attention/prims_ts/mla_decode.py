@@ -38,10 +38,6 @@ from .split_kv_mode_policy import split_capacity
 from .planning import (
     prepare_lse,
     validate_lse_mode,
-    reduction_workspace_bound,
-    constructor_plan_defaults,
-    get_constructor_plan_options,
-    set_constructor_plan_options,
 )
 
 from .decode import (
@@ -1312,26 +1308,80 @@ def _get_compiled_mla_decode(
     return compiled
 
 
-@flashinfer_experimental_api
 def get_prims_ts_batch_mla_decode_workspace_size(
+    batch_size: int,
     num_heads: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
     page_size: int,
+    max_seq_len: int,
     *,
+    seq_len_q: Optional[int] = None,
+    max_seq_len_q: Optional[int] = None,
+    q_dtype: torch.dtype = torch.bfloat16,
+    kv_dtype: Optional[torch.dtype] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    mask_type: Literal["dense", "causal"] = "causal",
     device=None,
 ) -> int:
-    """Return hardware-bounded MLA scratch bytes without request geometry.
+    """Return caller-workspace bytes for one automatic MLA policy.
 
-    Allocate contiguous CUDA int8/uint8 scratch, exclusive to one ordered
-    execution lane. No initialization is needed. Final LSE is a separate output.
+    The arguments define the static geometry used to resolve the same automatic
+    policy and private scratch layout as
+    :func:`batch_mla_decode_with_paged_kv_cache`, without compiling a kernel.
+    ``max_seq_len_q`` is the static per-request Q bound for both fixed and
+    packed-query launches;
+    ``seq_len_q`` remains a backward-compatible fixed-Q alias. If neither is
+    supplied, the bound is one. The returned byte count covers split-KV
+    scratch. Optional final LSE uses a separate caller-owned output. Allocate
+    a contiguous ``torch.int8`` or ``torch.uint8`` CUDA buffer; MLA does not require its
+    contents to be initialized before first use.
     """
-    _validate_positive_int(num_heads, "num_heads")
+
+    batch_size = _validate_positive_int(batch_size, "batch_size")
+    num_heads = _validate_positive_int(num_heads, "num_heads")
     _validate_mla_dims(kv_lora_rank, qk_rope_head_dim)
-    _validate_page_size(page_size)
-    resolved_device, _ = _resolve_cuda_device(device)
+    page_size = _validate_page_size(page_size)
+    max_seq_len = _validate_mla_max_kv_len(max_seq_len, "max_seq_len")
+    max_seq_len_q = _resolve_max_seq_len_q_alias(
+        seq_len_q=seq_len_q,
+        max_seq_len_q=max_seq_len_q,
+        default=1,
+    )
+    assert max_seq_len_q is not None
+    _validate_mla_query_head_extent(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        max_seq_len_q=max_seq_len_q,
+    )
+    _validate_mask(mask_type)
+    if kv_dtype is None:
+        kv_dtype = q_dtype
+    _validate_mla_dtype_pair(q_dtype, kv_dtype, out_dtype)
+    resolved_device, device_index = _resolve_cuda_device(device)
     _validate_runtime_device(resolved_device)
-    return reduction_workspace_bound(resolved_device, kv_lora_rank, mla=True)
+
+    spec = _resolve_mla_decode_launch_spec(
+        device_index,
+        batch_size,
+        num_heads,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        page_size,
+        max_seq_len,
+        _dtype_key(q_dtype),
+        _dtype_key(kv_dtype),
+        _dtype_key(out_dtype),
+        mask_type,
+        max_seq_len_q,
+    )
+    return _make_mla_workspace_layout(
+        spec.kernel_workspace_bytes,
+        batch_size,
+        num_heads,
+        max_seq_len_q,
+        include_lse=False,
+    ).total_bytes
 
 
 def _prepare_mla_runtime(
@@ -1495,54 +1545,11 @@ class BatchMLADecodePagedTSWrapper:
     graphs; concurrent execution requires independent wrappers/workspaces."""
 
     @flashinfer_experimental_api
-    def __init__(
-        self, *, workspace_buffer: Optional[torch.Tensor] = None, **model_config
-    ) -> None:
-        """Store optional model/workspace defaults using ``plan()`` keywords.
-
-        The existing no-argument constructor remains supported. Caller scratch
-        does not require a sizing query; ``plan()`` validates its capacity.
-        Construction does not allocate scratch or compile kernels.
-        """
+    def __init__(self) -> None:
+        """Initialize an unplanned task-scheduled paged-MLA wrapper."""
         self._plan_state: Optional[_MLADecodePlanState] = None
-        if workspace_buffer is not None:
-            model_config["workspace_buffer"] = workspace_buffer
-        set_constructor_plan_options(self, model_config)
 
     @flashinfer_experimental_api
-    def get_workspace_size(self) -> int:
-        """Return model scratch bytes without allocating or compiling.
-
-        Use constructor model defaults before planning, or the active model afterward.
-        The query is optional: caller workspace can be passed directly to the
-        constructor or plan(). Final output and LSE are separate buffers."""
-        state = self._plan_state
-        options = (
-            get_constructor_plan_options(self)
-            if state is None
-            else {
-                "device": state.device,
-                "num_heads": state.num_heads,
-                "kv_lora_rank": state.kv_lora_rank,
-                "qk_rope_head_dim": state.qk_rope_head_dim,
-                "page_size": state.page_size,
-            }
-        )
-        required = get_prims_ts_batch_mla_decode_workspace_size(
-            device=options["device"],
-            num_heads=options["num_heads"],
-            kv_lora_rank=options["kv_lora_rank"],
-            qk_rope_head_dim=options["qk_rope_head_dim"],
-            page_size=options["page_size"],
-        )
-        return (
-            required
-            if state is None
-            else max(required, state.workspace_layout.total_bytes)
-        )
-
-    @flashinfer_experimental_api
-    @constructor_plan_defaults
     def plan(
         self,
         device: int | str | torch.device,
@@ -1571,8 +1578,8 @@ class BatchMLADecodePagedTSWrapper:
         replanning replaces state and invalidates previous graphs. Equivalent
         plans/layers reuse CPU policy and compiled-kernel caches. The automatic
         active split count stays a runtime kernel/reduction operand.
-        Scratch is hardware-bounded and checked against the selected layout;
-        callers may supply workspace directly without a preceding size query."""
+        Scratch is sized for the selected policy and problem geometry. Callers
+        may supply workspace directly without a preceding size query."""
 
         lse_mode = validate_lse_mode(lse_mode)
         if not isinstance(validate, bool):
@@ -1639,25 +1646,15 @@ class BatchMLADecodePagedTSWrapper:
             max_seq_len_q,
             include_lse=False,
         )
-        required_bytes = max(
-            get_prims_ts_batch_mla_decode_workspace_size(
-                num_heads,
-                kv_lora_rank,
-                qk_rope_head_dim,
-                page_size,
-                device=device,
-            ),
-            workspace_layout.total_bytes,
-        )
         if workspace_buffer is None:
             workspace_buffer = torch.empty(
-                required_bytes, device=device, dtype=torch.int8
+                workspace_layout.total_bytes, device=device, dtype=torch.int8
             )
         elif validate:
             _validate_workspace_buffer(
                 workspace_buffer,
                 device=device,
-                required_bytes=required_bytes,
+                required_bytes=workspace_layout.total_bytes,
             )
         workspace = _bind_mla_workspace(workspace_buffer, workspace_layout)
         compiled = _get_compiled_mla_decode(compile_spec)

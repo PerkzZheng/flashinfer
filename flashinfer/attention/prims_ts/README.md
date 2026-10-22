@@ -47,7 +47,7 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 
 | Kernel | Guide | Public APIs |
 | --- | --- | --- |
-| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache`, `get_prims_ts_batch_prefill_workspace_size` |
+| FMHA context/prefill | [Task-Scheduled FMHA Context](kernels/fmha_context/README.md) | `BatchPrefillTSWrapper`, `batch_prefill`, `BatchPrefillPagedTSWrapper`, `batch_prefill_with_paged_kv_cache` |
 | FMHA decode | [Task-Scheduled FMHA Decode](kernels/fmha_decode/README.md) | `BatchDecodePagedTSWrapper`, `batch_decode_with_paged_kv_cache`, `get_prims_ts_batch_decode_workspace_size`, `prepare_prims_ts_batch_decode_with_kv_cache` |
 | QToken-KvBlock-Sparse-Attention | [Packed-prefill and fixed-decode example](https://github.com/PerkzZheng/prims-ts-examples/blob/main/q_token_kv_block_sparse_attention.py) | `QTokenKvBlockSparsePagedTSWrapper`, `q_token_kv_block_sparse_attention_with_paged_kv_cache`, `get_q_token_kv_block_sparse_workspace_size`, `suggest_q_token_kv_block_sparse_group_size`, `validate_q_token_kv_block_sparse_group_size`, `make_q_token_kv_block_sparse_qo_indptr` |
 | Block-sparse FMHA | [Sage attention](#sage-attention) below | `BlockSparseTSWrapper`, `block_sparse_attention`, `SageAttentionConfig`, `SageAttentionParams`; fixed-Q paged KV: `BlockSparsePagedTSWrapper`, `block_sparse_attention_with_paged_kv_cache` |
@@ -71,8 +71,8 @@ by planning with `initialize_workspace=False`.
 
 Use the existing `get_prims_ts_batch_*_workspace_size` helpers outside
 capture. Zero caller-owned FMHA scratch before its first trusted standalone
-launch; wrappers initialize control storage by default. Their fixed
-control tail supports ordinary batch/length changes without re-zeroing. Scratch and output must not
+launch and re-zero it when workspace-layout inputs change; wrappers
+initialize control storage by default. Scratch and output must not
 overlap any live input or each other; each concurrent launch/graph needs its
 own scratch. Warm up the exact topology before capture, retain stable storage,
 and update metadata only between completed replays. Validation is enabled by
@@ -110,46 +110,44 @@ metadata; it does not select policies or compile kernels. Replan when the
 planned shape/capacity contract changes. Growing live KV lengths within the
 planned capacity does not itself require replanning.
 
-Workspace queries remain independent of request sizes: they use model geometry
-and hardware capacity. Constructor defaults use the existing `plan()` keyword
-names; explicit plan arguments override them. Decode/MLA accept caller workspace
-directly in the constructor or `plan()`, without a required sizing query. The
-optional wrapper `get_workspace_size()` avoids repeating model configuration.
-Without caller scratch, `plan()` allocates it and checks the selected layout.
-Context needs no split-reduction workspace; its query returns zero.
+Decode and MLA retain their geometry-based standalone workspace-size queries.
+Pass the same problem geometry and dtypes to the query and `plan()`. Caller
+scratch can be passed directly to `plan()` without a sizing query; otherwise
+planning allocates exactly the selected layout. To reuse one buffer across
+configurations, allocate the maximum queried size and initialize decode control
+storage for each new layout. Context has no split-reduction workspace or public
+workspace-size query; variable-window metadata retains its existing behavior.
 
 ```python
 import torch
-from flashinfer.attention.prims_ts import BatchDecodePagedTSWrapper
+from flashinfer.attention.prims_ts import (
+    BatchDecodePagedTSWrapper,
+    get_prims_ts_batch_decode_workspace_size,
+)
 
 device = torch.device("cuda:0")
 dtype = torch.bfloat16
 num_qo_heads, num_kv_heads, head_dim, page_size = 32, 4, 128, 32
 batch_size, max_seq_len_q, max_kv_len = 2, 2, 128
 
-# Store model defaults once; query scratch before providing problem bounds.
-wrapper = BatchDecodePagedTSWrapper(
-    "NHD",
-    device=device,
-    num_qo_heads=num_qo_heads,
-    num_kv_heads=num_kv_heads,
-    head_dim=head_dim,
-    page_size=page_size,
-    q_data_type=dtype,
-    packed_query=True,
-    mask_type="causal",
+# Query scratch for the same geometry and dtypes used by plan().
+qo_indptr = torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
+workspace_bytes = get_prims_ts_batch_decode_workspace_size(
+    batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, max_kv_len,
+    max_seq_len_q=max_seq_len_q, q_dtype=dtype, kv_layout="NHD",
+    mask_type="causal", device=device,
+    qo_indptr=qo_indptr,
 )
-workspace = torch.empty(wrapper.get_workspace_size(), dtype=torch.uint8, device=device)
+workspace = torch.empty(workspace_bytes, dtype=torch.uint8, device=device)
+wrapper = BatchDecodePagedTSWrapper("NHD")
 wrapper.plan(
-    batch_size=batch_size,
-    max_seq_len_q=max_seq_len_q,
-    max_kv_len=max_kv_len,
-    workspace_buffer=workspace,
+    device, batch_size, num_qo_heads, num_kv_heads, head_dim, page_size, max_kv_len,
+    max_seq_len_q=max_seq_len_q, q_data_type=dtype, packed_query=True,
+    mask_type="causal", workspace_buffer=workspace,
 )
 
 # Two requests: Q lengths [2, 1], KV lengths [128, 96].
 q = torch.randn(3, num_qo_heads, head_dim, dtype=dtype, device=device)
-qo_indptr = torch.tensor([0, 2, 3], dtype=torch.int32, device=device)
 seq_lens = torch.tensor([128, 96], dtype=torch.int32, device=device)
 block_tables = torch.tensor(
     [[0, 1, 2, 3], [4, 5, 6, 0]], dtype=torch.int32, device=device

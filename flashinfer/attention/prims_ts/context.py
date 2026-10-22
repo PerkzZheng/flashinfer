@@ -52,8 +52,6 @@ from .planning import (
     validate_attention_sinks,
     _validate_scale,
     _validate_kv_layout,
-    constructor_plan_defaults,
-    set_constructor_plan_options,
 )
 
 
@@ -2554,17 +2552,6 @@ def _prepare_out(
     return out
 
 
-@flashinfer_experimental_api
-def get_prims_ts_batch_prefill_workspace_size() -> int:
-    """Return context's global reduction scratch requirement: zero bytes.
-
-    Context writes final outputs directly. Variable-window CTA minima are
-    request metadata, supplied by the caller or prepared separately by the
-    wrapper during warmup, and are not a split-reduction workspace.
-    """
-    return 0
-
-
 def _variable_window_buffers(geometry, empty_i32):
     if geometry.mask_type != "variable_window":
         return None, empty_i32
@@ -2595,23 +2582,11 @@ class BatchPrefillTSWrapper:
     Replanning invalidates graphs; complete prior launches and replays first."""
 
     @flashinfer_experimental_api
-    def __init__(self, **model_config) -> None:
-        """Store optional model defaults using ``plan()`` keyword names.
-
-        The existing no-argument constructor remains supported. Constructor
-        defaults are overridden by explicit plan arguments. Request sizes belong
-        to run(). Construction does not allocate or compile.
-        """
+    def __init__(self) -> None:
+        """Initialize an unplanned task-scheduled context-attention wrapper."""
         self._plan_state: Optional[_ContextPlanState] = None
-        set_constructor_plan_options(self, model_config)
 
     @flashinfer_experimental_api
-    def get_workspace_size(self) -> int:
-        """Return context's global reduction scratch requirement: zero bytes."""
-        return get_prims_ts_batch_prefill_workspace_size()
-
-    @flashinfer_experimental_api
-    @constructor_plan_defaults
     def plan(
         self,
         *,
@@ -2893,34 +2868,13 @@ class BatchPrefillPagedTSWrapper:
     Replanning invalidates graphs; complete prior launches and replays first."""
 
     @flashinfer_experimental_api
-    def __init__(
-        self, kv_layout: Literal["HND", "NHD"] = "HND", **model_config
-    ) -> None:
-        """Create an unplanned paged-context wrapper.
-
-        Parameters
-        ----------
-        kv_layout : {"HND", "NHD"}
-            Physical K/V layout, ``"HND"`` or ``"NHD"``. Layout conversion
-            changes tensor metadata only.
-        **model_config
-            Optional model defaults using ``plan()`` keyword names. Explicit
-            plan arguments override them. Request sizes belong to run().
-            Construction does not allocate or compile.
-        """
-
+    def __init__(self, kv_layout: Literal["HND", "NHD"] = "HND") -> None:
+        """Initialize an unplanned paged-context wrapper with a K/V layout."""
         _validate_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._plan_state: Optional[_PagedContextPlanState] = None
-        set_constructor_plan_options(self, model_config)
 
     @flashinfer_experimental_api
-    def get_workspace_size(self) -> int:
-        """Return paged context's global reduction scratch: zero bytes."""
-        return get_prims_ts_batch_prefill_workspace_size()
-
-    @flashinfer_experimental_api
-    @constructor_plan_defaults
     def plan(
         self,
         *,
@@ -3437,6 +3391,5 @@ __all__ = [
     "BatchPrefillPagedTSWrapper",
     "BatchPrefillTSWrapper",
     "batch_prefill",
-    "get_prims_ts_batch_prefill_workspace_size",
     "batch_prefill_with_paged_kv_cache",
 ]

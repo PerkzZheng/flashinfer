@@ -33,12 +33,7 @@ from .planning import (
     validate_lse_mode,
     validate_attention_sinks,
     _validate_scale,
-    reduction_workspace_bound,
     _validate_kv_layout as _validate_layout,
-    decode_control_workspace_bytes,
-    constructor_plan_defaults,
-    get_constructor_plan_options,
-    set_constructor_plan_options,
 )
 from flashinfer.trace.templates.attention import (
     attention_ts_decode_trace_dispatch,
@@ -1941,34 +1936,127 @@ def _get_compiled_decode(
     return compiled_main, compiled_reducer
 
 
-@flashinfer_experimental_api
 def get_prims_ts_batch_decode_workspace_size(
+    batch_size: int,
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
     page_size: int,
+    max_seq_len: int,
     *,
+    seq_len_q: int = 1,
+    qo_indptr: Optional[torch.Tensor] = None,
+    max_seq_len_q: Optional[int] = None,
+    q_dtype: torch.dtype = torch.float16,
+    k_dtype: Optional[torch.dtype] = None,
+    v_dtype: Optional[torch.dtype] = None,
+    kv_dtype: Optional[torch.dtype] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    mask_type: Literal["dense", "causal"] = "dense",
+    window_left: int = -1,
+    kv_layout: Literal["HND", "NHD"] = "HND",
+    storage_page_size: Optional[int] = None,
     device: Optional[Union[int, str, torch.device]] = None,
     split_kv: bool = True,
+    use_attention_sinks: bool = False,
 ) -> int:
-    """Return hardware-bounded reusable scratch bytes, without request sizes.
+    """Return caller-workspace bytes for one automatic FMHA policy.
 
-    Allocate contiguous CUDA int8/uint8 scratch. Caller scratch is exclusive to
-    one ordered execution lane; plan initializes its control tail by default.
-    Enabled final LSE is a separate output and is not part of this workspace.
+    The arguments resolve the same policy and scratch layout as
+    :func:`batch_decode_with_paged_kv_cache`, without compiling a kernel.
+    Allocate at least the returned number of bytes as a contiguous
+    ``torch.int8`` or ``torch.uint8`` CUDA tensor and zero it before its first
+    FMHA launch. Re-zero a reused buffer whenever any workspace-layout input,
+    including ``batch_size``, changes because the internal section offsets can
+    move even when the compiled callable is reused. Fixed-Q launches use
+    ``seq_len_q``. Packed-Q launches provide ``qo_indptr`` and the explicit
+    static ``max_seq_len_q`` bound used for workspace geometry and JIT policy.
+    ``max_seq_len`` must be no larger than ``2,147,483,392`` so the padded
+    256-token K/V tile endpoint remains representable as signed Int32.
+    ``storage_page_size`` defaults to the semantic ``page_size``. A larger
+    physical page is supported only for semantic page size four and activates
+    encoded ``(physical page, subpage)`` locators.
+    This sizing helper validates that every cumulative-offset delta is positive
+    and no larger than the bound. If ``device`` is omitted, it is inferred from
+    ``qo_indptr`` for a packed launch. ``k_dtype`` defaults to ``q_dtype`` and
+    ``v_dtype`` to ``k_dtype``; pass ``v_dtype=torch.float8_e4m3fn`` with
+    BF16 Q/K to size the QK-BF16/PV-FP8 launch. ``kv_dtype`` is a
+    compatibility alias for both K and V and must agree with explicit dtypes.
+
+    ``split_kv`` permits automatic split fanout when True (default), or forces
+    nonsplit execution when False. It is independent of Q layout and must
+    match the value supplied to attention planning/launch.
+    ``use_attention_sinks`` must also match planning because it can affect
+    the selected policy and scratch layout.
     """
-    head_dim = _validate_head_dim(head_dim)
+
+    batch_size = _validate_positive_int(batch_size, "batch_size")
+    use_packed_q, resolved_seq_len_q = _resolve_q_mode(
+        seq_len_q=seq_len_q,
+        qo_indptr=qo_indptr,
+        max_seq_len_q=max_seq_len_q,
+        require_packed_max=True,
+    )
+    assert resolved_seq_len_q is not None
+    seq_len_q = resolved_seq_len_q
     _validate_head_geometry(num_qo_heads, num_kv_heads)
-    _validate_page_size(page_size)
-    resolved_device, _ = _resolve_cuda_device(device)
-    _validate_runtime_device(resolved_device)
-    if not split_kv:
-        return _make_decode_workspace_layout(
-            ((1, 1, 1, 1, 1), (1, 1, 1, 1, 2), (1, 1, 1)),
-            torch.float16,
-            use_separate_reduction_kernel=False,
-        ).total_bytes
-    return reduction_workspace_bound(resolved_device, head_dim)
+    _validate_decode_query_head_extent(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len_q=seq_len_q,
+    )
+    head_dim = _validate_head_dim(head_dim)
+    page_size = _validate_page_size(page_size)
+    storage_page_size = _validate_storage_page_size(
+        page_size,
+        page_size if storage_page_size is None else storage_page_size,
+    )
+    max_seq_len = _validate_max_kv_len(max_seq_len, "max_seq_len")
+    _validate_layout(kv_layout)
+    _validate_mask(mask_type)
+    window_left = _validate_window_left(window_left, mask_type)
+    k_dtype, v_dtype = _resolve_kv_dtypes(q_dtype, k_dtype, v_dtype, kv_dtype)
+    if out_dtype is None:
+        out_dtype = q_dtype
+    _validate_dtype_pair(q_dtype, k_dtype, v_dtype, out_dtype)
+    inferred_device = (
+        qo_indptr.device
+        if device is None and isinstance(qo_indptr, torch.Tensor)
+        else device
+    )
+    resolved_device, _ = _resolve_cuda_device(inferred_device)
+    if qo_indptr is not None:
+        _validate_qo_indptr(
+            qo_indptr,
+            expected_device=resolved_device,
+            batch_size=batch_size,
+        )
+        _validate_packed_q_plan_values(
+            qo_indptr,
+            max_seq_len_q=seq_len_q,
+        )
+
+    return _resolve_decode_workspace_layout(
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        max_seq_len,
+        seq_len_q,
+        q_dtype,
+        k_dtype,
+        v_dtype,
+        out_dtype,
+        kv_layout,
+        mask_type,
+        use_packed_q,
+        window_left,
+        storage_page_size,
+        resolved_device,
+        split_kv=split_kv,
+        use_attention_sinks=use_attention_sinks,
+    ).total_bytes
 
 
 def _prepare_decode_runtime(
@@ -3682,73 +3770,18 @@ class BatchDecodePagedTSWrapper:
     Concurrent streams or graph replays require separate wrappers/workspaces."""
 
     @flashinfer_experimental_api
-    def __init__(
-        self,
-        kv_layout: Literal["HND", "NHD"] = "HND",
-        *,
-        workspace_buffer: Optional[torch.Tensor] = None,
-        **model_config,
-    ) -> None:
+    def __init__(self, kv_layout: Literal["HND", "NHD"] = "HND") -> None:
         """Initialize an unplanned wrapper with one static K/V layout.
 
         Parameters
         ----------
         kv_layout : {"HND", "NHD"}
-            Physical K/V layout, ``"HND"`` or ``"NHD"``. Layout conversion
-            changes tensor metadata only.
-        workspace_buffer : torch.Tensor, optional
-            Caller-owned scratch to use by default in ``plan()``. No workspace
-            size query is required; planning checks the supplied capacity.
-        **model_config
-            Optional model defaults using the keyword names of ``plan()``.
-            Explicit plan arguments override them.
-            Construction does not allocate scratch or compile kernels.
+            Physical K/V layout, ``"HND"`` or ``"NHD"``.
         """
 
         _validate_layout(kv_layout)
         self._kv_layout = kv_layout
         self._plan_state: Optional[_DecodePlanState] = None
-        if workspace_buffer is not None:
-            model_config["workspace_buffer"] = workspace_buffer
-        set_constructor_plan_options(self, model_config)
-
-    @flashinfer_experimental_api
-    def get_workspace_size(self) -> int:
-        """Return model scratch bytes without allocating or compiling.
-
-        Use constructor model defaults before planning, or the active model afterward.
-        The query is optional: caller workspace can be passed directly to the
-        constructor or plan(). Final output and LSE are separate buffers."""
-        state = self._plan_state
-        options = (
-            get_constructor_plan_options(self)
-            if state is None
-            else {
-                "device": state.device,
-                "num_qo_heads": state.num_qo_heads,
-                "num_kv_heads": state.num_kv_heads,
-                "head_dim": state.head_dim,
-                "page_size": state.page_size,
-            }
-        )
-        split_kv = (
-            options["split_kv"]
-            if state is None
-            else dict(state.policy)["split_kv_allowed"]
-        )
-        required = get_prims_ts_batch_decode_workspace_size(
-            device=options["device"],
-            num_qo_heads=options["num_qo_heads"],
-            num_kv_heads=options["num_kv_heads"],
-            head_dim=options["head_dim"],
-            page_size=options["page_size"],
-            split_kv=split_kv,
-        )
-        return (
-            required
-            if state is None
-            else max(required, state.workspace_layout.total_bytes)
-        )
 
     def _require_plan_state(self) -> _DecodePlanState:
         state = self._plan_state
@@ -3763,7 +3796,6 @@ class BatchDecodePagedTSWrapper:
         return self._require_plan_state().policy
 
     @flashinfer_experimental_api
-    @constructor_plan_defaults
     def plan(
         self,
         device: Union[int, str, torch.device],
@@ -3800,8 +3832,9 @@ class BatchDecodePagedTSWrapper:
         plan-owned CUDA storage; otherwise every run supplies its own lengths.
         Kernel selection and compilation/loading finish here, before capture.
         Replanning replaces state and invalidates its prior captured graphs.
-        Scratch sizing remains hardware-bounded; a larger selected layout is
-        capacity-checked here. Caller scratch may be passed without a size query.
+        Scratch is sized for the selected policy and problem geometry. Caller
+        scratch may be passed without a size query. Planning initializes control
+        storage unless initialize_workspace=False transfers that to the caller.
         Active split counts are automatic runtime operands for main/reduction
         kernels; users never supply the count."""
 
@@ -3929,54 +3962,24 @@ class BatchDecodePagedTSWrapper:
             use_separate_reduction_kernel=(spec.config.use_separate_reduction_kernel),
             use_split_kv=spec.config.use_split_kv,
         )
-        control_bytes = max(
-            decode_control_workspace_bytes(device) if split_kv else _align_up(68),
-            _align_up(workspace_layout.split_kv_counter.byte_size + 64),
-        )
-        required_bytes = max(
-            get_prims_ts_batch_decode_workspace_size(
-                num_qo_heads,
-                num_kv_heads,
-                head_dim,
-                page_size,
-                device=device,
-                split_kv=split_kv,
-            ),
-            _align_up(
-                workspace_layout.partial_stats.byte_offset
-                + workspace_layout.partial_stats.byte_size
-                + control_bytes
-            ),
-        )
         if workspace_buffer is None:
             initialize_workspace = True
             workspace_buffer = torch.empty(
-                required_bytes, device=device, dtype=torch.int8
+                workspace_layout.total_bytes,
+                device=device,
+                dtype=torch.int8,
             )
-        else:
+        elif validate:
             _validate_workspace_buffer(
-                workspace_buffer, device=device, required_bytes=required_bytes
+                workspace_buffer,
+                device=device,
+                required_bytes=workspace_layout.total_bytes,
             )
-        # Keep semaphores/dummy metadata in a fixed arena tail, disjoint from
-        # every partial-result view. Reused scratch must not alias those views.
-        control_base = workspace_buffer.numel() - control_bytes
-        workspace_layout = replace(
-            workspace_layout,
-            split_kv_counter=replace(
-                workspace_layout.split_kv_counter, byte_offset=control_base
-            ),
-            cu_seqlens_q=replace(
-                workspace_layout.cu_seqlens_q, byte_offset=workspace_buffer.numel() - 64
-            ),
-            attention_sinks=replace(
-                workspace_layout.attention_sinks,
-                byte_offset=workspace_buffer.numel() - 32,
-            ),
-            total_bytes=workspace_buffer.numel(),
-        )
         workspace = _bind_decode_workspace(workspace_buffer, workspace_layout)
         if initialize_workspace:
-            workspace_buffer[control_base:].zero_()
+            workspace.split_kv_counter.zero_()
+            workspace.cu_seqlens_q.zero_()
+            workspace.attention_sinks.zero_()
         # Materialize from the normalized tuple so the plan never aliases
         # caller-owned host or device storage.
         planned_seq_lens_device = (

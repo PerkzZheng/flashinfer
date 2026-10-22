@@ -268,7 +268,7 @@ assert packed_out.shape == (sum(q_lens), H, latent_dim)
 ```
 
 For the standalone API, call
-`get_prims_ts_batch_mla_decode_workspace_size()` with the model head dimensions, page size and device. Allocate at least that many bytes as
+`get_prims_ts_batch_mla_decode_workspace_size()` with the batch size, Q/KV length bounds, head dimensions, dtypes, page size and device. Allocate at least that many bytes as
 a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8` tensor. Final public LSE uses a separate output buffer. Scratch does
 not require initialization and is exclusive to one in-flight launch or graph.
 It must not overlap

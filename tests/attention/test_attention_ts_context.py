@@ -722,15 +722,6 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
     for surface in surfaces:
         for parameter in inspect.signature(surface).parameters.values():
             if parameter.kind is inspect.Parameter.VAR_KEYWORD:
-                if (
-                    surface
-                    in (
-                        BatchPrefillTSWrapper.__init__,
-                        BatchPrefillPagedTSWrapper.__init__,
-                    )
-                    and parameter.name == "model_config"
-                ):
-                    continue
                 violations.append(f"{surface.__qualname__}.**{parameter.name}")
                 continue
             tokens = tuple(parameter.name.split("_"))

@@ -11,24 +11,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared attention plan defaults, workspace bounds and output bindings."""
+"""Shared attention LSE/sink bindings and scale/layout checks."""
 
-import functools
-import inspect
 import math
 import numbers
 import struct
-from typing import Any, Callable, Literal, cast
+from typing import Literal, cast
 
 import torch
 
 from flashinfer.utils import (
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
-    get_device_sm_count,
-    round_up,
 )
-from ._hardware import get_max_active_clusters
 
 
 def _validate_scale(value: object, name: str) -> float:
@@ -56,87 +51,6 @@ def _validate_kv_layout(kv_layout: str) -> None:
         raise TypeError("kv_layout must be a string")
     if kv_layout not in ("HND", "NHD"):
         raise ValueError(f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}")
-
-
-def set_constructor_plan_options(wrapper: Any, options: dict[str, Any]) -> None:
-    """Store optional model defaults without allocating execution resources."""
-    if options:
-        inspect.signature(wrapper.plan).bind_partial(**options)
-    wrapper._constructor_plan_options = options
-
-
-def get_constructor_plan_options(wrapper: Any) -> dict[str, Any]:
-    """Resolve model defaults for an optional pre-plan workspace query."""
-    bound = inspect.signature(wrapper.plan).bind_partial(
-        **wrapper._constructor_plan_options
-    )
-    bound.apply_defaults()
-    return bound.arguments
-
-
-def constructor_plan_defaults(plan: Callable) -> Callable:
-    """Merge constructor defaults with explicitly supplied plan arguments.
-
-    Bind only explicitly supplied plan arguments before merging. This keeps
-    explicit False/None/default-valued overrides meaningful, and leaves the
-    original signature, API logging and tracing metadata available to tooling.
-    """
-    signature = inspect.signature(plan)
-
-    @functools.wraps(plan)
-    def with_defaults(self, *args, **kwargs):
-        options = self._constructor_plan_options
-        if not options:
-            return plan(self, *args, **kwargs)
-        explicit = signature.bind_partial(self, *args, **kwargs)
-        explicit.arguments.pop("self")
-        return plan(self, **{**options, **explicit.arguments})
-
-    return with_defaults
-
-
-@functools.cache
-def _device_service_slots(device: torch.device) -> int:
-    index = device.index
-    if index is None:
-        index = torch.cuda.current_device()
-    with torch.cuda.device(index):
-        return max(
-            get_device_sm_count(torch.device("cuda", index)),
-            get_max_active_clusters(1),
-            2 * get_max_active_clusters(2),
-        )
-
-
-def decode_control_workspace_bytes(device: torch.device) -> int:
-    """Reserve a fixed control tail disjoint from every partial-result view."""
-    # 4 = up to two policy service waves times two for reducer-capacity rounding.
-    # 128 = maximum query/head rows per work tile (a conservative counter bound).
-    # Each counter is int32 (4 bytes). The final 64 bytes hold two 32-byte-aligned
-    # dummy metadata slots. All arena sections use 256-byte alignment.
-    return round_up(_device_service_slots(device) * 4 * 128 * 4 + 64, 256)
-
-
-def reduction_workspace_bound(
-    device: torch.device, head_dim: int, *, mla: bool = False
-) -> int:
-    """Bound automatic split scratch by resident physical query/head work.
-
-    Ordinary fanout fits one service wave. Jointly scored FMHA recipes may
-    cross its boundary once; rounding reducer capacities adds at most another
-    factor of two. Each physical work tile stores at most 128 query/head rows.
-    Output-sized statistics and forced-split formats are checked separately.
-    """
-    service_slots = _device_service_slots(device)
-    # MLA 1CTA uses M<=64 and at most 2x capacity rounding. Its 2CTA path
-    # uses M128 with half as many resident clusters and the same rounding.
-    work_tiles = service_slots * (1 if mla else 4)
-    partial_rows = work_tiles * 128
-    stats_bytes = 4 if mla else 8
-    size = partial_rows * (head_dim * 2 + stats_bytes) + work_tiles * 4 + 256
-    if not mla:
-        size += decode_control_workspace_bytes(device)
-    return round_up(size, 256)
 
 
 def validate_lse_mode(mode: str) -> Literal["none", "base2"]:
