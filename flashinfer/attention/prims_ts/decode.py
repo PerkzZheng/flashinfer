@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 import functools
 import math
 import numbers
+import struct
 from typing import TYPE_CHECKING, Literal, NamedTuple, Optional, Union, cast
 
 import torch
@@ -26,15 +27,13 @@ import torch
 from ._compile_cache import build_and_load_attention_kernel
 
 from flashinfer.api_logging import flashinfer_experimental_api
-from flashinfer.utils import get_device_sm_count
-from .split_kv_mode_policy import split_capacity
-from .planning import (
-    prepare_lse,
-    validate_lse_mode,
-    validate_attention_sinks,
-    _validate_scale,
-    _validate_kv_layout as _validate_layout,
+from flashinfer.utils import (
+    get_device_sm_count,
+    _check_workspace_buffer_alignment,
+    check_shape_dtype_device,
 )
+from .split_kv_mode_policy import split_capacity
+
 from flashinfer.trace.templates.attention import (
     attention_ts_decode_trace_dispatch,
     prims_ts_decode_wrapper_trace_dispatch,
@@ -517,6 +516,78 @@ def _validate_exact_compact_strides(
 def _validate_16byte_alignment(tensor: torch.Tensor, name: str) -> None:
     if tensor.data_ptr() % 16 != 0:
         raise ValueError(f"{name} data pointer must be 16-byte aligned")
+
+
+def _validate_scale(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(f"{name} must be a positive Python scalar")
+    try:
+        value_as_float = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must be a positive Python scalar") from error
+    if not math.isfinite(value_as_float) or value_as_float <= 0.0:
+        raise ValueError(f"{name} must be finite and positive")
+    try:
+        value_as_float32 = struct.unpack("=f", struct.pack("=f", value_as_float))[0]
+    except (OverflowError, struct.error) as error:
+        raise ValueError(
+            f"{name} must be representable as a positive float32"
+        ) from error
+    if not math.isfinite(value_as_float32) or value_as_float32 <= 0.0:
+        raise ValueError(f"{name} must be representable as a positive float32")
+    return value_as_float32
+
+
+def _validate_layout(kv_layout: str) -> None:
+    if not isinstance(kv_layout, str):
+        raise TypeError("kv_layout must be a string")
+    if kv_layout not in ("HND", "NHD"):
+        raise ValueError(f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}")
+
+
+def validate_lse_mode(mode: str) -> Literal["none", "base2"]:
+    if mode not in ("none", "base2"):
+        raise ValueError("lse_mode must be 'none' or 'base2'")
+    return cast(Literal["none", "base2"], mode)
+
+
+def prepare_lse(
+    lse: torch.Tensor | None,
+    *,
+    q: torch.Tensor,
+    mode: str,
+    return_lse: bool,
+    validate: bool,
+) -> torch.Tensor | None:
+    """Bind an independent caller buffer, or allocate the enabled output."""
+    if mode == "none":
+        if return_lse or lse is not None:
+            raise ValueError("plan() must enable lse_mode='base2'")
+        return None
+    if lse is None:
+        return torch.empty(q.shape[:-1], dtype=torch.float32, device=q.device)
+    if validate:
+        check_shape_dtype_device(lse, q.shape[:-1], torch.float32, q.device, "lse")
+        if not lse.is_contiguous():
+            raise ValueError("lse must be contiguous")
+        _check_workspace_buffer_alignment(lse, "lse", alignment=4)
+    return lse
+
+
+def validate_attention_sinks(sinks, *, q, enabled, validate):
+    """Bind sink logits; callers guarantee finite values or negative infinity."""
+    if enabled != (sinks is not None):
+        raise ValueError(
+            "attention_sinks must be supplied exactly when plan(use_attention_sinks=True)"
+        )
+    if sinks is not None and validate:
+        check_shape_dtype_device(
+            sinks, (q.shape[-2],), torch.float32, q.device, "attention_sinks"
+        )
+        if not sinks.is_contiguous():
+            raise ValueError("attention_sinks must be contiguous")
+        _check_workspace_buffer_alignment(sinks, "attention_sinks", alignment=4)
+    return sinks
 
 
 def _validate_mask(mask_type: str) -> None:

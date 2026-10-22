@@ -8832,23 +8832,27 @@ def test_attention_ts_decode_standalone_reuses_caller_workspace():
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
-    "dtype,heads,nq,nk,mode",
+    "dtype,dim,heads,nq,nk,packed,mode",
     (
-        (torch.bfloat16, 8, 3, 257, "base2"),
-        (_FP8, 32, 1, 8192, "base2"),
-        (torch.bfloat16, 128, 1, 8192, "base2"),
-        (_FP8, 128, 1, 8192, "base2"),
+        (torch.bfloat16, 128, 8, 3, 257, False, "base2"),
+        (_FP8, 128, 32, 1, 8192, False, "base2"),
+        (torch.bfloat16, 128, 128, 1, 8192, False, "base2"),
+        (_FP8, 128, 128, 1, 8192, False, "base2"),
+        (torch.bfloat16, 64, 15, 9, 513, False, "base2"),
+        (_FP8, 64, 3, 9, 513, False, "base2"),
+        (torch.bfloat16, 128, 15, 9, 513, True, "base2"),
+        (_FP8, 256, 3, 9, 513, True, "base2"),
     ),
 )
-def test_attention_ts_decode_final_statistics(dtype, heads, nq, nk, mode):
-    """NHD, sinks and runtime split reducers publish fresh output/LSE on replay."""
+def test_attention_ts_decode_final_statistics(dtype, dim, heads, nq, nk, packed, mode):
+    """NHD sinks/LSE exclude padded Q rows and refresh output on replay."""
     from tests.attention.test_attention_ts_context import _softmax_statistics_reference
 
     case = _make_decode_case(
         kv_lens=(nk,),
         num_qo_heads=heads,
         num_kv_heads=1,
-        head_dim=128,
+        head_dim=dim,
         seq_len_q=nq,
         page_size=32,
         qkv_dtype=dtype,
@@ -8858,6 +8862,9 @@ def test_attention_ts_decode_final_statistics(dtype, heads, nq, nk, mode):
         device="cuda",
         seed=7213,
     )
+    offsets = None
+    if packed:
+        case, offsets = _pack_decode_case(case, (nq - 2,))
     cache = tuple(t.transpose(1, 2).contiguous() for t in (case.k_cache, case.v_cache))
     sinks = torch.linspace(-4, 10, heads, device="cuda")
     sinks[0], sinks[-1] = -torch.inf, 1000.0
@@ -8866,7 +8873,7 @@ def test_attention_ts_decode_final_statistics(dtype, heads, nq, nk, mode):
         device="cuda",
         num_qo_heads=heads,
         num_kv_heads=1,
-        head_dim=128,
+        head_dim=dim,
         page_size=32,
         q_data_type=dtype,
         o_data_type=case.output_dtype,
@@ -8876,18 +8883,19 @@ def test_attention_ts_decode_final_statistics(dtype, heads, nq, nk, mode):
         batch_size=1,
         max_kv_len=nk,
         max_seq_len_q=nq,
+        packed_query=packed,
     )
     pages = case.block_tables[0, : (nk + 31) // 32].long()
     k, v = (
-        t[pages].transpose(1, 2).reshape(-1, 1, 128)[:nk]
+        t[pages].transpose(1, 2).reshape(-1, 1, dim)[:nk]
         for t in (case.k_cache, case.v_cache)
     )
-    q = case.q if nq == 1 else case.q[0]
+    q = case.q if packed or nq == 1 else case.q[0]
     ref, expected = _softmax_statistics_reference(
         q, k, v, scale=case.bmm1_scale, sinks=sinks
     )
     ref *= case.bmm2_scale
-    if nq != 1:
+    if nq != 1 and not packed:
         ref, expected = ref[None], expected[None]
     if mode == "base2":
         expected /= math.log(2)
@@ -8899,6 +8907,7 @@ def test_attention_ts_decode_final_statistics(dtype, heads, nq, nk, mode):
             cache,
             lengths,
             case.block_tables,
+            qo_indptr=offsets,
             bmm1_scale=case.bmm1_scale,
             bmm2_scale=case.bmm2_scale,
             attention_sinks=sinks,

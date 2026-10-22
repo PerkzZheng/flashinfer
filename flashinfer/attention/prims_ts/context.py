@@ -46,12 +46,12 @@ from ._compile_cache import build_and_load_attention_kernel
 from ._hardware import get_max_active_clusters
 
 from flashinfer.api_logging import flashinfer_experimental_api
-from .planning import (
+from .decode import (
     prepare_lse,
     validate_lse_mode,
     validate_attention_sinks,
     _validate_scale,
-    _validate_kv_layout,
+    _validate_layout as _validate_kv_layout,
 )
 
 

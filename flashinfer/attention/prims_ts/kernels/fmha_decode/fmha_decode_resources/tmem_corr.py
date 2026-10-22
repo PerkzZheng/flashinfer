@@ -1145,7 +1145,8 @@ class TmemCorrResource(DecodeGenResourceBase):
                 row,
                 self.q_token_offset,
             )
-            # Validity is expressed in the compact logical output-row domain.
+            # This compact-row check excludes tail queries. Direct scale-group
+            # callers also mask CTA-local padding, which can alias the next tile.
             valid = _q_logical_output_row_is_valid_for_seq(
                 cfg, self.h_r, row, self.seq_len_q
             )
@@ -4004,7 +4005,17 @@ class TmemCorrResource(DecodeGenResourceBase):
                 output_row,
                 reduced_sum[scale_idx],
                 final_max[scale_idx],
-                warp_idx == Int32(0) and lane_idx < Int32(4),
+                (
+                    warp_idx == Int32(0)
+                    and lane_idx < Int32(4)
+                    and _q_row_is_valid_for_seq(
+                        cfg,
+                        self.h_r,
+                        logical_q_group_idx,
+                        row_in_tile,
+                        self.seq_len_q,
+                    )
+                ),
             )
             norm_scale = (
                 self.output_scale
@@ -4512,7 +4523,17 @@ class TmemCorrResource(DecodeGenResourceBase):
                 output_row,
                 reduced_sum[scale_idx],
                 final_max[scale_idx],
-                warp_idx == Int32(0) and lane_idx < Int32(4),
+                (
+                    warp_idx == Int32(0)
+                    and lane_idx < Int32(4)
+                    and _q_row_is_valid_for_seq(
+                        cfg,
+                        self.h_r,
+                        logical_q_group_idx,
+                        row_in_tile,
+                        self.seq_len_q,
+                    )
+                ),
             )
             norm_scale = (
                 self.output_scale

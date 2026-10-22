@@ -35,12 +35,11 @@ from flashinfer.trace.templates.attention import (
 )
 
 from .split_kv_mode_policy import split_capacity
-from .planning import (
-    prepare_lse,
-    validate_lse_mode,
-)
+
 
 from .decode import (
+    prepare_lse,
+    validate_lse_mode,
     _WorkspaceSection,
     _align_up,
     _append_workspace_section,
