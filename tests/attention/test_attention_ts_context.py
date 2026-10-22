@@ -76,7 +76,7 @@ class _ContextCase:
     k_lengths: tuple[int, ...]
     mask_type: str
     window_left: int
-    sm_scale: float
+    softmax_scale: float
     output_scale: float
     output_dtype: torch.dtype
 
@@ -185,7 +185,7 @@ def _make_context_case(
         k_lengths=k_lengths,
         mask_type=mask_type,
         window_left=window_left,
-        sm_scale=1.0 / math.sqrt(head_dim),
+        softmax_scale=1.0 / math.sqrt(head_dim),
         output_scale=output_scale,
         output_dtype=qkv_dtype if output_dtype is None else output_dtype,
     )
@@ -290,7 +290,7 @@ def _make_paged_context_case(
         k_lengths=k_lengths,
         mask_type=mask_type,
         window_left=window_left,
-        sm_scale=1.0 / math.sqrt(head_dim),
+        softmax_scale=1.0 / math.sqrt(head_dim),
         output_scale=output_scale,
         output_dtype=qk_dtype if output_dtype is None else output_dtype,
     )
@@ -391,7 +391,7 @@ def _context_reference(case: _ContextCase) -> torch.Tensor:
                 window_left=case.window_left,
             )
             scores = torch.einsum("hd,khd->hk", q[query_idx], k[begin:end])
-            probabilities = torch.softmax(scores * case.sm_scale, dim=-1)
+            probabilities = torch.softmax(scores * case.softmax_scale, dim=-1)
             request_output.append(
                 torch.einsum("hk,khd->hd", probabilities, v[begin:end])
                 * case.output_scale
@@ -427,7 +427,7 @@ def _variable_window_reference(
             key_positions <= ends[batch_idx].unsqueeze(1)
         )
         probabilities = torch.softmax(
-            scores.masked_fill(~valid.unsqueeze(0), -torch.inf) * case.sm_scale,
+            scores.masked_fill(~valid.unsqueeze(0), -torch.inf) * case.softmax_scale,
             dim=-1,
         )
         outputs.append(
@@ -513,7 +513,7 @@ def _plan_wrapper(wrapper: BatchPrefillTSWrapper, case: _ContextCase) -> None:
         packed=case.packed,
         mask_type=case.mask_type,
         window_left=case.window_left,
-        sm_scale=case.sm_scale,
+        softmax_scale=case.softmax_scale,
         output_scale=case.output_scale,
         out_dtype=case.output_dtype,
         batch_size=len(case.q_lengths),
@@ -573,7 +573,7 @@ def _plan_paged_wrapper(
         page_size=case.page_size,
         mask_type=reference.mask_type,
         window_left=reference.window_left,
-        sm_scale=reference.sm_scale,
+        softmax_scale=reference.softmax_scale,
         output_scale=reference.output_scale,
         uniform_packed_lengths=uniform_packed_lengths,
         has_q_offset=has_q_offset,
@@ -651,7 +651,7 @@ def _run_one_shot(case: _ContextCase, *, out: Optional[torch.Tensor] = None):
         kv_indptr=case.kv_indptr,
         mask_type=case.mask_type,
         window_left=case.window_left,
-        sm_scale=case.sm_scale,
+        softmax_scale=case.softmax_scale,
         output_scale=case.output_scale,
         out_dtype=case.output_dtype,
         out=out,
@@ -774,7 +774,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "page_size",
         "mask_type",
         "window_left",
-        "sm_scale",
+        "softmax_scale",
         "output_scale",
         "lse_mode",
         "use_attention_sinks",
@@ -799,7 +799,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "lse",
         "return_lse",
         "attention_sinks",
-        "scale_softmax_log2",
+        "softmax_scale",
         "output_scale",
         "validate",
     )
@@ -864,7 +864,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "packed",
         "mask_type",
         "window_left",
-        "sm_scale",
+        "softmax_scale",
         "output_scale",
         "lse_mode",
         "use_attention_sinks",
@@ -888,7 +888,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "lse",
         "return_lse",
         "attention_sinks",
-        "scale_softmax_log2",
+        "softmax_scale",
         "output_scale",
         "validate",
     )
@@ -919,7 +919,7 @@ def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> N
         "kv_layout": "HND",
         "mask_type": "dense",
         "window_left": -1,
-        "sm_scale": None,
+        "softmax_scale": None,
         "output_scale": 1.0,
         "out_dtype": None,
         "out": None,
@@ -2298,24 +2298,29 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
             BatchPrefillTSWrapper().plan(**plan_kwargs)
 
 
-@pytest.mark.parametrize("page_size", (16, 32, 64, 128))
+@pytest.mark.parametrize("page_size", (4, 8, 16, 32, 64, 128))
 def test_attention_ts_context_accepts_public_page_sizes(page_size: int):
     assert context_module._validate_page_size(page_size) == page_size
 
 
-@pytest.mark.parametrize("page_size", (0, 8, 256))
+@pytest.mark.parametrize("page_size", (0, 2, 256))
 def test_attention_ts_context_rejects_unsupported_page_sizes(page_size: int):
     with pytest.raises(NotImplementedError, match="supports page_size"):
         context_module._validate_page_size(page_size)
 
 
-@pytest.mark.parametrize("page_size", (16, 32, 64, 128))
 @pytest.mark.parametrize(
-    ("head_dim", "qkv_dtype"),
-    (
-        pytest.param(128, torch.bfloat16, id="d128-bf16"),
-        pytest.param(256, _FP8, id="d256-fp8"),
-    ),
+    "page_size,head_dim,qkv_dtype,mask_type",
+    [
+        pytest.param(p, d, dtype, "causal", id=f"p{p}-d{d}-{dtype}-causal")
+        for p in (4, 8, 16, 32, 64, 128)
+        for d, dtype in ((128, torch.bfloat16), (256, _FP8))
+    ]
+    + [
+        pytest.param(p, d, _FP8, "dense", id=f"p{p}-d{d}-fp8-dense")
+        for p in (4, 8)
+        for d in (128, 256)
+    ],
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
@@ -2323,17 +2328,18 @@ def test_attention_ts_context_paged_supported_page_sizes_accuracy(
     page_size: int,
     head_dim: int,
     qkv_dtype: torch.dtype,
+    mask_type: str,
 ):
     """Every public page size crosses page and K-tile boundaries accurately."""
 
     case = _make_paged_context_case(
         q_lengths=(33, 17),
-        k_lengths=(129, 97),
+        k_lengths=(513, 381) if mask_type == "causal" else (512, 385),
         num_qo_heads=8,
         num_kv_heads=2,
         head_dim=head_dim,
         qk_dtype=qkv_dtype,
-        mask_type="causal",
+        mask_type=mask_type,
         page_size=page_size,
         output_dtype=torch.bfloat16,
         output_scale=1.0,
@@ -4139,7 +4145,7 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
         metadata.seq_lens_kv,
         page_size=case.page_size,
         mask_type=case.reference.mask_type,
-        sm_scale=case.reference.sm_scale,
+        softmax_scale=case.reference.softmax_scale,
         output_scale=case.reference.output_scale,
         out_dtype=case.reference.output_dtype,
     )
@@ -4198,7 +4204,7 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
         metadata.seq_lens_kv,
         page_size=32,
         mask_type="causal",
-        sm_scale=case.reference.sm_scale,
+        softmax_scale=case.reference.softmax_scale,
         output_scale=case.reference.output_scale,
         out_dtype=case.reference.output_dtype,
         out=output,
@@ -4709,7 +4715,7 @@ def test_attention_ts_context_mla_prefill(
     q = (q * operand_scale).to(dtype)
     k = (k * operand_scale).to(dtype)
     v = (v * operand_scale).to(dtype)
-    sm_scale = 1 / (math.sqrt(192) * operand_scale**2)
+    softmax_scale = 1 / (math.sqrt(192) * operand_scale**2)
     output_scale = 0.75 / operand_scale
     qo = (
         torch.tensor(_cumulative(q_lens), device="cuda", dtype=torch.int32)
@@ -4731,7 +4737,7 @@ def test_attention_ts_context_mla_prefill(
             vr = v[k_offset : k_offset + nk].float().transpose(0, 1)
             kr = kr.repeat_interleave(hq // hkv, dim=0)
             vr = vr.repeat_interleave(hq // hkv, dim=0)
-            scores = (qr @ kr.transpose(-1, -2)) * sm_scale
+            scores = (qr @ kr.transpose(-1, -2)) * softmax_scale
             if causal:
                 mask = torch.arange(nk, device="cuda")[None, :] > (
                     nk - nq + torch.arange(nq, device="cuda")[:, None]
@@ -4765,7 +4771,7 @@ def test_attention_ts_context_mla_prefill(
         k_dtype=dtype,
         packed=packed,
         mask_type="causal" if causal else "dense",
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         output_scale=output_scale,
         out_dtype=out_dtype,
         batch_size=batch_size,
@@ -4789,7 +4795,7 @@ def test_attention_ts_context_mla_prefill(
         qo_indptr=qo,
         kv_indptr=ko,
         mask_type="causal" if causal else "dense",
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         output_scale=output_scale,
         out_dtype=out_dtype,
     )
@@ -5020,6 +5026,7 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
         wrapper = BatchPrefillTSWrapper()
         args = (case.q, case.k, case.v, case.qo_indptr, case.kv_indptr)
         plan_options = dict(packed=case.packed)
+    runtime_softmax_scale = 8 * case.softmax_scale
     wrapper.plan(
         device="cuda",
         num_qo_heads=4,
@@ -5048,7 +5055,7 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
                     (case.v, case.k_lengths),
                 )
             ],
-            scale=case.sm_scale,
+            scale=runtime_softmax_scale,
             sinks=sinks,
         )
         for b in range(2)
@@ -5056,10 +5063,22 @@ def test_attention_ts_context_final_statistics(dtype, dim, kind, mode):
     combine = torch.cat if case.packed else torch.stack
     ref = combine([r[0] for r in refs]) * 0.75
     expected = combine([r[1] for r in refs]) / (math.log(2) if mode == "base2" else 1)
-    out, lse = wrapper.run(*args, attention_sinks=sinks, return_lse=True)
+    out, lse = wrapper.run(
+        *args,
+        attention_sinks=sinks,
+        softmax_scale=runtime_softmax_scale,
+        return_lse=True,
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        wrapper.run(*args, attention_sinks=sinks, out=out, lse=lse, validate=False)
+        wrapper.run(
+            *args,
+            attention_sinks=sinks,
+            softmax_scale=runtime_softmax_scale,
+            out=out,
+            lse=lse,
+            validate=False,
+        )
     out.fill_(torch.nan)
     lse.fill_(torch.nan)
     graph.replay()

@@ -586,10 +586,11 @@ between completed graph replays. Supply caller outputs and disable validation
 for allocation-free replay.
 
 FP8 scalar dequantization remains caller-composed: effective QK scale is
-`sm_scale * q_scale * k_scale`; effective output scale includes `v_scale`.
-Context uses `sm_scale` / `output_scale` while planning and
-`scale_softmax_log2 = effective_QK_scale * log2(e)` / `output_scale` at run.
-FMHA and MLA decode name the effective scales `bmm1_scale` / `bmm2_scale`.
+`attention_scale * q_scale * k_scale`; effective output scale includes `v_scale`.
+Dense context, FMHA decode and MLA decode use `softmax_scale` / `output_scale`.
+The QK scale is in natural-exponential units; context converts it to base two
+internally. Context planning sets defaults that `run()` may override. Context
+and FMHA decode default to `1 / sqrt(D)`; MLA retains its default of 1.
 Context scales are host FP32 scalar operands; device scale tensors are not
 supported. Captured graphs retain the scalar values used during capture;
 changing them requires recapture. Scalar values are validated on the host and do not specialize JIT. Packed NVFP4 block
@@ -601,7 +602,9 @@ Split counts are automatic and private, with the physical SM count as their
 ceiling. The policy bounds useful work using execution geometry and KV capacity,
 then prepares scratch/reduction capacity in ranges 1, 2–4, 5–8, 9–16, 17–32,
 33–64, and sixteen-split ranges above 64 clipped to the hardware ceiling.
-No count, ceiling, or count tensor is exposed to users.
+No count, ceiling, or count tensor is exposed to users. Reduction selection checks
+cluster residency with the rounded capacity and falls back to the standalone
+reducer when that physical cluster grid no longer fits one resident wave.
 
 Producers and reducers receive typed runtime counts. Scratch strides and
 cluster/barrier participation retain prepared capacity; inactive slots/ranks

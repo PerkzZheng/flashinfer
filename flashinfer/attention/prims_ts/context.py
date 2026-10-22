@@ -62,7 +62,7 @@ if TYPE_CHECKING:
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _SUPPORTED_HEAD_DIMS = (128, 256)
 _DEFAULT_PAGED_KV_PAGE_SIZE = 32
-_SUPPORTED_PAGED_KV_PAGE_SIZES = (16, 32, 64, 128)
+_SUPPORTED_PAGED_KV_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 _SUPPORTED_DTYPES = (
     torch.float16,
     torch.bfloat16,
@@ -2605,7 +2605,7 @@ class BatchPrefillTSWrapper:
         packed: bool = False,
         mask_type: Literal["dense", "causal", "variable_window"] = "dense",
         window_left: int = -1,
-        sm_scale: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
         output_scale: float = 1.0,
         lse_mode: Literal["none", "base2"] = "none",
         use_attention_sinks: bool = False,
@@ -2646,11 +2646,11 @@ class BatchPrefillTSWrapper:
             window_left=window_left,
             output_dtype=resolved_out_dtype,
         )
-        if sm_scale is None:
-            sm_scale = geometry.head_dim**-0.5
+        if softmax_scale is None:
+            softmax_scale = geometry.head_dim**-0.5
         scale_softmax_log2 = _validate_scale(
-            _validate_scale(sm_scale, "sm_scale") * math.log2(math.e),
-            "sm_scale * log2(e)",
+            _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
+            "softmax_scale * log2(e)",
         )
         output_scale = _validate_scale(output_scale, "output_scale")
         empty_i32 = torch.empty(1, dtype=torch.int32, device=geometry.device)
@@ -2698,7 +2698,7 @@ class BatchPrefillTSWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
-        scale_softmax_log2: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
         output_scale: Optional[float] = None,
         validate: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -2718,7 +2718,7 @@ class BatchPrefillTSWrapper:
         require inclusive start/end bounds; ends must be nondecreasing within each
         request, while starts may be unordered. Optional CTA minima avoid refreshing
         wrapper-owned fallback scratch. Scale overrides are finite positive host
-        scalars: scale_softmax_log2 is the effective QK scale times log2(e), and
+        scalars: softmax_scale is the effective QK scale, and
         output_scale scales V/output. They are runtime kernel operands, not JIT keys.
 
         Enabled attention_sinks supplies compact CUDA FP32 [Hq] natural-log sink
@@ -2804,8 +2804,11 @@ class BatchPrefillTSWrapper:
             runtime_window_cta_starts = state.empty_i32
         scale_softmax_log2 = (
             state.scale_softmax_log2
-            if scale_softmax_log2 is None
-            else _validate_scale(scale_softmax_log2, "scale_softmax_log2")
+            if softmax_scale is None
+            else _validate_scale(
+                _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
+                "softmax_scale * log2(e)",
+            )
         )
         output_scale = (
             state.output_scale
@@ -2892,7 +2895,7 @@ class BatchPrefillPagedTSWrapper:
         page_size: int = _DEFAULT_PAGED_KV_PAGE_SIZE,
         mask_type: Literal["dense", "causal"] = "dense",
         window_left: int = -1,
-        sm_scale: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
         output_scale: float = 1.0,
         lse_mode: Literal["none", "base2"] = "none",
         use_attention_sinks: bool = False,
@@ -2938,11 +2941,11 @@ class BatchPrefillPagedTSWrapper:
             has_q_offset=has_q_offset,
             paged_v_tail_is_zero=paged_v_tail_is_zero,
         )
-        if sm_scale is None:
-            sm_scale = geometry.head_dim**-0.5
+        if softmax_scale is None:
+            softmax_scale = geometry.head_dim**-0.5
         scale_softmax_log2 = _validate_scale(
-            _validate_scale(sm_scale, "sm_scale") * math.log2(math.e),
-            "sm_scale * log2(e)",
+            _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
+            "softmax_scale * log2(e)",
         )
         output_scale = _validate_scale(output_scale, "output_scale")
         compiled, policy = _get_compiled_paged_context(
@@ -2982,7 +2985,7 @@ class BatchPrefillPagedTSWrapper:
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
-        scale_softmax_log2: Optional[float] = None,
+        softmax_scale: Optional[float] = None,
         output_scale: Optional[float] = None,
         validate: bool = True,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -3031,8 +3034,11 @@ class BatchPrefillPagedTSWrapper:
             )
         scale_softmax_log2 = (
             state.scale_softmax_log2
-            if scale_softmax_log2 is None
-            else _validate_scale(scale_softmax_log2, "scale_softmax_log2")
+            if softmax_scale is None
+            else _validate_scale(
+                _validate_scale(softmax_scale, "softmax_scale") * math.log2(math.e),
+                "softmax_scale * log2(e)",
+            )
         )
         output_scale = (
             state.output_scale
@@ -3089,7 +3095,7 @@ def batch_prefill(
     window_left: int = -1,
     variable_window_token_starts: Optional[torch.Tensor] = None,
     variable_window_token_ends: Optional[torch.Tensor] = None,
-    sm_scale: Optional[float] = None,
+    softmax_scale: Optional[float] = None,
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
@@ -3128,7 +3134,7 @@ def batch_prefill(
         ``0 <= starts[b, q] <= ends[b, q] < Sk``.
         Ends must be nondecreasing along Q within each batch item; starts
         need not be ordered.
-    sm_scale : float, optional
+    softmax_scale : float, optional
         Softmax scale; defaults to the inverse square root of head size.
     output_scale : float
         Scale applied to the attention output.
@@ -3202,7 +3208,7 @@ def batch_prefill(
         packed=geometry.packed,
         mask_type=mask_type,
         window_left=window_left,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         output_scale=output_scale,
         use_attention_sinks=attention_sinks is not None,
         lse_mode=validate_lse_mode(lse_mode)
@@ -3237,7 +3243,7 @@ def batch_prefill_with_paged_kv_cache(
     kv_layout: Literal["HND", "NHD"] = "HND",
     mask_type: Literal["dense", "causal"] = "dense",
     window_left: int = -1,
-    sm_scale: Optional[float] = None,
+    softmax_scale: Optional[float] = None,
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
     out: Optional[torch.Tensor] = None,
@@ -3250,7 +3256,7 @@ def batch_prefill_with_paged_kv_cache(
 
     Q/output use ``[total_q, Hq, D]`` storage and K/V each use
     ``[num_pages, Hkv, page_size, D]`` for HND or
-    ``[num_pages, page_size, Hkv, D]`` for NHD, with page size 16/32/64/128.
+    ``[num_pages, page_size, Hkv, D]`` for NHD, with page size 4/8/16/32/64/128.
     ``qo_indptr`` describes Q rows, ``block_tables`` supplies one fixed
     row-strided page table, and ``seq_lens_kv`` supplies logical K/V lengths.
     Physical page indices need not be identity ordered. ``D`` may be 128 or
@@ -3284,7 +3290,7 @@ def batch_prefill_with_paged_kv_cache(
         Attention mask mode.
     window_left : int
         Left sliding-window extent, or ``-1`` to disable the window.
-    sm_scale : float, optional
+    softmax_scale : float, optional
         Softmax scale; defaults to the inverse square root of head size.
     output_scale : float
         Scale applied to the attention output.
@@ -3363,7 +3369,7 @@ def batch_prefill_with_paged_kv_cache(
         page_size=page_size,
         mask_type=mask_type,
         window_left=window_left,
-        sm_scale=sm_scale,
+        softmax_scale=softmax_scale,
         output_scale=output_scale,
         use_attention_sinks=attention_sinks is not None,
         lse_mode=validate_lse_mode(lse_mode)

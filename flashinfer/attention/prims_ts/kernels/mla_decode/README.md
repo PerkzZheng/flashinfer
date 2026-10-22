@@ -136,7 +136,7 @@ rectangular tiles beyond a shorter request's active prefix retire scheduler
 bookkeeping without issuing Q/K/V or output accesses.
 
 For causal request `b`, query row `i` can attend through
-`seq_lens[b] - query_length[b] + i`. `bmm1_scale` and `bmm2_scale` default to
+`seq_lens[b] - query_length[b] + i`. `softmax_scale` and `output_scale` default to
 1 and must be finite, positive Python scalars representable as positive
 `float32` values.
 

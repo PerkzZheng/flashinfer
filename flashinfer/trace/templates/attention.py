@@ -1157,8 +1157,8 @@ def _make_attention_ts_decode_trace(
             "mask_type": Scalar("string", optional=True),
             "window_left": Scalar("int32", optional=True),
             "kv_layout": Scalar("string", optional=True),
-            "bmm1_scale": Scalar("float32", optional=True),
-            "bmm2_scale": Scalar("float32", optional=True),
+            "softmax_scale": Scalar("float32", optional=True),
+            "output_scale": Scalar("float32", optional=True),
             "out_dtype": Scalar("dtype", optional=True),
             "split_kv": Scalar("bool", optional=True),
         }
@@ -1387,8 +1387,8 @@ def _make_prims_ts_decode_wrapper_trace(
                 tuple_idx=1,
                 optional=True,
             ),
-            "bmm1_scale": Scalar("float32", optional=True),
-            "bmm2_scale": Scalar("float32", optional=True),
+            "softmax_scale": Scalar("float32", optional=True),
+            "output_scale": Scalar("float32", optional=True),
             "validate": Scalar(
                 "bool",
                 optional=True,
@@ -1681,8 +1681,8 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
                 ["workspace_size"], dtype="uint8", optional=True
             ),
             "validate": Scalar("bool", optional=True),
-            "bmm1_scale": Scalar("float32", optional=True),
-            "bmm2_scale": Scalar("float32", optional=True),
+            "softmax_scale": Scalar("float32", optional=True),
+            "output_scale": Scalar("float32", optional=True),
             "mask_type": Scalar("string", optional=True),
             "out_dtype": Scalar("dtype", optional=True),
         },
@@ -1691,7 +1691,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
             "head_dim_qk == kv_lora_rank + qk_rope_head_dim",
             "kv_lora_rank == 512",
             "qk_rope_head_dim == 64",
-            "page_size in (16, 32, 64, 128)",
+            "page_size in (4, 8, 16, 32, 64, 128)",
             *(["kv_pad_dim == 1"] if rank4_cache else []),
             "block_tables.shape[0] == batch_size",
             *(
@@ -1823,8 +1823,8 @@ def _make_prims_ts_decode_mla_wrapper_trace(
                 optional=not packed_query,
                 description="Cumulative Q offsets required by a packed-Q run.",
             ),
-            "bmm1_scale": Scalar("float32", optional=True),
-            "bmm2_scale": Scalar("float32", optional=True),
+            "softmax_scale": Scalar("float32", optional=True),
+            "output_scale": Scalar("float32", optional=True),
             "validate": Scalar(
                 "bool",
                 optional=True,
@@ -1835,7 +1835,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         constraints=[
             "head_dim_qk == 576",
             "kv_lora_rank == 512",
-            "page_size in (16, 32, 64, 128)",
+            "page_size in (4, 8, 16, 32, 64, 128)",
             "block_tables.shape[0] == batch_size",
             "max_pages_per_seq * page_size >= max_kv_len",
             "min(seq_lens) >= 1",

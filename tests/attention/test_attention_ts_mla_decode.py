@@ -177,8 +177,8 @@ class _MLACase:
     page_size: int
     output_dtype: torch.dtype
     mask_type: str
-    bmm1_scale: float
-    bmm2_scale: float
+    softmax_scale: float
+    output_scale: float
 
 
 def _variable_seq_lens(
@@ -284,8 +284,8 @@ def _make_mla_case(
         page_size=page_size,
         output_dtype=torch.bfloat16,
         mask_type=mask_type,
-        bmm1_scale=q_scale * kv_scale / math.sqrt(128 + _ROPE_DIM),
-        bmm2_scale=kv_scale,
+        softmax_scale=q_scale * kv_scale / math.sqrt(128 + _ROPE_DIM),
+        output_scale=kv_scale,
     )
 
 
@@ -358,8 +358,8 @@ def _fp8_request_reference(
     q_stored: torch.Tensor,
     cache_stored: torch.Tensor,
     *,
-    bmm1_scale: float,
-    bmm2_scale: float,
+    softmax_scale: float,
+    output_scale: float,
     num_insts_kv: int,
     tile_size_kv: int,
     splits_kv: int,
@@ -408,14 +408,16 @@ def _fp8_request_reference(
                 else local_max
             )
             probabilities = (
-                torch.exp((tile_scores - new_max[:, None]) * bmm1_scale)
+                torch.exp((tile_scores - new_max[:, None]) * softmax_scale)
                 * _FP8_PROBABILITY_SCALE
             )
             quantized_probabilities = probabilities.to(_FP8).float()
             tile_sum = probabilities.sum(dim=-1)
             tile_acc = quantized_probabilities @ cache_stored[begin:end, :_LATENT_DIM]
             if stream_valid[stream_idx]:
-                correction = torch.exp((stream_max[stream_idx] - new_max) * bmm1_scale)
+                correction = torch.exp(
+                    (stream_max[stream_idx] - new_max) * softmax_scale
+                )
                 stream_sum[stream_idx] = stream_sum[stream_idx] * correction + tile_sum
                 stream_acc[stream_idx] = (
                     stream_acc[stream_idx] * correction[:, None] + tile_acc
@@ -443,10 +445,10 @@ def _fp8_request_reference(
         stream_max, stream_sum, stream_acc, stream_valid, strict=True
     ):
         if valid:
-            correction = torch.exp((maximum - final_max) * bmm1_scale)
+            correction = torch.exp((maximum - final_max) * softmax_scale)
             final_sum += denominator * correction
             final_acc += accumulator * correction[:, None]
-    return final_acc / final_sum[:, None] * bmm2_scale
+    return final_acc / final_sum[:, None] * output_scale
 
 
 @torch.no_grad()
@@ -486,8 +488,8 @@ def _mla_reference(
                 output = _fp8_request_reference(
                     q_stored,
                     visible_cache,
-                    bmm1_scale=case.bmm1_scale,
-                    bmm2_scale=case.bmm2_scale,
+                    softmax_scale=case.softmax_scale,
+                    output_scale=case.output_scale,
                     num_insts_kv=num_insts_kv,
                     tile_size_kv=tile_size_kv,
                     splits_kv=splits_kv,
@@ -497,9 +499,9 @@ def _mla_reference(
                     q_stored[:, :_LATENT_DIM] @ visible_cache[:, :_LATENT_DIM].T
                     + q_stored[:, _LATENT_DIM:] @ visible_cache[:, _LATENT_DIM:].T
                 )
-                probabilities = torch.softmax(scores * case.bmm1_scale, dim=-1)
+                probabilities = torch.softmax(scores * case.softmax_scale, dim=-1)
                 output = (
-                    probabilities @ visible_cache[:, :_LATENT_DIM] * case.bmm2_scale
+                    probabilities @ visible_cache[:, :_LATENT_DIM] * case.output_scale
                 )
             request_outputs.append(output)
         if request_outputs:
@@ -762,8 +764,8 @@ def _run_case(wrapper, case, *, qo_indptr=None, out=None, validate=True, **kwarg
         case.block_tables,
         case.seq_lens,
         qo_indptr=qo_indptr,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         out=out,
         validate=validate,
         **kwargs,
@@ -834,8 +836,8 @@ def _run_standalone(
         qo_indptr=qo_indptr,
         max_seq_len_q=resolved_max_seq_len_q,
         out=output,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         mask_type=case.mask_type,
         out_dtype=case.output_dtype,
     )
@@ -1134,8 +1136,8 @@ def _empty_mla_runtime() -> mla_decode_module._MLARuntime:
         normalized_cache=torch.empty(8),
         out=torch.empty(8),
         num_physical_pages=1,
-        bmm1_scale=1.0,
-        bmm2_scale=1.0,
+        softmax_scale=1.0,
+        output_scale=1.0,
     )
 
 
@@ -1233,8 +1235,8 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "block_tables",
         "seq_lens",
         "qo_indptr",
-        "bmm1_scale",
-        "bmm2_scale",
+        "softmax_scale",
+        "output_scale",
         "out",
         "lse",
         "return_lse",
@@ -1890,8 +1892,8 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
         max_seq_len_q=max_seq_len_q,
         mask_type=case.mask_type,
         max_kv_len=case.max_seq_len,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         out_dtype=case.output_dtype,
     )
     _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
@@ -1906,8 +1908,8 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
             qo_indptr=qo_indptr,
             mask_type=case.mask_type,
             max_kv_len=case.max_seq_len,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
             out_dtype=case.output_dtype,
         )
 
@@ -2211,7 +2213,7 @@ def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
 
 
 @pytest.mark.parametrize(
-    "page_size", (16, 32, 64, 128), ids=lambda value: f"page{value}"
+    "page_size", (4, 8, 16, 32, 64, 128), ids=lambda value: f"page{value}"
 )
 @pytest.mark.parametrize(
     "qkv_dtype",
@@ -2252,7 +2254,7 @@ def test_attention_ts_mla_decode_page_size_dtype_product(
 
 
 @pytest.mark.parametrize(
-    "page_size", (16, 32, 64, 128), ids=lambda value: f"page{value}"
+    "page_size", (4, 8, 16, 32, 64, 128), ids=lambda value: f"page{value}"
 )
 @pytest.mark.parametrize(
     "qkv_dtype",
@@ -2654,8 +2656,8 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
         max_seq_len_q=max_seq_len_q,
         mask_type=case.mask_type,
         max_kv_len=case.max_seq_len,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         out_dtype=case.output_dtype,
     )
     _assert_case_correct(one_shot, case, policy, qo_indptr=qo_indptr)
@@ -2739,8 +2741,8 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
         max_seq_len_q=max_seq_len_q,
         mask_type=case.mask_type,
         max_kv_len=case.max_seq_len,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         out=one_shot_out,
         out_dtype=case.output_dtype,
     )
@@ -2913,8 +2915,8 @@ def test_attention_ts_mla_replanned_sizes(heads, dtype, packed_query):
                 case.block_tables,
                 case.seq_lens,
                 qo_indptr=qo_indptr,
-                bmm1_scale=case.bmm1_scale,
-                bmm2_scale=case.bmm2_scale,
+                softmax_scale=case.softmax_scale,
+                output_scale=case.output_scale,
                 out=out,
                 validate=validate,
             )
@@ -2974,8 +2976,8 @@ def test_attention_ts_mla_standalone_reuses_caller_workspace():
             qk_rope_head_dim=64,
             max_kv_len=sk,
             workspace_buffer=workspace,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
         )
         expected = _mla_reference(case, num_insts_kv=1, tile_size_kv=128, splits_kv=1)
         torch.testing.assert_close(output.float(), expected, rtol=0.02, atol=0.02)
@@ -3026,8 +3028,8 @@ def test_attention_ts_mla_runtime_sm_split_ceiling(dtype):
             case.kv_cache,
             case.block_tables,
             case.seq_lens,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
         )
         policy = dict(wrapper._plan_state.policy)
         assert 128 < policy["split_kv"] <= sms
@@ -3068,7 +3070,7 @@ def test_mla_final_lse(dtype, heads, nq, nk, packed, mode):
         qb = query[int(offsets[b]) : int(offsets[b + 1])] if packed else query[b]
         pages = case.block_tables[b, : (n + 31) // 32].long()
         kv = case.kv_cache[pages, 0].reshape(-1, 576)[:n].float()
-        scores = torch.einsum("qhd,kd->qhk", qb.float(), kv) * case.bmm1_scale
+        scores = torch.einsum("qhd,kd->qhk", qb.float(), kv) * case.softmax_scale
         keys = torch.arange(n, device="cuda")
         end = torch.arange(qb.shape[0], device="cuda") + n - qb.shape[0]
         scores.masked_fill_(keys[None, None] > end[:, None, None], -torch.inf)
@@ -3135,8 +3137,8 @@ def test_mla_runtime_count_changes(dtype, heads, batch, kv):
             case.kv_cache,
             case.block_tables,
             case.seq_lens,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
             out=out,
             lse=lse,
             return_lse=True,
@@ -3156,8 +3158,8 @@ def test_mla_runtime_count_changes(dtype, heads, batch, kv):
             case.kv_cache,
             case.block_tables,
             case.seq_lens,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
             out=out,
             lse=lse,
             validate=False,

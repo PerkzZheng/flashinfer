@@ -164,8 +164,8 @@ class _DecodeRuntime:
     v_page_stride: int
     v_head_stride: int
     v_token_stride: int
-    bmm1_scale: float
-    bmm2_scale: float
+    softmax_scale: float
+    output_scale: float
 
 
 @dataclass(frozen=True)
@@ -1236,6 +1236,7 @@ def _resolve_decode_launch_spec(
 
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
+        _select_auto_split_kv_reduction_mode,
         arch_config_args,
         get_max_active_clusters_for_cluster_size,
         make_decode_config,
@@ -1425,6 +1426,18 @@ def _resolve_decode_launch_spec(
         cfg = replace(
             cfg, splits_kv=capacity, max_splits_kv=capacity, runtime_split_kv=True
         )
+        if cfg.use_cluster_smem_reduction and capacity != requested_splits:
+            # Rounding can move a previously one-wave cluster grid beyond
+            # residency. Reuse the normal fallback with the launched capacity.
+            with torch.cuda.device(device_index):
+                cfg, _ = _select_auto_split_kv_reduction_mode(
+                    cfg,
+                    seq_len_q=seq_len_q,
+                    batch_size=batch_size,
+                    num_heads_q=num_qo_heads,
+                    num_heads_kv=num_kv_heads,
+                    preserve_exact_cluster_fanout=True,
+                )
     _validate_decode_policy_kv_tile_size(cfg)
     resolved = _decode_launch_spec_from_config(
         cfg,
@@ -1587,8 +1600,8 @@ def _get_compiled_decode(
         v_page_stride: cutlass.Int64,
         v_head_stride: cutlass.Int64,
         v_token_stride: cutlass.Int64,
-        bmm1_scale: cutlass.Float32,
-        bmm2_scale: cutlass.Float32,
+        softmax_scale: cutlass.Float32,
+        output_scale: cutlass.Float32,
         requested_splits: cutlass.Int32,
         direct_q1_inputs: tuple,
         runtime_max_kv_len: cutlass.Int32,
@@ -1672,8 +1685,8 @@ def _get_compiled_decode(
             partial_stats.iterator,
             split_kv_counter.iterator,
             attention_sinks.iterator,
-            bmm1_scale,
-            bmm2_scale,
+            softmax_scale,
+            output_scale,
             Int32(0),
             Int32(static_max_active_clusters),
             stream,
@@ -1712,8 +1725,8 @@ def _get_compiled_decode(
             partial_o: cute.Tensor,
             partial_stats: cute.Tensor,
             attention_sinks: cute.Tensor,
-            bmm1_scale: cutlass.Float32,
-            bmm2_scale: cutlass.Float32,
+            softmax_scale: cutlass.Float32,
+            output_scale: cutlass.Float32,
             requested_splits: cutlass.Int32,
             direct_q1_inputs: tuple,
             runtime_max_kv_len: cutlass.Int32,
@@ -1766,8 +1779,8 @@ def _get_compiled_decode(
                 partial_o.iterator,
                 partial_stats.iterator,
                 attention_sinks.iterator,
-                bmm1_scale,
-                bmm2_scale,
+                softmax_scale,
+                output_scale,
                 stream,
                 static_cfg,
                 static_full_split_prefix,
@@ -2147,8 +2160,8 @@ def _prepare_decode_runtime(
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
     output_dtype: torch.dtype,
-    bmm1_scale: Optional[float],
-    bmm2_scale: float,
+    softmax_scale: Optional[float],
+    output_scale: float,
     out: Optional[torch.Tensor],
     kv_layout: str = "HND",
 ) -> _DecodeRuntime:
@@ -2195,11 +2208,11 @@ def _prepare_decode_runtime(
         k_cache=k_cache,
         logical_head_dim=head_dim,
     )
-    effective_bmm1_scale = _validate_scale(
-        1.0 / math.sqrt(head_dim) if bmm1_scale is None else bmm1_scale,
-        "bmm1_scale",
+    effective_softmax_scale = _validate_scale(
+        1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale,
+        "softmax_scale",
     )
-    effective_bmm2_scale = _validate_scale(bmm2_scale, "bmm2_scale")
+    effective_output_scale = _validate_scale(output_scale, "output_scale")
     output_shape = _decode_output_shape(
         batch_size=batch_size,
         num_qo_heads=num_qo_heads,
@@ -2232,8 +2245,8 @@ def _prepare_decode_runtime(
         v_page_stride=normalized_cache.v_page_stride,
         v_head_stride=normalized_cache.v_head_stride,
         v_token_stride=normalized_cache.v_token_stride,
-        bmm1_scale=effective_bmm1_scale,
-        bmm2_scale=effective_bmm2_scale,
+        softmax_scale=effective_softmax_scale,
+        output_scale=effective_output_scale,
     )
 
 
@@ -2278,8 +2291,8 @@ def _launch_decode(
         runtime.v_page_stride,
         runtime.v_head_stride,
         runtime.v_token_stride,
-        runtime.bmm1_scale,
-        runtime.bmm2_scale,
+        runtime.softmax_scale,
+        runtime.output_scale,
         requested_splits,
         (),
         runtime_max_kv_len,
@@ -2293,8 +2306,8 @@ def _launch_decode(
             workspace.partial_o,
             workspace.partial_stats,
             sinks,
-            runtime.bmm1_scale,
-            runtime.bmm2_scale,
+            runtime.softmax_scale,
+            runtime.output_scale,
             requested_splits,
             (),
             runtime_max_kv_len,
@@ -2357,8 +2370,8 @@ def _prepare_decode_runtime_unchecked(
     kv_scale_factors: Optional[PagedKVScaleFactors],
     *,
     output_dtype: torch.dtype,
-    bmm1_scale: Optional[float],
-    bmm2_scale: float,
+    softmax_scale: Optional[float],
+    output_scale: float,
     out: Optional[torch.Tensor],
     kv_layout: str = "HND",
 ) -> _DecodeRuntime:
@@ -2397,12 +2410,12 @@ def _prepare_decode_runtime_unchecked(
         v_page_stride=int(v_cache.stride(0)),
         v_head_stride=int(v_cache.stride(1)),
         v_token_stride=int(v_cache.stride(2)),
-        bmm1_scale=(
+        softmax_scale=(
             1.0 / math.sqrt(int(q.shape[-1]))
-            if bmm1_scale is None
-            else float(bmm1_scale)
+            if softmax_scale is None
+            else float(softmax_scale)
         ),
-        bmm2_scale=float(bmm2_scale),
+        output_scale=float(output_scale),
     )
 
 
@@ -2553,8 +2566,8 @@ class PrimsTSBatchDecodePlan:
         query: torch.Tensor,
         *,
         out: torch.Tensor,
-        bmm1_scale: Optional[float] = None,
-        bmm2_scale: float = 1.0,
+        softmax_scale: Optional[float] = None,
+        output_scale: float = 1.0,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
         attention_sinks: Optional[torch.Tensor] = None,
@@ -2595,10 +2608,10 @@ class PrimsTSBatchDecodePlan:
             )
 
         scale_qk = _validate_scale(
-            1.0 / math.sqrt(self._head_dim) if bmm1_scale is None else bmm1_scale,
-            "bmm1_scale",
+            1.0 / math.sqrt(self._head_dim) if softmax_scale is None else softmax_scale,
+            "softmax_scale",
         )
-        scale_v = _validate_scale(bmm2_scale, "bmm2_scale")
+        scale_v = _validate_scale(output_scale, "output_scale")
         lse = prepare_lse(
             lse, q=query, mode=self._lse_mode, return_lse=return_lse, validate=validate
         )
@@ -4110,8 +4123,8 @@ class BatchDecodePagedTSWrapper:
         *,
         kv_scale_factors: Optional[PagedKVScaleFactors] = None,
         qo_indptr: Optional[torch.Tensor] = None,
-        bmm1_scale: Optional[float] = None,
-        bmm2_scale: float = 1.0,
+        softmax_scale: Optional[float] = None,
+        output_scale: float = 1.0,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -4132,8 +4145,8 @@ class BatchDecodePagedTSWrapper:
 
         Supply seq_lens on every run unless plan() owns its CUDA copy. Packed queries require qo_indptr; fixed Q
         rejects it under validation. Q/K/V dtypes, cache layout and model semantics
-        must match plan(). bmm1_scale is the finite positive host effective QK scale
-        (default 1/sqrt(D)); bmm2_scale is the host V/output scale (default 1).
+        must match plan(). softmax_scale is the finite positive host effective QK scale
+        (default 1/sqrt(D)); output_scale is the host V/output scale (default 1).
 
         Enabled attention_sinks requires compact CUDA FP32 [Hq] natural-log logits
         after QK scaling. Values must be finite or -inf and add zero V contribution;
@@ -4199,8 +4212,8 @@ class BatchDecodePagedTSWrapper:
                 k_dtype=state.k_dtype,
                 v_dtype=state.v_dtype,
                 output_dtype=state.output_dtype,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
                 out=out,
                 kv_layout=self._kv_layout,
             )
@@ -4223,8 +4236,8 @@ class BatchDecodePagedTSWrapper:
                 paged_kv_cache,
                 kv_scale_factors,
                 output_dtype=state.output_dtype,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=bmm2_scale,
+                softmax_scale=softmax_scale,
+                output_scale=output_scale,
                 out=out,
                 kv_layout=self._kv_layout,
             )
@@ -4272,8 +4285,8 @@ def batch_decode_with_paged_kv_cache(
     mask_type: Literal["dense", "causal"] = "dense",
     window_left: int = -1,
     kv_layout: Literal["HND", "NHD"] = "HND",
-    bmm1_scale: Optional[float] = None,
-    bmm2_scale: float = 1.0,
+    softmax_scale: Optional[float] = None,
+    output_scale: float = 1.0,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
@@ -4332,7 +4345,7 @@ def batch_decode_with_paged_kv_cache(
         Left sliding-window extent, or ``-1`` to disable the window.
     kv_layout : {"HND", "NHD"}
         Layout of the paged K/V cache.
-    bmm1_scale, bmm2_scale : float, optional
+    softmax_scale, output_scale : float, optional
         QK and value/output scaling factors.
     out : torch.Tensor, optional
         Caller-owned output tensor.
@@ -4529,8 +4542,8 @@ def batch_decode_with_paged_kv_cache(
         block_tables,
         kv_scale_factors=kv_scale_factors,
         qo_indptr=qo_indptr,
-        bmm1_scale=bmm1_scale,
-        bmm2_scale=bmm2_scale,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
         out=out,
         lse=lse,
         return_lse=return_lse,

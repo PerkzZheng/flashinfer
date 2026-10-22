@@ -183,7 +183,7 @@ def _validate_prims_ts_context_samples(
     kv_indptr,
     num_qo_heads,
     num_kv_heads,
-    sm_scale,
+    softmax_scale,
     output_scale,
     causal,
     paged_kv_indices=None,
@@ -249,7 +249,9 @@ def _validate_prims_ts_context_samples(
             v_matrix = v_matrix[:visible_kv]
 
         q_vector = q[q_begin + query_idx, query_head].float()
-        probabilities = torch.softmax(torch.mv(k_matrix, q_vector) * sm_scale, dim=0)
+        probabilities = torch.softmax(
+            torch.mv(k_matrix, q_vector) * softmax_scale, dim=0
+        )
         expected = torch.matmul(probabilities, v_matrix) * output_scale
         actual = out[q_begin + query_idx, query_head].float()
         difference = actual - expected
@@ -1106,7 +1108,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
     prims_ts_kv_cache = None
     prims_ts_kv_scale_factors = None
     prims_ts_out = None
-    prims_ts_bmm2_scale = None
+    prims_ts_output_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
         prims_ts_mask_type = (
@@ -1142,7 +1144,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 kv_cache_for_trt[:, 1].copy_(v_dequant)
         else:
             prims_ts_kv_cache = kv_cache.contiguous()
-        prims_ts_bmm2_scale = 1.0 if prims_ts_v_scale is None else prims_ts_v_scale
+        prims_ts_output_scale = 1.0 if prims_ts_v_scale is None else prims_ts_v_scale
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
         backend_wrappers["prims-ts"].plan(
@@ -1250,8 +1252,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 kv_scale_factors=prims_ts_kv_scale_factors,
-                bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=prims_ts_bmm2_scale,
+                softmax_scale=scale if k_scale is None else k_scale * scale,
+                output_scale=prims_ts_output_scale,
                 out=out,
                 validate=False,
             )
@@ -1343,8 +1345,8 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 None,
                 block_tables,
                 kv_scale_factors=prims_ts_kv_scale_factors,
-                bmm1_scale=scale if k_scale is None else k_scale * scale,
-                bmm2_scale=prims_ts_bmm2_scale,
+                softmax_scale=scale if k_scale is None else k_scale * scale,
+                output_scale=prims_ts_output_scale,
                 out=prims_ts_out,
                 validate=False,
             ),
@@ -1879,7 +1881,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
 
     prims_ts_k_cache = None
     prims_ts_out = None
-    prims_ts_sm_scale = None
+    prims_ts_softmax_scale = None
     prims_ts_output_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
@@ -1891,7 +1893,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         _q_scale = q_scale if q_scale is not None else 1.0
         _k_scale = k_scale if k_scale is not None else 1.0
         _v_scale = prims_ts_v_scale if prims_ts_v_scale is not None else 1.0
-        prims_ts_sm_scale = _q_scale * _k_scale * scale
+        prims_ts_softmax_scale = _q_scale * _k_scale * scale
         prims_ts_output_scale = _v_scale
         backend_wrappers_prims_ts.plan(
             device=device,
@@ -1907,7 +1909,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             out_dtype=o_data_type,
             page_size=page_size,
             mask_type="causal" if causal else "dense",
-            sm_scale=prims_ts_sm_scale,
+            softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             uniform_packed_lengths=not args.random_actual_seq_len,
             has_q_offset=causal and s_qo != s_kv,
@@ -2231,7 +2233,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             kv_indptr=kv_indptr,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
-            sm_scale=prims_ts_sm_scale,
+            softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             causal=causal,
             paged_kv_indices=kv_indices,
@@ -2266,7 +2268,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     kv_indptr=kv_indptr,
                     num_qo_heads=num_qo_heads,
                     num_kv_heads=num_kv_heads,
-                    sm_scale=prims_ts_sm_scale,
+                    softmax_scale=prims_ts_softmax_scale,
                     output_scale=prims_ts_output_scale,
                     causal=causal,
                     paged_kv_indices=kv_indices,
@@ -2846,7 +2848,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         v = (v / v_scale).to(kv_dtype)
 
     prims_ts_out = None
-    prims_ts_sm_scale = None
+    prims_ts_softmax_scale = None
     prims_ts_output_scale = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
@@ -2860,7 +2862,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
         _q_scale = q_scale if q_scale is not None else 1.0
         _k_scale = k_scale if k_scale is not None else 1.0
         _v_scale = v_scale if v_scale is not None else 1.0
-        prims_ts_sm_scale = _q_scale * _k_scale * scale
+        prims_ts_softmax_scale = _q_scale * _k_scale * scale
         prims_ts_output_scale = _v_scale
         backend_wrappers["prims-ts"] = prims_ts.BatchPrefillTSWrapper()
         backend_wrappers["prims-ts"].plan(
@@ -2876,7 +2878,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             k_dtype=k.dtype,
             packed=True,
             mask_type="causal" if causal else "dense",
-            sm_scale=prims_ts_sm_scale,
+            softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             out_dtype=out_dtype,
         )
@@ -3147,7 +3149,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             kv_indptr=kv_indptr,
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
-            sm_scale=prims_ts_sm_scale,
+            softmax_scale=prims_ts_softmax_scale,
             output_scale=prims_ts_output_scale,
             causal=causal,
         )
@@ -3179,7 +3181,7 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                     kv_indptr=kv_indptr,
                     num_qo_heads=num_qo_heads,
                     num_kv_heads=num_kv_heads,
-                    sm_scale=prims_ts_sm_scale,
+                    softmax_scale=prims_ts_softmax_scale,
                     output_scale=prims_ts_output_scale,
                     causal=causal,
                 )
@@ -3794,8 +3796,8 @@ def testBatchMLAPagedAttentionWrapper(args):
                     kv_cache,
                     block_tables,
                     actual_seq_lens_kv.flatten(),
-                    bmm1_scale=sm_scale,
-                    bmm2_scale=1.0,
+                    softmax_scale=sm_scale,
+                    output_scale=1.0,
                     out=out,
                     validate=False,
                 )
@@ -3946,8 +3948,8 @@ def testBatchMLAPagedAttentionWrapper(args):
                 kv_cache,
                 block_tables,
                 actual_seq_lens_kv.flatten(),
-                bmm1_scale=sm_scale,
-                bmm2_scale=1.0,
+                softmax_scale=sm_scale,
+                output_scale=1.0,
                 out=prims_ts_out,
                 validate=False,
             ),

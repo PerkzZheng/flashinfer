@@ -400,8 +400,8 @@ class _DecodeCase:
     reference_real: torch.Tensor
     output_dtype: torch.dtype
     mask_type: str
-    bmm1_scale: float
-    bmm2_scale: float
+    softmax_scale: float
+    output_scale: float
     q_scale: float
     k_scale: float
     v_scale: float
@@ -633,8 +633,8 @@ def _fp8_decode_reference(
     paged_kv_indices: torch.Tensor,
     paged_kv_last_page_len: torch.Tensor,
     *,
-    bmm1_scale: float,
-    bmm2_scale: float,
+    softmax_scale: float,
+    output_scale: float,
     output_dtype: torch.dtype,
     o_scale: float,
     mask_type: str,
@@ -786,7 +786,7 @@ def _fp8_decode_reference(
                         else local_max
                     )
                     probabilities = (
-                        torch.exp((tile_scores - new_max.unsqueeze(-1)) * bmm1_scale)
+                        torch.exp((tile_scores - new_max.unsqueeze(-1)) * softmax_scale)
                         * probability_scale
                     )
                     quantized_probabilities = probabilities.to(_FP8).float()
@@ -798,7 +798,7 @@ def _fp8_decode_reference(
                     )
                     if stream_valid[stream_idx]:
                         correction = torch.exp(
-                            (stream_max[stream_idx] - new_max) * bmm1_scale
+                            (stream_max[stream_idx] - new_max) * softmax_scale
                         )
                         stream_sum[stream_idx] = (
                             stream_sum[stream_idx] * correction + local_sum
@@ -831,10 +831,10 @@ def _fp8_decode_reference(
             final_sum = torch.zeros_like(final_max)
             final_acc = torch.zeros_like(stream_acc[0])
             for maximum, denominator, accumulator in valid_streams:
-                correction = torch.exp((maximum - final_max) * bmm1_scale)
+                correction = torch.exp((maximum - final_max) * softmax_scale)
                 final_sum += denominator * correction
                 final_acc += accumulator * correction.unsqueeze(-1)
-            output_real = final_acc / final_sum.unsqueeze(-1) * bmm2_scale
+            output_real = final_acc / final_sum.unsqueeze(-1) * output_scale
             output_real = output_real.to(output_dtype).float() * o_scale
             if packed_q:
                 output[q_begin + query_idx] = output_real
@@ -916,8 +916,8 @@ def _make_decode_case(
         raise ValueError("cache_form must be 'combined' or 'tuple'")
 
     sm_scale = 1.0 / math.sqrt(head_dim)
-    bmm1_scale = sm_scale * q_scale * k_scale
-    bmm2_scale = v_scale / o_scale
+    softmax_scale = sm_scale * q_scale * k_scale
+    output_scale = v_scale / o_scale
     if qkv_dtype == _FP8:
         reference = _fp8_decode_reference(
             q,
@@ -926,8 +926,8 @@ def _make_decode_case(
             indptr_tensor,
             indices_tensor,
             last_page_lens,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
             output_dtype=output_dtype,
             o_scale=o_scale,
             mask_type=mask_type,
@@ -961,8 +961,8 @@ def _make_decode_case(
         reference_real=reference,
         output_dtype=output_dtype,
         mask_type=mask_type,
-        bmm1_scale=bmm1_scale,
-        bmm2_scale=bmm2_scale,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
@@ -1118,7 +1118,7 @@ def _make_mixed_precision_decode_case(
         dtype=torch.int32,
         device=device,
     )
-    bmm1_scale = 1.0 / math.sqrt(head_dim)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
     if q_dtype == _FP8:
         reference = _fp8_decode_reference(
             q,
@@ -1127,8 +1127,8 @@ def _make_mixed_precision_decode_case(
             indptr,
             indices,
             last_page_len,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=1.0,
+            softmax_scale=softmax_scale,
+            output_scale=1.0,
             output_dtype=output_dtype,
             o_scale=1.0,
             mask_type="dense",
@@ -1143,7 +1143,7 @@ def _make_mixed_precision_decode_case(
             indptr,
             indices,
             last_page_len,
-            sm_scale=bmm1_scale,
+            sm_scale=softmax_scale,
             q_scale=1.0,
             k_scale=1.0,
             v_scale=1.0,
@@ -1166,8 +1166,8 @@ def _make_mixed_precision_decode_case(
             reference_real=reference,
             output_dtype=output_dtype,
             mask_type="dense",
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=1.0,
+            softmax_scale=softmax_scale,
+            output_scale=1.0,
             q_scale=1.0,
             k_scale=1.0,
             v_scale=1.0,
@@ -1686,8 +1686,8 @@ def _run_case(
         case.block_tables,
         qo_indptr=qo_indptr,
         kv_scale_factors=kv_scale_factors,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         out=out,
         validate=validate,
     )
@@ -1748,8 +1748,8 @@ def _run_standalone(
         seq_len_q=seq_len_q,
         qo_indptr=qo_indptr,
         max_seq_len_q=max_seq_len_q,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         out=output,
         out_dtype=case.output_dtype,
         mask_type=case.mask_type,
@@ -1874,8 +1874,8 @@ def _with_reference(
             case.paged_kv_indptr,
             case.paged_kv_indices,
             case.paged_kv_last_page_len,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
             output_dtype=case.output_dtype,
             o_scale=case.o_scale,
             mask_type=case.mask_type,
@@ -2547,8 +2547,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "mask_type",
         "window_left",
         "kv_layout",
-        "bmm1_scale",
-        "bmm2_scale",
+        "softmax_scale",
+        "output_scale",
         "out",
         "lse",
         "return_lse",
@@ -2601,8 +2601,8 @@ def test_attention_ts_decode_wrapper_has_compile_oriented_contract() -> None:
         "block_tables",
         "kv_scale_factors",
         "qo_indptr",
-        "bmm1_scale",
-        "bmm2_scale",
+        "softmax_scale",
+        "output_scale",
         "out",
         "lse",
         "return_lse",
@@ -3087,8 +3087,8 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
         plan.run(
             dynamic_q,
             out=eager_out,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
         )
         is eager_out
     )
@@ -3101,8 +3101,8 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
         captured = plan.run(
             dynamic_q,
             out=graph_out,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
         )
     assert captured is graph_out
     graph.replay()
@@ -3114,8 +3114,8 @@ def test_attention_ts_decode_prepared_dynamic_block_table_eager_and_graph() -> N
         plan.run(
             dynamic_q[:4],
             out=graph_out,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
         )
 
 
@@ -3196,8 +3196,8 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
         seq_lens,
         workspace_buffer=workspace,
         max_kv_len=2051,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         out=output,
         out_dtype=torch.bfloat16,
         mask_type="causal",
@@ -3212,8 +3212,8 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
         block_table,
         seq_lens,
         mask_type="causal",
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         page_size=4,
     )
     _assert_case_correct(one_shot, case)
@@ -3425,8 +3425,8 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
         result = plan.run(
             case.q,
             out=prepared_output,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
         )
         torch.cuda.synchronize()
     finally:
@@ -3626,8 +3626,8 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
         plan.run(
             case.q,
             out=prepared_output,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
         )
         torch.cuda.synchronize()
     finally:
@@ -3663,7 +3663,7 @@ def test_attention_ts_decode_q4_keeps_kv128_d256_page_membership(
             scores = torch.einsum(
                 "hd,khd->hk", case.q[batch_idx, query_idx].float(), keys.float()
             )
-            probabilities = torch.softmax(scores * case.bmm1_scale, dim=-1)
+            probabilities = torch.softmax(scores * case.softmax_scale, dim=-1)
             reference[batch_idx, query_idx] = torch.einsum(
                 "hk,khd->hd", probabilities, values.float()
             )
@@ -4408,20 +4408,25 @@ def test_attention_ts_nvfp4_cache_contract():
     [1, 4, 8],
     ids=lambda value: f"q{value}",
 )
-@pytest.mark.parametrize("head_dim", [64, 128, 256], ids=lambda value: f"d{value}")
 @pytest.mark.parametrize(
     ("num_qo_heads", "num_kv_heads"),
     [(32, 4)],
     ids=["gqa32x4"],
 )
 @pytest.mark.parametrize(
-    "page_size",
-    [64],
-    ids=lambda value: f"p{value}",
-)
-@pytest.mark.parametrize(
-    "qkv_dtype",
-    ["bf16q-fp8kv", "bf16q-nvfp4kv", "fp8q-nvfp4kv", "fp8q-nvfp4kv-bf16o"],
+    "head_dim,page_size,qkv_dtype",
+    [
+        pytest.param(d, p, kind, id=f"d{d}-p{p}-{kind}")
+        for d in (64, 128, 256)
+        for p in (16, 64)
+        for kind in (
+            "bf16q-fp8kv",
+            "bf16q-nvfp4kv",
+            "fp8q-nvfp4kv",
+            "fp8q-nvfp4kv-bf16o",
+        )
+        if not (d == 64 and p == 16 and "nvfp4" in kind)
+    ],
 )
 def test_attention_ts_decode_mixed_precision(
     batch_size: int,
@@ -4495,8 +4500,8 @@ def test_attention_ts_decode_mixed_precision(
             case.seq_lens,
             case.block_tables,
             kv_scale_factors=kv_scale_factors,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
             validate=validate,
         )
         _assert_case_correct(output, case)
@@ -4512,8 +4517,8 @@ def test_attention_ts_decode_mixed_precision(
         ),
         kv_scale_factors=kv_scale_factors,
         seq_len_q=seq_len_q,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         out_dtype=case.output_dtype,
     )
     _assert_case_correct(one_shot, case)
@@ -4547,8 +4552,8 @@ def test_attention_ts_decode_mixed_precision(
             seq_lens,
             kv_scale_factors=kv_scale_factors,
             seq_len_q=seq_len_q,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
             out=explicit_out,
             workspace_buffer=workspace,
             max_kv_len=seq_len_kv,
@@ -4625,8 +4630,8 @@ def test_attention_ts_decode_mixed_precision_more_loaders_than_pages(
         case.seq_lens,
         case.block_tables,
         kv_scale_factors=kv_scale_factors,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
     )
     _assert_case_correct(output, case)
 
@@ -5408,6 +5413,45 @@ def _make_auto_kv_tile_config(monkeypatch, **overrides):
     return fmha_decode_config.make_decode_config(**{**kwargs, **overrides})
 
 
+def test_attention_ts_decode_cluster_residency_uses_split_capacity(monkeypatch):
+    """Rounded split buckets must still fit the cluster policy's resident wave."""
+    from contextlib import nullcontext
+
+    _mock_decode_hardware(monkeypatch)
+    monkeypatch.setattr(torch.cuda, "device", lambda *_a, **_k: nullcontext())
+    monkeypatch.setattr(
+        fmha_decode_config,
+        "get_max_active_clusters_for_cluster_size",
+        lambda size: 152 // size,
+    )
+    spec = _resolve_decode_launch_spec.__wrapped__(
+        0,
+        32,
+        16,
+        1,
+        128,
+        64,
+        8192,
+        4,
+        "float8_e4m3fn",
+        "float8_e4m3fn",
+        "float8_e4m3fn",
+        "float16",
+        "HND",
+        "causal",
+        False,
+        -1,
+    )
+    cfg = spec.config
+    q_tiles = fmha_decode_config.make_q_tile_geometry(
+        rows_per_cta=cfg.tile_size_q,
+        heads_q_per_kv=16,
+        groups_tokens_heads_q=cfg.groups_tokens_heads_q,
+    ).num_q_ctas(4)
+    assert not cfg.use_cluster_smem_reduction or 32 * q_tiles <= 152 // cfg.splits_kv
+    assert spec.requested_splits <= cfg.max_splits_kv
+
+
 @pytest.mark.parametrize("dtype", (BFloat16, Float16))
 def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
     """A Q64 cost-model result promotes both qualified 16-bit dtypes."""
@@ -5507,9 +5551,9 @@ def test_attention_ts_decode_auto_config_selects_kv256(monkeypatch, dtype):
             32,
             128,
             False,
-            1,
-            False,
-            ("q", "kv", "launch"),
+            2,
+            True,
+            ("q", "kv"),
             id="variable-q",
         ),
         pytest.param(
@@ -6546,7 +6590,7 @@ def test_attention_ts_decode_mixed_kv_dtype_accuracy(
             v_cache=v_cache,
             paged_kv_cache=(case.k_cache, v_cache),
             v_scale=v_scale,
-            bmm2_scale=v_scale / case.o_scale,
+            output_scale=v_scale / case.o_scale,
         )
     )
 
@@ -7132,8 +7176,8 @@ def test_attention_ts_decode_packed_q_sliding_window_public_parity():
         max_seq_len_q=max_seq_len_q,
         mask_type=case.mask_type,
         window_left=case.window_left,
-        bmm1_scale=case.bmm1_scale,
-        bmm2_scale=case.bmm2_scale,
+        softmax_scale=case.softmax_scale,
+        output_scale=case.output_scale,
         out_dtype=case.output_dtype,
     )
     _assert_case_correct(one_shot, case)
@@ -7651,12 +7695,13 @@ def test_attention_ts_decode_head_dim_gqa_product(
 
 
 @pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")
-@pytest.mark.parametrize("head_ratio", (33, 65), ids=lambda value: f"gqa{value}")
+@pytest.mark.parametrize("head_ratio,page_size", ((33, 8), (65, 64)))
 @pytest.mark.parametrize("output_dtype", (_FP8, torch.bfloat16))
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_decode_wide_fp8_gqa_accuracy(
     head_dim: int,
     head_ratio: int,
+    page_size: int,
     output_dtype: torch.dtype,
 ):
     """Check partial head bands and 16-bit output against the FP8 reference."""
@@ -7667,7 +7712,7 @@ def test_attention_ts_decode_wide_fp8_gqa_accuracy(
         num_kv_heads=1,
         head_dim=head_dim,
         seq_len_q=1,
-        page_size=32,
+        page_size=page_size,
         qkv_dtype=_FP8,
         output_dtype=output_dtype,
         cache_form="combined",
@@ -8772,8 +8817,8 @@ def test_attention_ts_decode_replanned_sizes(dtype, packed_query, layout):
                 seq_lens,
                 case.block_tables,
                 qo_indptr=qo_indptr,
-                bmm1_scale=case.bmm1_scale,
-                bmm2_scale=case.bmm2_scale,
+                softmax_scale=case.softmax_scale,
+                output_scale=case.output_scale,
                 out=out,
                 validate=validate,
             )
@@ -8834,27 +8879,29 @@ def test_attention_ts_decode_standalone_reuses_caller_workspace():
             lengths,
             workspace_buffer=workspace,
             max_kv_len=sk,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
         )
         _assert_case_correct(output, case)
 
 
 @_REQUIRES_PRIMTS_GPU
 @pytest.mark.parametrize(
-    "dtype,dim,heads,nq,nk,packed,mode",
+    "dtype,dim,heads,nq,nk,packed,mode,page_size",
     (
-        (torch.bfloat16, 128, 8, 3, 257, False, "base2"),
-        (_FP8, 128, 32, 1, 8192, False, "base2"),
-        (torch.bfloat16, 128, 128, 1, 8192, False, "base2"),
-        (_FP8, 128, 128, 1, 8192, False, "base2"),
-        (torch.bfloat16, 64, 15, 9, 513, False, "base2"),
-        (_FP8, 64, 3, 9, 513, False, "base2"),
-        (torch.bfloat16, 128, 15, 9, 513, True, "base2"),
-        (_FP8, 256, 3, 9, 513, True, "base2"),
+        (torch.bfloat16, 128, 8, 3, 257, False, "base2", 4),
+        (_FP8, 128, 32, 1, 8192, False, "base2", 8),
+        (torch.bfloat16, 128, 128, 1, 8192, False, "base2", 16),
+        (_FP8, 128, 128, 1, 8192, False, "base2", 64),
+        (torch.bfloat16, 64, 15, 9, 513, False, "base2", 128),
+        (_FP8, 64, 3, 9, 513, False, "base2", 4),
+        (torch.bfloat16, 128, 15, 9, 513, True, "base2", 8),
+        (_FP8, 256, 3, 9, 513, True, "base2", 128),
     ),
 )
-def test_attention_ts_decode_final_statistics(dtype, dim, heads, nq, nk, packed, mode):
+def test_attention_ts_decode_final_statistics(
+    dtype, dim, heads, nq, nk, packed, mode, page_size
+):
     """NHD sinks/LSE exclude padded Q rows and refresh output on replay."""
     from tests.attention.test_attention_ts_context import _softmax_statistics_reference
 
@@ -8864,7 +8911,7 @@ def test_attention_ts_decode_final_statistics(dtype, dim, heads, nq, nk, packed,
         num_kv_heads=1,
         head_dim=dim,
         seq_len_q=nq,
-        page_size=32,
+        page_size=page_size,
         qkv_dtype=dtype,
         output_dtype=torch.float16 if dtype == _FP8 else dtype,
         cache_form="tuple",
@@ -8884,7 +8931,7 @@ def test_attention_ts_decode_final_statistics(dtype, dim, heads, nq, nk, packed,
         num_qo_heads=heads,
         num_kv_heads=1,
         head_dim=dim,
-        page_size=32,
+        page_size=page_size,
         q_data_type=dtype,
         o_data_type=case.output_dtype,
         mask_type="causal",
@@ -8895,16 +8942,16 @@ def test_attention_ts_decode_final_statistics(dtype, dim, heads, nq, nk, packed,
         max_seq_len_q=nq,
         packed_query=packed,
     )
-    pages = case.block_tables[0, : (nk + 31) // 32].long()
+    pages = case.block_tables[0, : (nk + page_size - 1) // page_size].long()
     k, v = (
         t[pages].transpose(1, 2).reshape(-1, 1, dim)[:nk]
         for t in (case.k_cache, case.v_cache)
     )
     q = case.q if packed or nq == 1 else case.q[0]
     ref, expected = _softmax_statistics_reference(
-        q, k, v, scale=case.bmm1_scale, sinks=sinks
+        q, k, v, scale=case.softmax_scale, sinks=sinks
     )
-    ref *= case.bmm2_scale
+    ref *= case.output_scale
     if nq != 1 and not packed:
         ref, expected = ref[None], expected[None]
     if mode == "base2":
@@ -8918,8 +8965,8 @@ def test_attention_ts_decode_final_statistics(dtype, dim, heads, nq, nk, packed,
             lengths,
             case.block_tables,
             qo_indptr=offsets,
-            bmm1_scale=case.bmm1_scale,
-            bmm2_scale=case.bmm2_scale,
+            softmax_scale=case.softmax_scale,
+            output_scale=case.output_scale,
             attention_sinks=sinks,
             **kwargs,
         )

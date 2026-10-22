@@ -1120,8 +1120,8 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
             "optional": True,
             "description": "Whether to validate per-run tensors and metadata values.",
         }
-        assert definition["inputs"]["bmm1_scale"]["optional"] is True
-        assert definition["inputs"]["bmm2_scale"]["optional"] is True
+        assert definition["inputs"]["softmax_scale"]["optional"] is True
+        assert definition["inputs"]["output_scale"]["optional"] is True
         assert definition["outputs"]["output"].get("optional") is None
     for definition in definitions:
         assert definition["axes"].get("seq_len_q", {}).get("value") == seq_len_q

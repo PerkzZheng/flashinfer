@@ -195,9 +195,13 @@ be no greater than the corresponding K/V length.
 
 For request `b`, bottom-right causal row `i` can see through
 `seq_len_k[b] - seq_len_q[b] + i`. A causal left window further retains the
-current key and at most `window_left` preceding keys. `bmm1_scale` defaults to
-`1 / sqrt(D)` and `bmm2_scale` defaults to 1; supplied scales must be finite,
+current key and at most `window_left` preceding keys. `softmax_scale` defaults to
+`1 / sqrt(D)` and `output_scale` defaults to 1; supplied scales must be finite,
 positive Python scalars representable as positive `float32` values.
+
+D64 NVFP4 K/V with page size 16 remains unsupported because its native staging
+produces a misaligned access. Other transformed profiles use the normal
+page-size and staging checks.
 
 ## Dataflow and source map
 

@@ -83,7 +83,7 @@ from cutlass.experimental.task_scheduling.resources import (
 from cutlass.experimental.task_scheduling.resources import consumer_work, producer_work
 
 
-_SUPPORTED_CONTEXT_PAGE_SIZES = (16, 32, 64, 128)
+_SUPPORTED_CONTEXT_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 from cutlass.pipeline import PipelineAsync, PipelineState
 from cutlass.cutlass_dsl import Boolean, Constexpr, dsl_user_op, if_generate
 
@@ -622,7 +622,8 @@ class FmhaConfig:
         window_entries = self.page_table_window_entries
         if (
             pages_per_tile <= 0
-            or pages_per_tile > window_entries
+            # A one-tile window cannot retain distinct K/V page IDs.
+            or pages_per_tile >= window_entries
             or window_entries % pages_per_tile != 0
         ):
             return False
@@ -1681,10 +1682,8 @@ class SmemPageOffsetsKvResource(MemoryResource):
         self._alloc = SmemAllocation(
             "smem_page_offsets_v" if page_table_is_v else "smem_page_offsets_k",
             size_bytes=total_entries * 4,
-            # Page-size 16 consumes eight page IDs per 128-token K/V tile.
-            # Align only that specialization for one 32-byte vector load;
-            # preserve the established layout for larger page sizes.
-            alignment=(32 if cfg.kv_tile_n // cfg.num_tokens_per_page == 8 else 16),
+            # Eight-ID vector loads also serve smaller pages in chunks.
+            alignment=(32 if cfg.kv_tile_n // cfg.num_tokens_per_page >= 8 else 16),
         )
         self._smem_page_offsets = _placeholder_smem_array(Int32, total_entries)
         self.cached_page_ids = TaskLocalVariable(
@@ -1743,13 +1742,18 @@ class SmemPageOffsetsKvResource(MemoryResource):
         stage_idx = self.state_src.consumer_work_stage
         group_page_idx = (tile_idx * Int32(pages_per_tile)) & Int32(window_entries - 1)
         offset = stage_idx * Int32(window_entries) + group_page_idx
-        if cutlass.const_expr(pages_per_tile == 8):
-            return self._smem_page_offsets.load(offset, vector_size=8, alignment=32)
-        if cutlass.const_expr(pages_per_tile == 4):
-            return self._smem_page_offsets.load(offset, vector_size=4, alignment=16)
-        if cutlass.const_expr(pages_per_tile == 2):
-            return self._smem_page_offsets.load(offset, vector_size=2, alignment=8)
-        return self._smem_page_offsets.load(offset, vector_size=1, alignment=4)
+        if cutlass.const_expr(pages_per_tile <= 8):
+            return self._smem_page_offsets.load(
+                offset, vector_size=pages_per_tile, alignment=pages_per_tile * 4
+            )
+        page_ids = cutlass.Array(Int32, pages_per_tile, space=cutlass.AddressSpace.rmem)
+        for chunk in cutlass.range_constexpr(pages_per_tile // 8):
+            values = self._smem_page_offsets.load(
+                offset + Int32(chunk * 8), vector_size=8, alignment=32
+            )
+            for i in cutlass.range_constexpr(8):
+                page_ids[chunk * 8 + i] = Int32(values[i])
+        return page_ids
 
     @cute.jit
     def _producer_load_page_offsets(

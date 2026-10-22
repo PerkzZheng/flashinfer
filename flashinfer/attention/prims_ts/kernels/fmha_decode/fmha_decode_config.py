@@ -3030,7 +3030,6 @@ class FmhaDecodeConfig:
                 (fixed_q1 or fixed_grouped_q)
                 and not self.use_variable_seqlens_q
                 and self.use_paged_kv
-                and self.num_tokens_per_page == 32
                 and self.mask_type in (DENSE, CAUSAL)
                 and not any(
                     (
@@ -4426,7 +4425,6 @@ def _apply_auto_grouped_q_mma_config(
         or seq_len_q <= 1
         or not cfg.groups_tokens_heads_q
         or not cfg.use_paged_kv
-        or cfg.num_tokens_per_page != 32
         or cfg.use_sliding_window_causal
     ):
         return None
@@ -4927,7 +4925,7 @@ def _validate_profile_support(
             groups_tokens_heads_q=True,
         )
     # Fixed FP8 Q8 producers and reducers support both 16-bit output types.
-    # D64/D256 retain their grouped page-32 geometry; head ratios and
+    # D64/D256 retain their grouped paged-KV geometry; head ratios and
     # variable-Q layouts remain constrained by the same resource profile.
     qualified_fp8_q8_separate_reduction_supported = (
         not use_keeps_mma_ab
@@ -4942,7 +4940,6 @@ def _validate_profile_support(
             or (
                 use_groups_tokens_heads_q
                 and cfg.use_paged_kv
-                and cfg.num_tokens_per_page == 32
                 and (
                     headdim == 64
                     or (headdim == 256 and cfg.out_dtype in (Float16, BFloat16))
@@ -5053,11 +5050,15 @@ def _validate_profile_support(
                 "packed ungrouped SwapsMmaAb does not support cluster SMEM reduction; "
                 "use grouped Q or a GMEM reduction mode"
             )
-    if cfg.use_transform_kv and cfg.use_paged_kv and cfg.num_tokens_per_page == 16:
-        raise ValueError(
-            "mixed Q/KV dtypes do not support paged-KV page size 16; "
-            "use 32, 64, or 128 tokens per page"
-        )
+    # Page16 currently misaligns D64 NVFP4 staging; other transformed profiles
+    # use the ordinary page-size and staging checks.
+    if (
+        cfg.use_nvfp4_kv
+        and cfg.headdim == 64
+        and cfg.use_paged_kv
+        and cfg.num_tokens_per_page == 16
+    ):
+        raise ValueError("NVFP4 KV with head_dim=64 does not support page_size=16")
     if cfg.use_transform_kv and not cfg.store_transformed_kv_in_tmem:
         # The SMEM transform assigns eight elements per thread per iteration.
         total_elems = cfg.tile_size_kv * cfg.head_dim_kv_stage
@@ -5171,7 +5172,6 @@ def _validate_profile_support(
             and cfg.max_seq_len_q == 1
             and not cfg.use_variable_seqlens_q
             and cfg.use_paged_kv
-            and cfg.num_tokens_per_page == 32
             and cfg.q_dtype == Float8E4M3FN
             and cfg.k_dtype == Float8E4M3FN
             and cfg.v_dtype == Float8E4M3FN
@@ -5194,7 +5194,7 @@ def _validate_profile_support(
                 "separate reduction keepsMmaAb profiles require "
                 "the established D128/Q64-Q128, D256/Q128, or "
                 "QToken-KvBlock-Sparse-Attention D64/D128/D256 Q64/Q128-KV128 profiles, or a "
-                "fixed FP8/page-32 D64/Q64-Q128 or D256/Q64 profile; valid "
+                "fixed paged FP8 D64/Q64-Q128 or D256/Q64 profile; valid "
                 "reduction dtypes, Q layout, and static split-KV are required"
             )
         return
@@ -5252,7 +5252,7 @@ def _validate_profile_support(
             "separate reduction SwapsMmaAb profiles require fixed SQ=1, "
             "fixed grouped Q, or packed variable Q; tile_size_q in {16,32}, "
             "QToken-KvBlock-Sparse-Attention TileQ8, or a fixed FP8 Q8/HqPerKv8 profile "
-            "(D128, plus grouped paged-KV/page-32 D64 or D256 with "
+            "(D128, plus grouped paged-KV D64 or D256 with "
             "FP16/BF16 output); valid reduction dtypes and static split-KV are required"
         )
     if tile_size_q and tile_size_q not in (8, 16, 32):
@@ -5372,7 +5372,7 @@ def make_decode_config(
     2. Fill profile-derived defaults: dtype fields, paged-KV metadata, the
        dense/causal mask, sliding-window flags, attention-sink flags, default
        grouped-Q metadata for fixed or packed launches, and the SMEM-derived
-       KV stage count. For a multi-Q page-32 launch without a sliding
+       KV stage count. For a multi-Q paged launch without a sliding
        window, the Q selector first enumerates Swaps8/16/32 and Keeps64/128
        tiles and every useful direct/split recipe through the first
        capacity-crossing fanout.

@@ -148,7 +148,7 @@ for an active page indexes the physical cache.
 
 For request `b`, bottom-right causal row `i` can see through
 `Sk[b] - Sq[b] + i`. With `window_left=W>0`, the row retains that key and at
-most `W` preceding keys. `sm_scale` defaults to `1 / sqrt(Dqk)` and
+most `W` preceding keys. `softmax_scale` defaults to `1 / sqrt(Dqk)` and
 `output_scale` defaults to 1; supplied scales must be finite, positive, and
 representable as positive `float32` values. All scale inputs are finite positive host scalars; no device scale tensors
 are allocated or accepted.
@@ -294,7 +294,7 @@ assert out.shape == (1, 8192, 96, 128)
 ```
 
 FP8 E4M3 uses the same shapes. For quantized operands, pass
-`sm_scale=q_descale * k_descale / sqrt(192)` and
+`softmax_scale=q_descale * k_descale / sqrt(192)` and
 `output_scale=v_descale`; select the output dtype with `out_dtype`.
 
 Packed Q with a paged K/V cache:
@@ -334,7 +334,7 @@ assert out.shape == q.shape
 
 For a `torch.bfloat16` Q/K with a `torch.float8_e4m3fn` V, pass
 `v_dtype=v.dtype` (or `v_dtype=v_cache.dtype` for paged) to `plan()` and
-supply `output_scale=v_descale`; `sm_scale` is unchanged because Q and K stay
+supply `output_scale=v_descale`; `softmax_scale` is unchanged because Q and K stay
 BF16. Both wrappers accept this combination for head dimensions 128 and 256.
 
 For CUDA graph capture, call `plan()` and perform one default-validating
@@ -349,13 +349,13 @@ runtime tensors alive until every graph using that plan is destroyed.
 
 ## Limitations
 
-- Extremely small effective QK scales, such as `sm_scale=1e-38`, are outside
+- Extremely small effective QK scales, such as `softmax_scale=1e-38`, are outside
   the currently supported numerical range of context masking.
 
 - The 192/128 MLA extension requires contiguous separate Q/K/V and does not
   support a positive left window. Paged K/V retains equal head dimensions.
 
-- Paged context accepts separate HND or NHD K/V pools with page size 16, 32,
+- Paged context accepts separate HND or NHD K/V pools with page size 4, 8, 16, 32,
   64, or 128. Select the physical layout with `kv_layout`; NHD pools have
   shape `[num_pages, page_size, Hkv, D]`. Layout normalization changes tensor
   metadata only, and the same compiled kernel supports both layouts.

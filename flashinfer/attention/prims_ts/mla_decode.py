@@ -152,8 +152,8 @@ class _MLARuntime:
     normalized_cache: torch.Tensor
     out: torch.Tensor
     num_physical_pages: int
-    bmm1_scale: float
-    bmm2_scale: float
+    softmax_scale: float
+    output_scale: float
     extra_cache: Optional[torch.Tensor] = None
     sparse_inputs: Optional[tuple] = None
     output_quant_args: Optional[tuple] = None
@@ -1397,8 +1397,8 @@ def _prepare_mla_runtime(
     q_dtype: torch.dtype,
     kv_dtype: torch.dtype,
     output_dtype: torch.dtype,
-    bmm1_scale: float,
-    bmm2_scale: float,
+    softmax_scale: float,
+    output_scale: float,
     out: Optional[torch.Tensor],
     validate: bool,
 ) -> _MLARuntime:
@@ -1439,13 +1439,13 @@ def _prepare_mla_runtime(
                 f"kv_cache dtype must match the launch ({kv_dtype}), "
                 f"got {normalized_cache.dtype}"
             )
-        effective_bmm1_scale = _validate_scale(bmm1_scale, "bmm1_scale")
-        effective_bmm2_scale = _validate_scale(bmm2_scale, "bmm2_scale")
+        effective_softmax_scale = _validate_scale(softmax_scale, "softmax_scale")
+        effective_output_scale = _validate_scale(output_scale, "output_scale")
     else:
         normalized_cache = kv_cache[:, 0] if kv_cache.ndim == 4 else kv_cache
         num_physical_pages = int(normalized_cache.shape[0])
-        effective_bmm1_scale = bmm1_scale
-        effective_bmm2_scale = bmm2_scale
+        effective_softmax_scale = softmax_scale
+        effective_output_scale = output_scale
     total_q = int(query.shape[0]) if packed_query else None
     if out is None:
         out_shape = (
@@ -1470,8 +1470,8 @@ def _prepare_mla_runtime(
         normalized_cache=normalized_cache,
         out=out,
         num_physical_pages=num_physical_pages,
-        bmm1_scale=effective_bmm1_scale,
-        bmm2_scale=effective_bmm2_scale,
+        softmax_scale=effective_softmax_scale,
+        output_scale=effective_output_scale,
     )
 
 
@@ -1529,8 +1529,8 @@ def _launch_mla_decode(
         seq_lens,
         qo_indptr,
         runtime.sparse_inputs,
-        runtime.bmm1_scale,
-        runtime.bmm2_scale,
+        runtime.softmax_scale,
+        runtime.output_scale,
         runtime.output_quant_args,
     )
     return runtime.out
@@ -1693,8 +1693,8 @@ class BatchMLADecodePagedTSWrapper:
         seq_lens: torch.Tensor,
         *,
         qo_indptr: Optional[torch.Tensor] = None,
-        bmm1_scale: float = 1.0,
-        bmm2_scale: float = 1.0,
+        softmax_scale: float = 1.0,
+        output_scale: float = 1.0,
         out: Optional[torch.Tensor] = None,
         lse: Optional[torch.Tensor] = None,
         return_lse: bool = False,
@@ -1714,7 +1714,7 @@ class BatchMLADecodePagedTSWrapper:
 
         Fixed queries use [B, Sq, H, 576]; packed queries use [total_q, H, 576] and
         qo_indptr with nonnegative per-request deltas. All-empty packed Q is a no-op.
-        bmm1_scale and bmm2_scale are finite positive host QK and V/output scales.
+        softmax_scale and output_scale are finite positive host QK and V/output scales.
         The dense MLA interface does not expose attention sinks."""
 
         if not isinstance(validate, bool):
@@ -1737,8 +1737,8 @@ class BatchMLADecodePagedTSWrapper:
             q_dtype=state.q_dtype,
             kv_dtype=state.kv_dtype,
             output_dtype=state.output_dtype,
-            bmm1_scale=bmm1_scale,
-            bmm2_scale=bmm2_scale,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
             out=out,
             validate=validate,
         )
@@ -1792,8 +1792,8 @@ def batch_mla_decode_with_paged_kv_cache(
     qk_rope_head_dim: int = _MLA_ROPE_DIM,
     mask_type: Literal["dense", "causal"] = "causal",
     max_kv_len: Optional[int] = None,
-    bmm1_scale: float = 1.0,
-    bmm2_scale: float = 1.0,
+    softmax_scale: float = 1.0,
+    output_scale: float = 1.0,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
@@ -1834,7 +1834,7 @@ def batch_mla_decode_with_paged_kv_cache(
         Attention mask mode.
     max_kv_len : int, optional
         Static K/V length bound; defaults to the metadata maximum.
-    bmm1_scale, bmm2_scale : float
+    softmax_scale, output_scale : float
         QK and value/output scaling factors.
     out : torch.Tensor, optional
         Caller-owned output tensor.
@@ -1966,8 +1966,8 @@ def batch_mla_decode_with_paged_kv_cache(
         block_tables,
         seq_lens,
         qo_indptr=qo_indptr,
-        bmm1_scale=bmm1_scale,
-        bmm2_scale=bmm2_scale,
+        softmax_scale=softmax_scale,
+        output_scale=output_scale,
         out=out,
         lse=lse,
         return_lse=return_lse,
@@ -2767,8 +2767,8 @@ class BatchSparseMLADecodePagedTSWrapper:
         )
         # Both paths consume the same effective scales; no Q/K/V scale
         # composition or auxiliary preparation is performed here.
-        bmm1_scale = float(softmax_scale) if static_scales else 1.0
-        bmm2_scale = float(output_scale) if static_scales else 1.0
+        softmax_scale = float(softmax_scale) if static_scales else 1.0
+        output_scale = float(output_scale) if static_scales else 1.0
         sparse_inputs = (
             si,
             ci,
@@ -2795,8 +2795,8 @@ class BatchSparseMLADecodePagedTSWrapper:
                     primary,
                     core_out,
                     primary.shape[0],
-                    bmm1_scale,
-                    bmm2_scale,
+                    softmax_scale,
+                    output_scale,
                     extra_cache=extra,
                     sparse_inputs=sparse_inputs,
                     output_quant_args=output_quant_args,
