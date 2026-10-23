@@ -475,7 +475,7 @@ the scores in place in the max pass, which costs more per score.
 | | Decode kernel | Context kernel |
 | --- | --- | --- |
 | APIs | `BlockSparseTSWrapper`, `block_sparse_attention` | `BatchPrefillTSWrapper` |
-| K/V storage | Contiguous; the paged block-sparse APIs do not support Sage | Contiguous fixed-length `[B, S, H, D]` (`packed=False`) |
+| K/V storage | Contiguous; the paged block-sparse APIs do not support Sage | Contiguous fixed-length `[B, S, H, D]` (`packed_query=False`) |
 | Geometry | `head_dim=128`; a Q64/KV256 or Q128/KV128 Keeps tile, which needs a `kv_block_size` multiple of 64 and at least 64 grouped Q rows (`q_block_size * Hq / Hkv`) | `head_dim=128`; 128-token Q tiles of one Q head |
 | Masks and routes | Dense and causal masks; exact and proxy block-sparse routes (BSR or bitmask) | `mask_type="dense"` and `window_left=-1`; no routes, so `k_summary_block_size` is unused |
 | Split-KV | Rejected: only the direct output store applies `sfV` and `v_mean` | No split-KV launch |
@@ -631,7 +631,8 @@ operand contract, the quantizer in `quantization` and its CuTe DSL kernels in
 | Q/K dtype | `torch.bfloat16` |
 | V dtype | `torch.float8_e4m3fn` |
 | Output dtype | `torch.bfloat16` or `torch.float16` |
-| Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed=False`, `mask_type="dense"`; runs the two-CTA UMMA form |
+| Geometry | `head_dim=128`, `num_qo_heads == num_kv_heads`, `packed_query=False`, `mask_type="dense"`; runs the two-CTA UMMA form |
+| LSE / attention sinks | Unsupported for VC's quantized softmax sums |
 
 ### Operand tensors
 

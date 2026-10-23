@@ -2181,7 +2181,11 @@ def _get_compiled_context(
     else:
         batch_size = cute.sym_int()
         physical_sq = cute.sym_int() if compile_spec.runtime_lengths else max_seq_len_q
-        physical_sk = cute.sym_int() if compile_spec.runtime_lengths else _fixed_kv_rows(max_seq_len_k, compile_spec.vc)
+        physical_sk = (
+            cute.sym_int()
+            if compile_spec.runtime_lengths
+            else _fixed_kv_rows(max_seq_len_k, compile_spec.vc)
+        )
         q_shape = (batch_size, physical_sq, num_qo_heads, head_dim)
         kv_shape = (batch_size, physical_sk, num_kv_heads, head_dim)
         out_shape = (*q_shape[:-1], head_dim_vo)
@@ -2932,6 +2936,11 @@ class BatchPrefillTSWrapper:
                 "vc_config requires a dense contiguous fixed-length plan; VC-Attention "
                 "has no packed, causal or variable-window kernel"
             )
+        if vc_config is not None and (lse_mode != "none" or use_attention_sinks):
+            # VC uses quantized P sums; ordinary context LSE/sink math does not apply.
+            raise NotImplementedError(
+                "VC-Attention does not support LSE or attention sinks"
+            )
         geometry = replace(geometry, vc=vc_config)
         if softmax_scale is None:
             softmax_scale = geometry.head_dim**-0.5
@@ -2942,7 +2951,11 @@ class BatchPrefillTSWrapper:
         output_scale = _validate_scale(output_scale, "output_scale")
         vc_output_scale_buffer = (
             torch.empty(
-                (geometry.batch_size, geometry.num_qo_heads, geometry.head_dim_vo or geometry.head_dim),
+                (
+                    geometry.batch_size,
+                    geometry.num_qo_heads,
+                    geometry.head_dim_vo or geometry.head_dim,
+                ),
                 dtype=torch.float32,
                 device=geometry.device,
             )
