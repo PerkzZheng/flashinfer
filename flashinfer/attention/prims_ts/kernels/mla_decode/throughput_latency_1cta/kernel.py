@@ -1782,14 +1782,7 @@ class ThroughputLatencyMlaDecodeTs:
             )
             self.parallel_reduction_topology = (
                 make_balanced_parallel_reduction_topology(
-                    # Only the reducer's register schedule uses a bounded range.
-                    # Launch fanout and scratch capacity remain independent.
-                    min(
-                        cfg.num_ctas_per_seq_kv,
-                        ((reduction_policy_splits + 15) // 16) * 16,
-                    )
-                    if cluster_size > 1 and reduction_policy_splits is not None
-                    else cfg.num_ctas_per_seq_kv,
+                    cfg.num_ctas_per_seq_kv,
                     cluster_size=cluster_size,
                 )
             )

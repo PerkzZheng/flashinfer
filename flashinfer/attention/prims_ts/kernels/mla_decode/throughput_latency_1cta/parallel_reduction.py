@@ -681,27 +681,28 @@ def _run_parallel_gmem_reduction_shared_stats(
             )
             + Int64(cluster_rank) * Int64(cfg.head_dim_v)
         )
-        for local_slot_i in cutlass.range_constexpr(local_slots):
+        # Each rank traverses its live cyclic split prefix, independent of capacity.
+        for local_slot_i in cutlass.range(
+            cute.ceil_div(split_limit - cluster_rank, cluster_size), unroll=32
+        ):
             split_idx = Int32(local_slot_i * cluster_size) + cluster_rank
-            if split_idx < Int32(actual_splits) and split_idx < split_limit:
-                scale = Float32(
-                    smem_local_scale[
-                        row_in_slice * Int32(local_slots) + Int32(local_slot_i)
-                    ]
-                )
-                split_ptr = acc_row_ptr + Int64(
-                    local_slot_i * cluster_size * cfg.head_dim_v
-                )
-                if cutlass.const_expr(output_elements_per_thread == 1):
-                    local_output[0] += Float32(split_ptr.load()) * scale
-                else:
-                    partial_o = split_ptr.load(
-                        count=output_elements_per_thread,
-                        alignment=output_elements_per_thread
-                        * cfg.partial_o_dtype_bytes,
-                    ).to(Float32)
-                    for elem_i in cutlass.range_constexpr(output_elements_per_thread):
-                        local_output[elem_i] += partial_o[elem_i] * scale
+            scale = Float32(
+                smem_local_scale[
+                    row_in_slice * Int32(local_slots) + Int32(local_slot_i)
+                ]
+            )
+            split_ptr = acc_row_ptr + Int64(
+                local_slot_i * cluster_size * cfg.head_dim_v
+            )
+            if cutlass.const_expr(output_elements_per_thread == 1):
+                local_output[0] += Float32(split_ptr.load()) * scale
+            else:
+                partial_o = split_ptr.load(
+                    count=output_elements_per_thread,
+                    alignment=output_elements_per_thread * cfg.partial_o_dtype_bytes,
+                ).to(Float32)
+                for elem_i in cutlass.range_constexpr(output_elements_per_thread):
+                    local_output[elem_i] += partial_o[elem_i] * scale
 
     # Publish normalized O in BF16 while retaining FP32 accumulation.
     smem_o = cutlass.Array(
