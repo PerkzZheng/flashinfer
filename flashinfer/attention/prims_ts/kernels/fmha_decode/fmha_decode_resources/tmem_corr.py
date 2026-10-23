@@ -1468,16 +1468,16 @@ class TmemCorrResource(DecodeGenResourceBase):
         partial_max = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         partial_sum = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         partial_regs = cutlass.Array(Int32, 16, space=cutlass.AddressSpace.rmem)
-        for split_base_i in cutlass.range_constexpr(0, cfg.max_splits_kv, 4):
+        for split_base_i in cutlass.range(
+            0, reduction_splits_kv, 4, unroll_full=full_prefix
+        ):
             split_base = Int32(split_base_i)
             # Load up to four split partials first. Keeping the stats and O
             # loads grouped lets the fold loop below operate on registers only.
             for jj in cutlass.range_constexpr(4):
                 if cutlass.const_expr(full_prefix):
                     split_idx = Int32(split_base_i + jj)
-                    valid_split_idx = cutlass.const_expr(
-                        split_base_i + jj < cfg.splits_kv
-                    )
+                    valid_split_idx = split_idx < Int32(cfg.splits_kv)
                 else:
                     split_idx = split_base + Int32(jj)
                     valid_split_idx = split_idx < reduction_splits_kv
@@ -1518,8 +1518,8 @@ class TmemCorrResource(DecodeGenResourceBase):
             for jj in cutlass.range_constexpr(4):
                 valid_split_for_apply = split_base + Int32(jj) < reduction_splits_kv
                 if cutlass.const_expr(full_prefix):
-                    valid_split_for_apply = cutlass.const_expr(
-                        split_base_i + jj < cfg.splits_kv
+                    valid_split_for_apply = split_base + Int32(jj) < Int32(
+                        cfg.splits_kv
                     )
                 if valid_split_for_apply and valid_reduce_row:
                     regs_base = jj * 4

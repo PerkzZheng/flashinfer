@@ -278,24 +278,32 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             )
             lse_max = Float32(-Float32.inf)
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
-                stats_split_idx = lane_idx + Int32(
-                    lane_slot_i * GMEM_REDUCTION_WARP_LANES
-                )
-                lane_lse[lane_slot_i] = (
-                    Float32(row_lse[stats_split_idx])
-                    if stats_split_idx < split_limit
-                    else Float32(-Float32.inf)
-                )
-                lse_max = fmax_f32(lse_max, lane_lse[lane_slot_i])
+                if (
+                    cutlass.const_expr(lane_slot_i == 0)
+                    or Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES) < split_limit
+                ):
+                    stats_split_idx = lane_idx + Int32(
+                        lane_slot_i * GMEM_REDUCTION_WARP_LANES
+                    )
+                    lane_lse[lane_slot_i] = (
+                        Float32(row_lse[stats_split_idx])
+                        if stats_split_idx < split_limit
+                        else Float32(-Float32.inf)
+                    )
+                    lse_max = fmax_f32(lse_max, lane_lse[lane_slot_i])
 
             lse_max = warp_reduce_max_f32(lse_max)
             lse_max = lse_max if lse_max != Float32(-Float32.inf) else Float32(0.0)
             lse_sum = Float32(0.0)
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
-                lse_sum += cute.math.exp2(
-                    lane_lse[lane_slot_i] - lse_max,
-                    fastmath=True,
-                )
+                if (
+                    cutlass.const_expr(lane_slot_i == 0)
+                    or Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES) < split_limit
+                ):
+                    lse_sum += cute.math.exp2(
+                        lane_lse[lane_slot_i] - lse_max,
+                        fastmath=True,
+                    )
             lse_sum = warp_reduce_sum_f32(lse_sum)
             global_lse = finalize_log2_sum_exp(lse_max, lse_sum)
             stats_sink_scale = Float32(1)
@@ -320,18 +328,22 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                     )
 
             for lane_slot_i in cutlass.range_constexpr(lse_per_lane):
-                stats_split_idx = lane_idx + Int32(
-                    lane_slot_i * GMEM_REDUCTION_WARP_LANES
-                )
-                if stats_split_idx < split_limit:
-                    stats_weight = normalized_lse_weight(
-                        lane_lse[lane_slot_i], global_lse
+                if (
+                    cutlass.const_expr(lane_slot_i == 0)
+                    or Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES) < split_limit
+                ):
+                    stats_split_idx = lane_idx + Int32(
+                        lane_slot_i * GMEM_REDUCTION_WARP_LANES
                     )
-                    if cutlass.const_expr(finalize_attention):
-                        stats_weight *= stats_sink_scale
-                    smem_scale[
-                        stats_row * Int32(cfg.num_ctas_per_seq_kv) + stats_split_idx
-                    ] = stats_weight
+                    if stats_split_idx < split_limit:
+                        stats_weight = normalized_lse_weight(
+                            lane_lse[lane_slot_i], global_lse
+                        )
+                        if cutlass.const_expr(finalize_attention):
+                            stats_weight *= stats_sink_scale
+                        smem_scale[
+                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + stats_split_idx
+                        ] = stats_weight
 
     prims.barrier_cta_sync(
         barrier_id=SPLIT_REDUCTION_SCALE_BARRIER_ID,
@@ -383,8 +395,13 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
             dim_idx,
         )
         # Pair FP32 channels while preserving each channel's split order.
-        if split_limit == Int32(cfg.num_ctas_per_seq_kv):
-            for split_i in cutlass.range_constexpr(cfg.num_ctas_per_seq_kv):
+        unrolled_splits = (
+            cfg.num_ctas_per_seq_kv
+            if requested_splits is None
+            else GMEM_REDUCTION_WARP_LANES
+        )
+        if split_limit == Int32(unrolled_splits):
+            for split_i in cutlass.range_constexpr(unrolled_splits):
                 split_idx = Int32(split_i)
                 scale = Float32(
                     smem_scale[
@@ -411,7 +428,7 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                                 (output_acc[elem_i], output_acc[elem_i + 1]),
                             )
         else:
-            for split_i in cutlass.range(split_limit, unroll=1):
+            for split_i in cutlass.range(split_limit, unroll=4):
                 split_idx = Int32(split_i)
                 scale = Float32(
                     smem_scale[

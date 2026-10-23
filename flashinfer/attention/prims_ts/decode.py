@@ -32,7 +32,6 @@ from flashinfer.utils import (
     _check_workspace_buffer_alignment,
     check_shape_dtype_device,
 )
-from .split_kv_mode_policy import split_capacity
 
 from flashinfer.trace.templates.attention import (
     attention_ts_decode_trace_dispatch,
@@ -1240,7 +1239,6 @@ def _resolve_decode_launch_spec(
 
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
-        _select_auto_split_kv_reduction_mode,
         arch_config_args,
         get_max_active_clusters_for_cluster_size,
         make_decode_config,
@@ -1426,22 +1424,21 @@ def _resolve_decode_launch_spec(
     if cfg.use_split_kv and not use_q_token_kv_block_sparse_route:
         sm_count = get_device_sm_count(torch.device("cuda", device_index))
         requested_splits = min(requested_splits, sm_count)
-        capacity = split_capacity(requested_splits, sm_count)
-        cfg = replace(
-            cfg, splits_kv=capacity, max_splits_kv=capacity, runtime_split_kv=True
+        # GMEM capacity is a device bound, independent of the runtime fanout.
+        # Keep Q/batch fusion within CUDA's grid-Z limit; larger grids retain
+        # the original exact-fanout launch. Cluster sizes remain resident topology.
+        compact_grid = batch_size * q_ctas(cfg) <= 65535
+        capacity = (
+            requested_splits
+            if cfg.use_cluster_smem_reduction or not compact_grid
+            else sm_count
         )
-        if cfg.use_cluster_smem_reduction and capacity != requested_splits:
-            # Rounding can move a previously one-wave cluster grid beyond
-            # residency. Reuse the normal fallback with the launched capacity.
-            with torch.cuda.device(device_index):
-                cfg, _ = _select_auto_split_kv_reduction_mode(
-                    cfg,
-                    seq_len_q=seq_len_q,
-                    batch_size=batch_size,
-                    num_heads_q=num_qo_heads,
-                    num_heads_kv=num_kv_heads,
-                    preserve_exact_cluster_fanout=True,
-                )
+        cfg = replace(
+            cfg,
+            splits_kv=capacity,
+            max_splits_kv=capacity,
+            runtime_split_kv=compact_grid,
+        )
     _validate_decode_policy_kv_tile_size(cfg)
     resolved = _decode_launch_spec_from_config(
         cfg,
@@ -4048,6 +4045,46 @@ class BatchDecodePagedTSWrapper:
         )
         kv_prefix_mode: Literal["dynamic", "planned_full"] = "dynamic"
         kv_lengths_mode: Literal["dynamic", "planned_uniform_max"] = "dynamic"
+        cfg = spec.config
+        # Reuse declared uniform bounds. Single-Q GMEM keeps its runtime page window.
+        uniform_kv = (
+            not packed_query
+            and not cfg.use_sliding_window_causal
+            and specialization_seq_lens_kv is not None
+            and all(length == max_kv_len for length in specialization_seq_lens_kv)
+            and ((max_kv_len + cfg.tile_size_kv - 1) // cfg.tile_size_kv)
+            % cfg.num_insts_kv
+            == 0
+        )
+        fixed_uniform_kv = uniform_kv and (
+            cfg.use_cluster_smem_reduction or not cfg.has_single_q_cta
+        )
+        if uniform_kv:
+            from .kernels.fmha_decode.fmha_decode_config import (
+                compute_runtime_active_splits_kv,
+            )
+
+            q_step = cfg.q_tokens_per_cta if cfg.uses_nontrivial_grouped_q_layout else 1
+            if cfg.use_split_kv and all(
+                compute_runtime_active_splits_kv(
+                    valid_k=(max_kv_len - seq_len_q + min(q_base + q_step, seq_len_q))
+                    if mask_type == "causal"
+                    else max_kv_len,
+                    tile_size_kv=cfg.tile_size_kv,
+                    num_insts_kv=cfg.num_insts_kv,
+                    configured_splits_kv=spec.requested_splits,
+                )
+                == spec.requested_splits
+                for q_base in range(0, seq_len_q, q_step)
+            ):
+                kv_prefix_mode = "planned_full"
+                fixed_uniform_kv = True
+            if fixed_uniform_kv:
+                kv_lengths_mode = "planned_uniform_max"
+            if fixed_uniform_kv and spec.requested_splits == cfg.splits_kv:
+                # The live bound equals this declared topology; partial activity
+                # is still derived from the owned lengths, as before runtime buckets.
+                spec = replace(spec, config=replace(cfg, runtime_split_kv=False))
         compile_spec = _make_decode_compile_spec(
             spec,
             device_index=device_index,
@@ -4065,7 +4102,8 @@ class BatchDecodePagedTSWrapper:
             kv_prefix_mode=kv_prefix_mode,
             kv_lengths_mode=kv_lengths_mode,
             lse_mode=lse_mode,
-            runtime_kv_lengths=True,
+            runtime_kv_lengths=not fixed_uniform_kv
+            and (cfg.runtime_split_kv or not cfg.use_split_kv),
         )
         compiled_main, compiled_reducer = _get_compiled_decode(compile_spec)
         policy = spec.policy + (

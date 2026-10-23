@@ -193,7 +193,9 @@ def _reduce_exact_splits_body(
         PARTIAL_O_ELEMENT_BYTES
     )
     q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
-    active_splits_kv = Int32(cfg.splits_kv)
+    active_splits_kv = (
+        Int32(cfg.splits_kv) if requested_splits is None else Int32(requested_splits)
+    )
     valid_reduce_row = _q_logical_output_row_is_valid_for_seq(
         cfg,
         g_q_output_rows,
@@ -245,11 +247,14 @@ def _reduce_exact_splits_body(
     if valid_reduce_row:
         # The workspace retains configured-max strides, but only the runtime
         # active prefix was published by producer CTAs.
-        for split_idx_i in cutlass.range_constexpr(cfg.max_splits_kv):
+        for split_idx_i in cutlass.range(
+            active_splits_kv if cfg.runtime_split_kv else cfg.max_splits_kv,
+            unroll_full=not cfg.runtime_split_kv,
+        ):
             split_idx = Int32(split_idx_i)
             split_is_active = split_idx < active_splits_kv
             if cutlass.const_expr(static_full_split_prefix):
-                split_is_active = cutlass.const_expr(split_idx_i < cfg.splits_kv)
+                split_is_active = split_idx < Int32(cfg.splits_kv)
             if split_is_active:
                 # LSE layout: [logical_kv][configured split][row].
                 workspace_row = _separate_workspace_row_offset(
@@ -534,7 +539,9 @@ def decode_gen_parallel_separate_reduction_kernel(
         PARTIAL_O_ELEMENT_BYTES
     )
     q_token_offset, seq_len_q = _q_seq_bounds(cfg, g_cu_seqlens_q, b_idx)
-    active_splits_kv = Int32(cfg.splits_kv)
+    active_splits_kv = (
+        Int32(cfg.splits_kv) if requested_splits is None else Int32(requested_splits)
+    )
     valid_reduce_row = _q_logical_output_row_is_valid_for_seq(
         cfg,
         g_q_output_rows,
@@ -563,19 +570,11 @@ def decode_gen_parallel_separate_reduction_kernel(
         output_vals[elem_idx] = Float32(0.0)
     global_lse = Float32(-Float32.inf)
 
-    # Issue every owned slot's independent GMEM loads before folding them. The
-    # final batch width is compile-time. Padded split slots stay neutral and
-    # never form GMEM pointers, including non-power-of-two split counts.
+    # Batch independent GMEM loads before folding them. Storage capacity fixes
+    # the layout; runtime profiles only traverse their published split prefix.
+    load_batch = 2 if cfg.runtime_split_kv else PARALLEL_REDUCTION_LOAD_BATCH
     local_splits = cfg.parallel_reduction_splits_per_cta
     lane_splits = local_splits // slot_lanes
-    partial_lse = cutlass.Array(
-        Float32, PARALLEL_REDUCTION_LOAD_BATCH, space=cutlass.AddressSpace.rmem
-    )
-    partial_regs = cutlass.Array(
-        Int32,
-        PARALLEL_REDUCTION_LOAD_BATCH * PACKED_OUTPUT_REGS_PER_THREAD,
-        space=cutlass.AddressSpace.rmem,
-    )
 
     # Allocate the clustered path's local SMEM before acquiring the producer.
     # Cluster-size-one profiles compile out every later use of these arrays.
@@ -610,10 +609,28 @@ def decode_gen_parallel_separate_reduction_kernel(
         # A zero prefix publishes no partials; reuse it without reloading lengths.
         valid_reduce_row = valid_reduce_row & (active_splits_kv > Int32(0))
 
-    for split_base_i in cutlass.range_constexpr(
-        0, lane_splits, PARALLEL_REDUCTION_LOAD_BATCH
+    split_rounds = lane_splits
+    if cutlass.const_expr(cfg.runtime_split_kv):
+        # Capacity only determines scratch strides. Distribute the live prefix
+        # cyclically across the fixed reducer topology and stop at its runtime end.
+        split_rounds = cute.ceil_div(
+            active_splits_kv, slot_lanes * cfg.parallel_reduction_cluster_size
+        )
+    for split_base_i in cutlass.range(
+        0,
+        split_rounds,
+        load_batch,
+        unroll_full=not cfg.runtime_split_kv,
     ):
-        batch_width = min(PARALLEL_REDUCTION_LOAD_BATCH, lane_splits - split_base_i)
+        partial_lse = cutlass.Array(
+            Float32, load_batch, space=cutlass.AddressSpace.rmem
+        )
+        partial_regs = cutlass.Array(
+            Int32,
+            load_batch * PACKED_OUTPUT_REGS_PER_THREAD,
+            space=cutlass.AddressSpace.rmem,
+        )
+        batch_width = load_batch
         split_base = Int32(split_base_i)
         # Prefetch only published slots; inactive slots and padded Q rows
         # are in bounds but may contain uninitialized caller-owned scratch.
@@ -623,11 +640,18 @@ def decode_gen_parallel_separate_reduction_kernel(
                 + (split_base + Int32(jj)) * Int32(slot_lanes)
                 + lane_slot
             )
-            valid_split_idx = cutlass.const_expr(
-                cfg.parallel_reduction_padded_splits == cfg.max_splits_kv
-            ) or split_idx < Int32(cfg.max_splits_kv)
+            if cutlass.const_expr(cfg.runtime_split_kv):
+                split_idx = (
+                    (split_base + Int32(jj)) * Int32(slot_lanes) + lane_slot
+                ) * Int32(cfg.parallel_reduction_cluster_size) + cluster_rank
+            valid_split_idx = cutlass.const_expr(cfg.runtime_split_kv) or (
+                split_base + Int32(jj) < Int32(lane_splits)
+                and split_idx < Int32(cfg.max_splits_kv)
+            )
             active_split_idx = split_idx < active_splits_kv
-            if cutlass.const_expr(static_full_split_prefix):
+            if cutlass.const_expr(
+                static_full_split_prefix and not cfg.runtime_split_kv
+            ):
                 active_split_idx = cutlass.Boolean(True)
             if valid_split_idx and active_split_idx and valid_reduce_row:
                 workspace_row = _separate_workspace_row_offset(
@@ -669,11 +693,18 @@ def decode_gen_parallel_separate_reduction_kernel(
                 + (split_base + Int32(jj)) * Int32(slot_lanes)
                 + lane_slot
             )
-            valid_split_idx = cutlass.const_expr(
-                cfg.parallel_reduction_padded_splits == cfg.max_splits_kv
-            ) or split_idx < Int32(cfg.max_splits_kv)
+            if cutlass.const_expr(cfg.runtime_split_kv):
+                split_idx = (
+                    (split_base + Int32(jj)) * Int32(slot_lanes) + lane_slot
+                ) * Int32(cfg.parallel_reduction_cluster_size) + cluster_rank
+            valid_split_idx = cutlass.const_expr(cfg.runtime_split_kv) or (
+                split_base + Int32(jj) < Int32(lane_splits)
+                and split_idx < Int32(cfg.max_splits_kv)
+            )
             active_split_idx = split_idx < active_splits_kv
-            if cutlass.const_expr(static_full_split_prefix):
+            if cutlass.const_expr(
+                static_full_split_prefix and not cfg.runtime_split_kv
+            ):
                 active_split_idx = cutlass.Boolean(True)
             if valid_split_idx and active_split_idx and valid_reduce_row:
                 regs_base = jj * PACKED_OUTPUT_REGS_PER_THREAD

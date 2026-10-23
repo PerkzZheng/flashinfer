@@ -1694,6 +1694,7 @@ class ThroughputLatencyMlaDecodeTs:
         tile_size_q: int,
         explicit_split_kv: int | None = None,
         split_kv_capacity: int | None = None,
+        reduction_policy_splits: int | None = None,
         explicit_persistent: bool | None = None,
         mask_type: MaskType | str = MaskType.CAUSAL,
         sparse_profile=None,
@@ -1770,7 +1771,9 @@ class ThroughputLatencyMlaDecodeTs:
             )
             cluster_size = (
                 choose_q64_parallel_reducer_cluster_size(
-                    cfg.num_ctas_per_seq_kv,
+                    cfg.num_ctas_per_seq_kv
+                    if reduction_policy_splits is None
+                    else reduction_policy_splits,
                     base_clusters=base_clusters,
                     sm_count=self.max_active_clusters,
                 )
@@ -1779,7 +1782,14 @@ class ThroughputLatencyMlaDecodeTs:
             )
             self.parallel_reduction_topology = (
                 make_balanced_parallel_reduction_topology(
-                    cfg.num_ctas_per_seq_kv,
+                    # Only the reducer's register schedule uses a bounded range.
+                    # Launch fanout and scratch capacity remain independent.
+                    min(
+                        cfg.num_ctas_per_seq_kv,
+                        ((reduction_policy_splits + 15) // 16) * 16,
+                    )
+                    if cluster_size > 1 and reduction_policy_splits is not None
+                    else cfg.num_ctas_per_seq_kv,
                     cluster_size=cluster_size,
                 )
             )

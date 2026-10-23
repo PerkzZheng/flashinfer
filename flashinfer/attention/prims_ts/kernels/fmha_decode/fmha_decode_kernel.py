@@ -95,6 +95,7 @@ from .fmha_decode_resources import (
     TmemTransformedKvResource,
 )
 from .fmha_decode_resources.helpers_common import (
+    split_kv_grid_coord,
     _q_group_token_base,
     _q_seq_bounds,
 )
@@ -2834,7 +2835,9 @@ def _run_decode_gen_active(
             _q_group_token_base(cfg, q_group_idx),
             requested_splits=requested_splits,
         )
-        split_idx = cute.arch.block_idx()[0] % Int32(cfg.splits_kv)
+        split_idx = Int32(cute.arch.block_idx()[0])
+        if cutlass.const_expr(not cfg.uses_compact_split_grid):
+            split_idx = split_idx % Int32(cfg.splits_kv)
         run_task_graph = cute.arch.make_warp_uniform(
             split_idx < deferred_active_splits_kv
         )
@@ -2975,7 +2978,9 @@ def _run_decode_gen_runtime_prefix(
                 # This also avoids changing the grid or adding a reducer launch.
                 if active_splits_kv == Int32(cfg.splits_kv - 1):
                     active_splits_kv = Int32(cfg.splits_kv)
-        split_idx = q_group_cta_idx % Int32(cfg.splits_kv)
+        split_idx = Int32(cute.arch.block_idx()[0])
+        if cutlass.const_expr(not cfg.uses_compact_split_grid):
+            split_idx = q_group_cta_idx % Int32(cfg.splits_kv)
         split_is_active = split_idx < active_splits_kv
 
     if cutlass.const_expr(cfg.supports_cluster_smem_reduction):
@@ -3139,7 +3144,7 @@ def decode_gen_kernel(
     requested_splits=None,
 ) -> None:
     """Dispatch one static Q/split tile and drain padded launch slots safely."""
-    q_group_cta_idx, h_k_idx, b_idx = cute.arch.block_idx()
+    q_group_cta_idx, h_k_idx, b_idx = split_kv_grid_coord(cfg, cute.arch.block_idx())
     if cutlass.const_expr(
         cfg.use_q_token_kv_block_sparse_route
         and not cfg.shares_sparse_pattern
@@ -3160,8 +3165,9 @@ def decode_gen_kernel(
                 g_q_token_kv_block_sparse_page_membership_stride * g_h_k
             )
     q_group_idx = q_group_cta_idx
-    if cutlass.const_expr(cfg.use_split_kv):
-        # Grid coordinates and scratch linearization retain configured fanout.
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        q_group_idx = Int32(cute.arch.block_idx()[2]) % Int32(cfg.num_q_ctas)
+    elif cutlass.const_expr(cfg.use_split_kv):
         q_group_idx = q_group_cta_idx // Int32(cfg.splits_kv)
 
     q_token_offset = Int32(0)
@@ -3220,8 +3226,10 @@ def decode_gen_kernel(
                 b_idx,
                 q_token_offset,
                 seq_len_q,
-                Int32(cfg.splits_kv),
-                True,
+                Int32(cfg.splits_kv)
+                if requested_splits is None
+                else requested_splits[0],
+                requested_splits is None,
                 False,
                 tile_sched_params,
                 cfg,
@@ -3718,8 +3726,18 @@ def fmha_decode_launch(
         )
 
     grid_x = q_groups
+    grid_batch = b
     if cutlass.const_expr(cfg.use_split_kv):
         grid_x = q_groups * Int32(cfg.splits_kv)
+        if cutlass.const_expr(cfg.uses_compact_split_grid):
+            # X contains only live policy splits. Q/batch share Z with a
+            # compile-time Q stride, avoiding runtime-count coordinate division.
+            grid_x = (
+                Int32(cfg.splits_kv)
+                if requested_splits is None
+                else requested_splits[0]
+            )
+            grid_batch = b * q_groups
 
     if cutlass.const_expr(cfg.use_persistent_scheduler):
         tile_sched_params = utils.ClcDynamicPersistentTileSchedulerParams(
@@ -3729,7 +3747,7 @@ def fmha_decode_launch(
         grid = tile_sched_params.get_grid_shape()
     else:
         tile_sched_params = None
-        grid = (grid_x, h_k, b)
+        grid = (grid_x, h_k, grid_batch)
     # cluster distributed-SMEM reduction groups the splits_kv split CTAs
     # of each sequence (contiguous in grid-X) into one cluster so they can write
     # partials into each other's shared memory via prims.mapa.

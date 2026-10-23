@@ -2136,6 +2136,49 @@ def _apply_speculative_tail_markers(case):
 
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
+    ("kv_lens", "num_qo_heads", "owned_lengths", "seq_len_q", "page_size"),
+    (
+        ((32768, 16385, 8192), 64, False, 1, 64),
+        ((32768, 16385, 8192, 257), 64, False, 1, 64),
+        ((8192,) * 8, 8, True, 1, 64),
+        ((32768,) * 8, 8, True, 1, 64),
+        ((32768,) * 8, 16, True, 4, 32),
+        ((32768, 16385, 8192, 4097, 2048, 1025, 512, 257), 16, False, 4, 32),
+    ),
+)
+def test_attention_ts_decode_runtime_split_accuracy(
+    kv_lens, num_qo_heads, owned_lengths, seq_len_q, page_size
+):
+    """Check live split prefixes and fixed-length cluster paths against the reference."""
+    case = _make_decode_case(
+        kv_lens=kv_lens,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=1,
+        head_dim=128,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        qkv_dtype=_FP8,
+        out_dtype=torch.float16,
+        cache_form="combined",
+        mask_type="causal",
+        device="cuda",
+        seed=6979,
+    )
+    wrapper = _plan_case(case, max_kv_len=max(kv_lens), dynamic_kv=not owned_lengths)
+    seq_lens_kv = _seq_lens_from_csr(
+        case.paged_kv_indptr, case.paged_kv_last_page_len, page_size
+    )
+    _exercise_public_paths(
+        wrapper,
+        case,
+        seq_lens_kv,
+        max_kv_len=max(kv_lens),
+        exercise_all_paths=True,
+    )
+
+
+@_REQUIRES_BLACKWELL_PRIMTS_GPU
+@pytest.mark.parametrize(
     ("dtype", "page_size"), ((torch.bfloat16, 16), (torch.float16, 128))
 )
 def test_attention_ts_decode_paged_wide_head_group_graph(dtype, page_size):
@@ -5555,8 +5598,8 @@ def _make_auto_kv_tile_config(monkeypatch, **overrides):
     return fmha_decode_config.make_decode_config(**{**kwargs, **overrides})
 
 
-def test_attention_ts_decode_cluster_residency_uses_split_capacity(monkeypatch):
-    """Rounded split buckets must still fit the cluster policy's resident wave."""
+def test_attention_ts_decode_cluster_preserves_resident_fanout(monkeypatch):
+    """Physical split clusters must fit the policy's resident wave."""
     from contextlib import nullcontext
 
     _mock_decode_hardware(monkeypatch)

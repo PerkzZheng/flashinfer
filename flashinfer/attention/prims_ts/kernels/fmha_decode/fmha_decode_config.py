@@ -1096,6 +1096,16 @@ class FmhaDecodeConfig:
         return max(q_geometry.num_q_ctas(self.max_seq_len_q), 1)
 
     @property
+    def uses_compact_split_grid(self) -> bool:
+        """Launch actual split work in X and fuse Q/batch in Z."""
+        return (
+            self.runtime_split_kv
+            and self.use_split_kv
+            and not self.use_cluster_smem_reduction
+            and not self.use_persistent_scheduler
+        )
+
+    @property
     def has_single_q_cta(self) -> bool:
         """Whether every physical split maps to one logical Q CTA."""
         return (
@@ -1601,6 +1611,7 @@ class FmhaDecodeConfig:
         if (
             not self.use_separate_reduction_kernel
             or self.use_compact_parallel_reduction
+            or self.runtime_split_kv
         ):
             return 1
         return {

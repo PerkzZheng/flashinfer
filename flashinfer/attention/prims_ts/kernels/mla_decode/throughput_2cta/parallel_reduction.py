@@ -294,6 +294,15 @@ def run_parallel_reduction_kernel(
         alignment=16,
     )
 
+    live_rank_splits = cute.math.max(
+        cute.math.min(
+            cute.math.min(active_split_kv, Int32(actual_splits))
+            - cluster_rank * Int32(slots_per_rank),
+            Int32(slots_per_rank),
+        ),
+        Int32(0),
+    )
+
     # One warp computes the rank-local softmax state for this row.  All output
     # threads consume the same scales, so repeating LSE loads and SFU work in
     # every vector lane only adds instructions and register pressure.
@@ -305,25 +314,26 @@ def run_parallel_reduction_kernel(
         )
         local_lse_max = neg_inf
         for lane_slot_i in cutlass.range_constexpr(lse_slots_per_lane):
-            local_slot_idx = lane_idx + Int32(lane_slot_i * cfg.threads_per_warp)
-            split_idx = cluster_rank * Int32(slots_per_rank) + local_slot_idx
-            active_slot = (
-                query_is_valid
-                & (local_slot_idx < Int32(slots_per_rank))
-                & (split_idx < Int32(actual_splits))
-                & (split_idx < active_split_kv)
-            )
-            lane_lse[lane_slot_i] = neg_inf
-            # Keep the workspace access inside the dynamic predicate. Padded
-            # ranks must not form a load from the unpadded producer allocation.
-            if active_slot:
-                lane_lse[lane_slot_i] = Float32(
-                    acc_lse[row_in_tile, split_idx, query_tile_idx, batch_idx]
+            if Int32(lane_slot_i * cfg.threads_per_warp) < live_rank_splits:
+                local_slot_idx = lane_idx + Int32(lane_slot_i * cfg.threads_per_warp)
+                split_idx = cluster_rank * Int32(slots_per_rank) + local_slot_idx
+                active_slot = (
+                    query_is_valid
+                    & (local_slot_idx < Int32(slots_per_rank))
+                    & (split_idx < Int32(actual_splits))
+                    & (split_idx < active_split_kv)
                 )
-            local_lse_max = fmax_f32(
-                local_lse_max,
-                lane_lse[lane_slot_i],
-            )
+                lane_lse[lane_slot_i] = neg_inf
+                # Keep the workspace access inside the dynamic predicate. Padded
+                # ranks must not form a load from the unpadded producer allocation.
+                if active_slot:
+                    lane_lse[lane_slot_i] = Float32(
+                        acc_lse[row_in_tile, split_idx, query_tile_idx, batch_idx]
+                    )
+                local_lse_max = fmax_f32(
+                    local_lse_max,
+                    lane_lse[lane_slot_i],
+                )
 
         local_lse_max = warp_reduce_max_f32(local_lse_max)
         local_exp_frame = local_lse_max if local_lse_max != neg_inf else Float32(0.0)
@@ -334,13 +344,14 @@ def run_parallel_reduction_kernel(
         )
         local_sum_lse = Float32(0.0)
         for lane_slot_i in cutlass.range_constexpr(lse_slots_per_lane):
-            lane_exp[lane_slot_i] = Float32(
-                cute.math.exp2(
-                    lane_lse[lane_slot_i] - local_exp_frame,
-                    fastmath=True,
+            if Int32(lane_slot_i * cfg.threads_per_warp) < live_rank_splits:
+                lane_exp[lane_slot_i] = Float32(
+                    cute.math.exp2(
+                        lane_lse[lane_slot_i] - local_exp_frame,
+                        fastmath=True,
+                    )
                 )
-            )
-            local_sum_lse += lane_exp[lane_slot_i]
+                local_sum_lse += lane_exp[lane_slot_i]
         local_sum_lse = warp_reduce_sum_f32(local_sum_lse)
         # Keep this warp-local value distinct from the post-barrier SMEM load.
         stats_lse_value = finalize_log2_sum_exp(local_exp_frame, local_sum_lse)
@@ -355,12 +366,15 @@ def run_parallel_reduction_kernel(
             smem_local_lse[0] = stats_lse_value
 
         for lane_slot_i in cutlass.range_constexpr(lse_slots_per_lane):
-            local_slot_idx = lane_idx + Int32(lane_slot_i * cfg.threads_per_warp)
-            if local_slot_idx < Int32(slots_per_rank):
-                weight = normalized_lse_weight(lane_lse[lane_slot_i], stats_lse_value)
-                if cutlass.const_expr(finalize_attention):
-                    weight *= sink_scale
-                smem_local_scale[local_slot_idx] = weight
+            if Int32(lane_slot_i * cfg.threads_per_warp) < live_rank_splits:
+                local_slot_idx = lane_idx + Int32(lane_slot_i * cfg.threads_per_warp)
+                if local_slot_idx < Int32(slots_per_rank):
+                    weight = normalized_lse_weight(
+                        lane_lse[lane_slot_i], stats_lse_value
+                    )
+                    if cutlass.const_expr(finalize_attention):
+                        weight *= sink_scale
+                    smem_local_scale[local_slot_idx] = weight
 
     prims.barrier_cta_sync(SPLIT_REDUCTION_SCALE_BARRIER_ID)
 
@@ -376,7 +390,7 @@ def run_parallel_reduction_kernel(
         local_output[j] = Float32(0.0)
 
     acc_output_ptr = acc_output.iterator.raw_ptr()
-    for slot_i in cutlass.range_constexpr(slots_per_rank):
+    for slot_i in cutlass.range(live_rank_splits, unroll=4):
         split_idx = cluster_rank * Int32(slots_per_rank) + Int32(slot_i)
         active_slot = (
             query_is_valid

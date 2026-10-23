@@ -1009,7 +1009,9 @@ class MlaDecodeTs:
             self.sparse_balanced_registers,
         )
 
-    def _configure_parallel_reduction_topology(self) -> None:
+    def _configure_parallel_reduction_topology(
+        self, policy_splits: int | None = None
+    ) -> None:
         """Refresh reducer topology after any host-side launch-shape update."""
 
         self.parallel_reduction_topology = None
@@ -1029,8 +1031,11 @@ class MlaDecodeTs:
 
         if not self._parallel_reduction_shape_is_eligible:
             return
+        policy_splits = (
+            self.reduction_split_capacity if policy_splits is None else policy_splits
+        )
         topology = make_q128_wave_limited_parallel_reduction_topology(
-            self.reduction_split_capacity,
+            policy_splits,
             logical_rows=(self.num_heads * self.seq_len_q * self.batch_size),
             physical_sm_count=self.max_active_clusters * 2,
             max_cluster_size=8,
@@ -1043,30 +1048,27 @@ class MlaDecodeTs:
         # physical row. Padded M128 tails and intermediate split counts retain
         # the compact reference grid; high split counts may use clusters.
         use_small_split_g1 = (
-            self.reduction_split_capacity <= 16
+            policy_splits <= 16
             and topology is not None
             and topology.cluster_size == 1
             and parallel_g1_grid_has_no_padded_rows
             and should_use_q128_g1_parallel_reducer(
                 batch_size=self.batch_size,
                 physical_rows_per_batch=(physical_tile_rows * num_query_tiles),
-                producer_ctas=(
-                    self.batch_size
-                    * num_query_tiles
-                    * self.reduction_split_capacity
-                    * 2
-                ),
+                producer_ctas=(self.batch_size * num_query_tiles * policy_splits * 2),
                 reference_rows_per_cta=REDUCTION_ROWS_PER_CTA,
                 physical_sm_count=self.max_active_clusters * 2,
             )
         )
         use_high_split_cluster = (
-            self.reduction_split_capacity > 32
-            and topology is not None
-            and topology.cluster_size > 1
+            policy_splits > 32 and topology is not None and topology.cluster_size > 1
         )
-        if use_small_split_g1 or use_high_split_cluster:
-            self.parallel_reduction_topology = topology
+        if topology is not None and (use_small_split_g1 or use_high_split_cluster):
+            self.parallel_reduction_topology = (
+                make_balanced_parallel_reduction_topology(
+                    self.reduction_split_capacity, cluster_size=topology.cluster_size
+                )
+            )
             self.use_parallel_reduction = True
 
     def _make_config(self):
@@ -2042,7 +2044,7 @@ class MlaDecodeTs:
                 work_queue=mla_work_queue,
                 cache_seqs=cache_seqs,
                 cu_seqlens_q=cu_seqlens_q,
-                split_kv=Int32(self.reduction_split_capacity),
+                split_kv=max_split_kv,
                 logical_num_heads_q=self.num_heads,
                 logical_seq_len_q=self.seq_len_q,
                 tiled_mma_qk=tiled_mma_qk,
@@ -2113,7 +2115,7 @@ class MlaDecodeTs:
             named_res["gmem_o"].smem_exchange = epilogue_exchange_arr.data_ptr().toint(
                 Int32
             )
-            named_res["gmem_o"].split_kv = Int32(self.reduction_split_capacity)
+            named_res["gmem_o"].split_kv = max_split_kv
 
             task_manager.run()
 
@@ -2150,7 +2152,7 @@ class MlaDecodeTs:
         workspace: cute.Tensor,
     ):
         """Construct acc_o and acc_lse tensors from the workspace buffer."""
-        split_kv = Int32(self.reduction_split_capacity)
+        # Allocation is SM-bounded; live tensors use the runtime split stride.
         acc_o, acc_lse = None, None
         if cutlass.const_expr(workspace is not None):
             # Workspace strides are aligned to 256 bits, expressed in Float16

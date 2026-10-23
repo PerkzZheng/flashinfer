@@ -34,8 +34,6 @@ from flashinfer.trace.templates.attention import (
     prims_ts_decode_mla_wrapper_trace_dispatch,
 )
 
-from .split_kv_mode_policy import split_capacity
-
 
 from .decode import (
     prepare_lse,
@@ -870,10 +868,9 @@ def _resolve_mla_decode_launch_spec(
 
         if use_throughput_latency:
             assert decision.config is not None
-            capacity = split_capacity(one_cta_split_kv, sm_count)
-            # Admission must describe the capacity used by the native launch.
+            # Cluster fanout is physical topology, not a rounded scratch bound.
             prepared_cfg = resolve_auto_cluster_reduction_config(
-                replace(decision.config, num_ctas_per_seq_kv=capacity),
+                decision.config,
                 reduction_mode=None,
             )
             reduction_mode = (
@@ -883,6 +880,11 @@ def _resolve_mla_decode_launch_spec(
                 else resolve_runtime_cluster_reduction_mode(
                     prepared_cfg, reduction_mode=None
                 )
+            )
+            capacity = (
+                one_cta_split_kv
+                if prepared_cfg.use_cluster_reduction or one_cta_split_kv == 1
+                else sm_count
             )
             kernel = ThroughputLatencyMlaDecodeTs(
                 batch_size=batch_size,
@@ -904,6 +906,7 @@ def _resolve_mla_decode_launch_spec(
                 tile_size_q=launch_shape.tile_size_q,
                 explicit_split_kv=None,
                 split_kv_capacity=capacity,
+                reduction_policy_splits=one_cta_split_kv,
                 explicit_persistent=None,
                 mask_type=mask_type,
             )
@@ -965,7 +968,7 @@ def _resolve_mla_decode_launch_spec(
             if not decision.implementation_ready:
                 raise NotImplementedError(decision.reason)
             split_kv = two_cta_split_kv
-            capacity = split_capacity(split_kv, sm_count)
+            capacity = 1 if split_kv == 1 else sm_count
             work_clusters = batch_size * launch_shape.num_tiles * max(split_kv, 1)
             # Dynamic cluster stealing only helps once logical work exceeds a
             # resident wave.  Within one wave every cluster already launches,
@@ -992,6 +995,7 @@ def _resolve_mla_decode_launch_spec(
                 batch_size=batch_size,
                 mask_type=mask_type,
             )
+            kernel._configure_parallel_reduction_topology(split_kv)
             workspace_size = compute_2cta_workspace_size(
                 tile_size_q=int(launch_shape.tile_size_q),
                 num_q_tiles=int(launch_shape.num_tiles),

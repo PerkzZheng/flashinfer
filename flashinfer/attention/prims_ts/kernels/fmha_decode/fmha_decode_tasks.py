@@ -63,7 +63,10 @@ from .fmha_decode_constants import (
     KV_KIND_K,
     KV_KIND_V,
 )
+from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
+
 from .fmha_decode_resources.helpers_common import (
+    split_kv_grid_coord,
     _assume_nonnegative_i32,
     _q_group_token_base,
     _q_seq_bounds,
@@ -211,7 +214,9 @@ class PackedDecodeWorkQueue(WorkQueue):
                     lengths = HeadIndexedMetadataView(lengths, self.num_heads_kv, h_idx)
             empty_kv = cutlass.Int32(lengths[b_idx]) <= cutlass.Int32(0)
         q_group_idx = cutlass.Int32(q_group_cta_idx)
-        if cutlass.const_expr(self.cfg.use_split_kv):
+        if cutlass.const_expr(self.cfg.uses_compact_split_grid):
+            q_group_idx = cutlass.Int32(cute.arch.block_idx()[2]) % self.cfg.num_q_ctas
+        elif cutlass.const_expr(self.cfg.use_split_kv):
             q_group_idx = q_group_idx // cutlass.Int32(self.cfg.splits_kv)
         _, seq_len_q = _q_seq_bounds(
             self.cfg,
@@ -812,6 +817,11 @@ class DecodeGenTask(Task):
         context: ResourceContext | None = None,
     ) -> None:
         """Run one ordinary task tile and synchronize attention-sink tails."""
+        if cutlass.const_expr(self.cfg is not None and self.cfg.runtime_split_kv):
+            work_tile = WorkTileInfo(
+                split_kv_grid_coord(self.cfg, work_tile.tile_idx),
+                work_tile.is_valid_tile,
+            )
         Task._run_task_body_impl(
             self,
             work_tile,
@@ -1034,11 +1044,12 @@ class DecodeGenTask(Task):
             )
             return loop_domain + cutlass.Int32(self.domain_bias)
 
-        # Decode the logical Q tile with the configured physical split fanout,
-        # then derive its causal/window K union and useful runtime split prefix.
+        # Work-tile coordinates retain the configured capacity stride.
         q_group_cta_idx = cutlass.Int32(tile_coord[0])
         q_group_idx = q_group_cta_idx
-        if self.cfg.use_split_kv:
+        if self.cfg.uses_compact_split_grid:
+            q_group_idx = cutlass.Int32(cute.arch.block_idx()[2]) % self.cfg.num_q_ctas
+        elif self.cfg.use_split_kv:
             q_group_idx = q_group_cta_idx // cutlass.Int32(self.cfg.splits_kv)
         q_token_base = _q_group_token_base(self.cfg, q_group_idx)
         seq_len_q = (
@@ -1073,10 +1084,11 @@ class DecodeGenTask(Task):
                 q_token_base,
                 requested_splits=self.requested_splits,
             )
-            # Physical split coordinates and page-cache strides are laid out with
-            # the configured launch fanout.  Runtime pruning only shortens the
-            # useful prefix; it must not renumber the remaining CTAs.
-            split_idx = cutlass.Int32(tile_coord[0]) % cutlass.Int32(self.cfg.splits_kv)
+            split_idx = cutlass.Int32(cute.arch.block_idx()[0])
+            if not self.cfg.uses_compact_split_grid:
+                split_idx = cutlass.Int32(tile_coord[0]) % cutlass.Int32(
+                    self.cfg.splits_kv
+                )
             self._kv_raw_tile_base = skipped_tiles + split_idx * total_kv_tiles
         else:
             self._kv_raw_tile_base = skipped_tiles

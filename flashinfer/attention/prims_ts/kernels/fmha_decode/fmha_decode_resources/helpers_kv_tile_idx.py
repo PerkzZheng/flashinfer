@@ -319,6 +319,8 @@ def _static_split_kv_global_tile_idx(
 @cute.jit
 def _logical_cta_kv_idx(cfg: FmhaDecodeConfig, stage_info: StageInfo) -> Int32:
     """Resolve the split index from the Q-group-major launch coordinate."""
+    if cutlass.const_expr(cfg.uses_compact_split_grid):
+        return Int32(cute.arch.block_idx()[0])
     if cutlass.const_expr(stage_info.work_tile is not None):
         q_group_cta_idx = Int32(stage_info.work_tile.tile_idx[0])
     else:
