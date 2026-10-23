@@ -1103,6 +1103,9 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     )
     definitions = (*fmha_definitions, *mla_definitions)
     assert tuple(definition["name"] for definition in definitions) == expected_names
+    for definition in definitions:
+        golden = Path(__file__).parent / "fi_trace_out" / f"{definition['name']}.json"
+        assert definition == json.loads(golden.read_text())
     assert {"block_tables", "seq_lens_kv"} <= fmha_definitions[0]["inputs"].keys()
     for input_name in ("block_tables", "seq_lens_kv"):
         assert "optional" not in fmha_definitions[0]["inputs"][input_name]

@@ -2892,6 +2892,7 @@ class BatchPrefillTSWrapper:
         lse_mode='base2' enables final LSE stores, and use_attention_sinks enables
         a per-run sink binding. Context scales are positive host scalar defaults.
         Sage plans use BF16 output by default and require per-run Sage scales.
+        Sage V-mean restoration cannot be combined with attention sinks.
         Equivalent plans reuse policy and compiled-kernel caches.
         vc_config selects dense fixed D128 MHA with 16-bit Q/K, E4M3 V and
         per-run VCAttentionParams. VC runs sharing a plan must not overlap."""
@@ -2929,6 +2930,10 @@ class BatchPrefillTSWrapper:
             out_dtype=resolved_out_dtype,
             sage=sage,
         )
+        if sage is not None and sage.v_mean and use_attention_sinks:
+            raise NotImplementedError(
+                "Sage V-mean restoration does not support attention sinks"
+            )
         if vc_config is not None and not isinstance(vc_config, VCAttentionConfig):
             raise TypeError("vc_config must be a VCAttentionConfig instance")
         if vc_config is not None and (packed_query or mask_type != "dense"):

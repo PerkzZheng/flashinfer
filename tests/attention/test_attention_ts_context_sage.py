@@ -328,6 +328,8 @@ def test_context_sage_plan_rejects_unsupported_recipes() -> None:
         _plan(sage=config, mask_type="causal", **shape)
     with pytest.raises(TypeError, match="SageAttentionConfig"):
         _plan(sage=SageAttentionParams, **shape)
+    with pytest.raises(NotImplementedError, match="V-mean.*attention sinks"):
+        _plan(sage=SageAttentionConfig(v_mean=True), use_attention_sinks=True, **shape)
 
 
 @_REQUIRES_CONTEXT_SAGE_GPU
