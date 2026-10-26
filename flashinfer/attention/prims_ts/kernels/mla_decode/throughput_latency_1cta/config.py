@@ -32,8 +32,10 @@ from typing import Any
 
 from ....split_kv_mode_policy import select_split_kv_modes
 from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
+from ..scaled_kv.layout import ScaledKVConfig
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.query import FlatQueryTileLayout
+from ..scaled_kv.nvfp4 import nvfp4_row_bytes
 
 
 # 1CTA profiles are specialized for these Q/head tiles.  Tile sizes 8/16 use
@@ -78,7 +80,7 @@ def estimated_throughput_latency_smem_data_bytes(cfg: "MlaConfig") -> int:
 
 
 @dataclass(frozen=True)
-class MlaConfig:
+class MlaConfig(ScaledKVConfig):
     """Kernel traits for one throughput-latency 1CTA MLA schedule.
 
     The dataclass groups shape dimensions, tile sizes, CTA decomposition,
@@ -165,6 +167,16 @@ class MlaConfig:
     correction_num_warps: int = 4
     mma_num_warps: int = 1
     load_num_warps: int = 1
+    whole_kv_tile: bool = False
+    single_raw_prefetch: bool = False
+    compact_nv_rope: bool = False
+    q_tma_stage: bool = False
+    q_nope_tmem: bool = False
+    ws_native_e: bool = False
+    ws_qk: bool = False
+    ws_pv: bool = False
+    kv_cache_format: str = "native"
+    extra_kv_cache_format: str = "native"
     sparse_reuse_kv: bool = False
     paired_sparse_correction: bool = False
     defer_sparse_max_update: bool = False
@@ -205,9 +217,27 @@ class MlaConfig:
     attention_window_size: int = 0
 
     @property
+    def nvfp4_row_bytes(self) -> int:
+        return nvfp4_row_bytes(self.rope_dim)
+
+    @property
+    def whole_kv_tile_bytes(self) -> int:
+        return self.tile_size_kv * self.head_dim_qk * self.qkv_dtype_bytes
+
+    @property
+    def async_scaled_kv_gather(self) -> bool:
+        """Use independent gather/transform warps with two retained tiles."""
+        return self.use_scaled_kv and self.whole_kv_tile
+
+    @property
     def one_insts_kv_swap(self) -> bool:
         """One KV stream with swapped MMA operands (P remains in SMEM)."""
         return self.num_insts_kv == 1 and self.kernel_variant == "swaps_mma_ab"
+
+    @property
+    def compact_softmax_stats(self) -> bool:
+        """Store one warp-reduced statistic per Swap-AB column group."""
+        return self.whole_kv_tile and self.one_insts_kv_swap
 
     @property
     def single_kv_pipe(self) -> bool:
@@ -1305,7 +1335,7 @@ def is_throughput_latency_mla_supported_shape(
         and is_power_of_two(num_heads_q)
         and (
             num_tokens_per_page in SUPPORTED_MLA_PAGE_SIZES
-            or (num_tokens_per_page == 1 and rope_dim == 0)
+            or (num_tokens_per_page == 1 and rope_dim in (0, 64))
         )
         and seq_len_q >= 1
         and seq_len_kv >= 128
@@ -1550,7 +1580,7 @@ def make_throughput_latency_mla_config(
     if rope_dim < 0:
         raise ValueError("rope_dim must be non-negative")
     if num_tokens_per_page not in SUPPORTED_MLA_PAGE_SIZES and not (
-        num_tokens_per_page == 1 and rope_dim == 0
+        num_tokens_per_page == 1 and rope_dim in (0, 64)
     ):
         raise ValueError(
             "num_tokens_per_page must be one of "
@@ -1738,7 +1768,20 @@ def configure_sparse_mla(
     reuse = profile.reuse_kv
     uniform = profile.uniform_offset_cache
     single = profile.single_kv_stream
-    if cfg.num_tokens_per_page != 1 or cfg.rope_dim != 0:
+    whole_scaled_kv = profile.whole_kv_tile
+    if whole_scaled_kv and not (
+        cfg.use_scaled_kv
+        and cfg.is_fp8_qkv()
+        and cfg.rope_dim in (0, 64)
+        and reuse
+        and (keep or single)
+        and issuers == 8
+        and profile.kv_tile_size == 128
+    ):
+        raise ValueError(
+            "whole scaled KV tiles require D512/D576, one KV stream, BK128 and eight converters"
+        )
+    if cfg.num_tokens_per_page != 1 or cfg.rope_dim not in (0, 64):
         raise ValueError("sparse profiles require native page-size-one MLA")
     if issuers not in (1, 2, 4, 8):
         raise ValueError("sparse profiles require one, two, four or eight issuers")
@@ -1748,14 +1791,14 @@ def configure_sparse_mla(
         raise ValueError("unsupported sparse query tile")
     if single and (
         keep
-        or cfg.tile_size_q not in (8, 16)
+        or cfg.tile_size_q not in ((8, 16, 32) if whole_scaled_kv else (8, 16))
         or cfg.num_ctas_per_head_dim != 1
-        or issuers != 4
+        or issuers != (8 if whole_scaled_kv else 4)
         or cfg.use_cluster_reduction
         or (cfg.num_ctas_per_seq_kv > 1 and cfg.use_persistent_scheduler)
     ):
         raise ValueError(
-            "one-instance Swap-AB requires M8/M16, V1, four issuers and no cluster reduction"
+            "one-instance Swap-AB requires a supported tile/loader layout, one V owner and no cluster reduction"
         )
     if reuse and cfg.num_ctas_per_head_dim != 1:
         raise ValueError("retained KV requires one V owner")
@@ -1815,23 +1858,29 @@ def configure_sparse_mla(
         issuers == 8
         and not keep
         and (
-            cfg.tile_size_q not in (8, 16)
+            (cfg.tile_size_q not in (8, 16) and not whole_scaled_kv)
             or cfg.local_kv_tiles(cfg.total_kv_tiles) <= cfg.num_insts_kv
         )
     ):
         raise ValueError("eight Swap-AB issuers require a steady-state loop")
 
+    retained_scaled_kv = (
+        cfg.use_scaled_kv and keep and issuers == 8 and reuse
+    ) or whole_scaled_kv
+    ws_mma = retained_scaled_kv and keep
     # Four D128 slices make one D512 tile. FP8/BK64 reuse keeps two tiles;
     # BF16 BK128 retains one, with additional stages used for prefetch.
     kv_stages = (
         profile.reuse_kv_stages if reuse and profile.reuse_kv_stages else cfg.kv_stages
     )
-    if reuse and profile.reuse_kv_stages:
-        retained_tiles = 2 if cfg.is_fp8_qkv() or cfg.tile_size_kv == 64 else 1
+    if reuse and profile.reuse_kv_stages and not retained_scaled_kv:
+        retained_tiles = (
+            2
+            if cfg.is_fp8_qkv() or (cfg.tile_size_kv == 64 and not cfg.rope_dim)
+            else 1
+        )
         if kv_stages < retained_tiles * cfg.qk_head_dim_stages:
             raise ValueError("insufficient stages to retain KV through PV")
-    if cfg.tile_size_kv == 64 and profile.reuse_kv_stages < 2 * cfg.qk_head_dim_stages:
-        raise ValueError("BK64 requires two retained K tiles")
     page_stages = cfg.page_offsets_stages
     if (
         reuse
@@ -1842,6 +1891,8 @@ def configure_sparse_mla(
         page_stages = 1
     if profile.page_pipeline_stages:
         page_stages = profile.page_pipeline_stages
+    if retained_scaled_kv:
+        page_stages = 2
     if single and reuse and kv_stages >= 6 and not cfg.is_fp8_qkv():
         page_stages = 1
 
@@ -1904,10 +1955,31 @@ def configure_sparse_mla(
             if balanced
             else cfg.scheduler_regs,
         )
+    if retained_scaled_kv:
+        roles.update(
+            threads_per_cta=640,
+            page_offsets_warp_idx=9,
+            page_offsets_num_warps=2,
+            softmax_regs=80 if ws_mma else 96,
+            correction_regs=144 if ws_mma else 128,
+            ws_pv=ws_mma,
+            ws_qk=ws_mma,
+            ws_native_e=ws_mma,
+            q_nope_tmem=ws_mma,
+            q_tma_stage=ws_mma,
+            tmem_s_cols=64 if ws_mma else cfg.tile_size_q,
+            compact_nv_rope=bool(cfg.rope_dim),
+            single_raw_prefetch=True,
+            page_offsets_entries_per_stage=132,
+            whole_kv_tile=True,
+        )
+        kv_stages = 2
     return dataclass_replace(
         cfg,
         **roles,
         kv_stages=kv_stages,
         page_offsets_stages=page_stages,
-        q_stages=1 if single or (reuse and profile.reuse_kv_stages) else cfg.q_stages,
+        q_stages=1
+        if retained_scaled_kv or single or (reuse and profile.reuse_kv_stages)
+        else cfg.q_stages,
     )

@@ -95,6 +95,9 @@ from .parallel_reduction import (
     supports_parallel_gmem_reduction,
 )
 from .reduction import gmem_reduction_launch_shape, run_gmem_reduction_kernel
+from ..helpers.gather import make_sparse_rope_map
+from ..scaled_kv.layout import ScaledKVConfig
+from ..scaled_kv.tma import make_scaled_kv_maps
 from ..helpers.constants import LOG2_E, TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BARRIER_ID
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.tile import (
@@ -462,7 +465,12 @@ def build_throughput_latency_mla_task_manager(
     tma_desc_c_latent=None,
     tma_desc_c_rope=None,
     tma_desc_v=None,
+    tma_desc_bulk_extra=None,
+    tma_desc_sparse_rope=None,
+    tma_desc_sparse_extra_rope=None,
     c_rope_tensor=None,
+    c_latent_tensor=None,
+    q_tensor=None,
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
@@ -514,7 +522,12 @@ def build_throughput_latency_mla_task_manager(
             tma_desc_c_latent=tma_desc_c_latent,
             tma_desc_c_rope=tma_desc_c_rope,
             tma_desc_v=tma_desc_v,
+            tma_desc_bulk_extra=tma_desc_bulk_extra,
+            tma_desc_sparse_rope=tma_desc_sparse_rope,
+            tma_desc_sparse_extra_rope=tma_desc_sparse_extra_rope,
             c_rope_tensor=c_rope_tensor,
+            c_latent_tensor=c_latent_tensor,
+            q_tensor=q_tensor,
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,
@@ -545,7 +558,9 @@ def build_throughput_latency_mla_task_manager(
     tma_group = pipeline.CooperativeGroup(agent.Thread)
     umma_group = pipeline.CooperativeGroup(agent.Thread)
     load_group = pipeline.CooperativeGroup(agent.Thread, cfg.load_num_warps * 32)
-    page_group = pipeline.CooperativeGroup(agent.Thread, 32)
+    page_group = pipeline.CooperativeGroup(
+        agent.Thread, 32 * cfg.page_offsets_num_warps
+    )
     scheduler_group = pipeline.CooperativeGroup(
         agent.Thread,
         cfg.scheduler_num_warps * 32,
@@ -599,9 +614,12 @@ def build_throughput_latency_mla_task_manager(
     )
     smem_kv_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.kv_stages,
-        num_bytes=cfg.kv_smem_tile_bytes,
+        num_bytes=cfg.whole_kv_tile_bytes
+        if cfg.whole_kv_tile
+        else cfg.kv_smem_tile_bytes,
         num_bytes_per_warp_per_cta=(
-            cfg.kv_smem_tile_bytes // cfg.load_num_warps
+            (cfg.whole_kv_tile_bytes if cfg.whole_kv_tile else cfg.kv_smem_tile_bytes)
+            // cfg.load_num_warps
             if cfg.load_num_warps > 1
             else None
         ),
@@ -722,8 +740,11 @@ def build_throughput_latency_mla_task_manager(
         tma_desc_c_latent=tma_desc_c_latent,
         tma_desc_c_rope=tma_desc_c_rope,
         tma_desc_v=tma_desc_v,
-        tma_desc_bulk_extra=tma_desc_q_rope,
+        tma_desc_bulk_extra=tma_desc_bulk_extra,
+        tma_desc_sparse_rope=tma_desc_sparse_rope,
+        tma_desc_sparse_extra_rope=tma_desc_sparse_extra_rope,
         c_rope_tensor=c_rope_tensor,
+        c_latent_tensor=c_latent_tensor,
         page_offsets_kv=smem_page_offsets if use_page_offsets else None,
         page_offsets=page_offsets,
         cache_seqs=cache_seqs,
@@ -1092,6 +1113,7 @@ def build_throughput_latency_mla_task_manager(
     tmem_allocator.add_resource(local0)
     tmem_allocator.add_resource(local1)
     tmem_allocator.add_resource(tmem_o)
+    tmem_allocator.add_resource(smem_q)
     tmem_allocator.compute_layout()
 
     if cfg.short_merged_softmax:
@@ -1153,7 +1175,12 @@ def _make_single_kv_pipe_task_graph(
     tma_desc_c_latent=None,
     tma_desc_c_rope=None,
     tma_desc_v=None,
+    tma_desc_bulk_extra=None,
+    tma_desc_sparse_rope=None,
+    tma_desc_sparse_extra_rope=None,
     c_rope_tensor=None,
+    c_latent_tensor=None,
+    q_tensor=None,
     page_offsets=None,
     cache_seqs=None,
     cu_seqlens_q=None,
@@ -1197,7 +1224,9 @@ def _make_single_kv_pipe_task_graph(
     tma_group = pipeline.CooperativeGroup(agent.Thread)
     umma_group = pipeline.CooperativeGroup(agent.Thread)
     load_group = pipeline.CooperativeGroup(agent.Thread, cfg.load_num_warps * 32)
-    page_group = pipeline.CooperativeGroup(agent.Thread, 32)
+    page_group = pipeline.CooperativeGroup(
+        agent.Thread, 32 * cfg.page_offsets_num_warps
+    )
     softmax_group = pipeline.CooperativeGroup(
         agent.Thread,
         cfg.softmax_num_warps * 32,
@@ -1241,9 +1270,12 @@ def _make_single_kv_pipe_task_graph(
     )
     smem_kv_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.kv_stages,
-        num_bytes=cfg.kv_smem_tile_bytes,
+        num_bytes=cfg.whole_kv_tile_bytes
+        if cfg.whole_kv_tile
+        else cfg.kv_smem_tile_bytes,
         num_bytes_per_warp_per_cta=(
-            cfg.kv_smem_tile_bytes // cfg.load_num_warps
+            (cfg.whole_kv_tile_bytes if cfg.whole_kv_tile else cfg.kv_smem_tile_bytes)
+            // cfg.load_num_warps
             if cfg.load_num_warps > 1
             else None
         ),
@@ -1329,6 +1361,7 @@ def _make_single_kv_pipe_task_graph(
         pipeline_config=smem_q_cfg,
         tma_desc_q_latent=tma_desc_q_latent,
         tma_desc_q_rope=tma_desc_q_rope,
+        q_tensor=q_tensor,
         cu_seqlens_q=cu_seqlens_q,
         head_idx=head_idx,
         batch_idx=batch_idx,
@@ -1341,8 +1374,11 @@ def _make_single_kv_pipe_task_graph(
         tma_desc_c_latent=tma_desc_c_latent,
         tma_desc_c_rope=tma_desc_c_rope,
         tma_desc_v=tma_desc_v,
-        tma_desc_bulk_extra=tma_desc_q_rope,
+        tma_desc_bulk_extra=tma_desc_bulk_extra,
+        tma_desc_sparse_rope=tma_desc_sparse_rope,
+        tma_desc_sparse_extra_rope=tma_desc_sparse_extra_rope,
         c_rope_tensor=c_rope_tensor,
+        c_latent_tensor=c_latent_tensor,
         page_offsets_kv=smem_page_offsets if use_page_offsets else None,
         page_offsets=page_offsets,
         cache_seqs=cache_seqs,
@@ -1354,6 +1390,10 @@ def _make_single_kv_pipe_task_graph(
         cta_idx_head_dim_v=cta_idx_head_dim_v,
         name="ll_mla_q64_smem_kv",
     )
+    if cfg.q_tma_stage:
+        smem_q.kv_alias_ref = smem_kv
+    if cfg.async_scaled_kv_gather:
+        smem_page_offsets.nv_target = smem_kv
     tmem_s = (TmemSResource if cfg.one_insts_kv_swap else TmemSKeepsResource)(
         cfg=cfg,
         page_offsets=page_offsets,
@@ -1544,7 +1584,7 @@ def _make_single_kv_pipe_task_graph(
             )
         )
 
-    if cfg.load_warp_idx == 12:
+    if cfg.load_warp_idx == 12 and cfg.page_offsets_warp_idx != 9:
         idle = create_padding_task(
             cfg, work_queue, warp_idx=9, num_warps=1, task_class=MlaDecodeTask
         )
@@ -1633,6 +1673,7 @@ def _make_single_kv_pipe_task_graph(
     tmem_allocator.add_resource(tmem_s)
     tmem_allocator.add_resource(local)
     tmem_allocator.add_resource(tmem_o)
+    tmem_allocator.add_resource(smem_q)
     tmem_allocator.compute_layout()
 
     task_manager = TaskManager(
@@ -1650,7 +1691,7 @@ def _make_single_kv_pipe_task_graph(
     return task_manager, corr
 
 
-class ThroughputLatencyMlaDecodeTs:
+class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
     """Throughput-latency 1CTA MLA over dense pages or prepared sparse rows."""
 
     def __init__(
@@ -1679,6 +1720,8 @@ class ThroughputLatencyMlaDecodeTs:
         mask_type: MaskType | str = MaskType.CAUSAL,
         sparse_profile=None,
         finalize_output: bool = False,
+        kv_cache_format: str = "native",
+        extra_kv_cache_format: str = "native",
     ):
         """Initialize one selected physical tile profile over logical flat Q rows."""
         import cutlass as _cutlass
@@ -1708,6 +1751,8 @@ class ThroughputLatencyMlaDecodeTs:
         self.explicit_persistent = explicit_persistent
         self.mask_type = normalize_mask_type(mask_type)
         self.sparse_profile = sparse_profile
+        self.kv_cache_format = kv_cache_format
+        self.extra_kv_cache_format = extra_kv_cache_format
         self.finalize_output = finalize_output
         self.output_quant = None
         # Sparse attention binds separate source lists; dense attention uses
@@ -1772,15 +1817,26 @@ class ThroughputLatencyMlaDecodeTs:
                 raise ValueError(
                     "final sparse reduction requires one virtual query per request"
                 )
-            # Partials already contain every V partition. Finalize one whole
-            # D512 head per CTA, sharing its statistics across four vec4 warps.
+            # Partials already contain every V partition. Each slice covers
+            # complete D512 heads and shares their statistics across its warps.
             reducer_cfg = dataclass_replace(
                 cfg, num_ctas_per_head_dim=1, head_dim_per_cta_v=cfg.head_dim_v
             )
             topology = make_balanced_parallel_reduction_topology(
                 cfg.num_ctas_per_seq_kv, cluster_size=1
             )
-            return reducer_cfg, topology, cfg.head_dim_v
+            # Two complete heads per block amortize sparse reduction setup
+            # and use vec8 loads/stores. Keep quantized output on its existing
+            # one-head path until its wider-fragment contract is qualified.
+            heads_per_cta = (
+                2
+                if cfg.use_scaled_kv
+                and cfg.whole_kv_tile
+                and cfg.tile_size_q == 64
+                and self.output_quant is None
+                else 1
+            )
+            return reducer_cfg, topology, cfg.head_dim_v * heads_per_cta
         return (
             cfg,
             self.parallel_reduction_topology,
@@ -1849,6 +1905,11 @@ class ThroughputLatencyMlaDecodeTs:
             explicit_split_kv=self.explicit_split_kv,
             explicit_persistent=self.explicit_persistent,
             mask_type=self.mask_type,
+        )
+        cfg = dataclass_replace(
+            cfg,
+            kv_cache_format=self.kv_cache_format,
+            extra_kv_cache_format=self.extra_kv_cache_format,
         )
         if self.sparse_profile is not None:
             cfg = configure_sparse_mla(
@@ -2134,7 +2195,7 @@ class ThroughputLatencyMlaDecodeTs:
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
 
-        if cutlass.const_expr(cfg.rope_dim > 0):
+        if cutlass.const_expr(cfg.rope_dim > 0 and cfg.num_tokens_per_page != 1):
             c_rope_tma = cute.make_tensor(
                 c_rope.iterator,
                 cute.select(c_rope.layout, mode=[1, 0, 2]),
@@ -2153,9 +2214,11 @@ class ThroughputLatencyMlaDecodeTs:
             tma_desc_c_rope = tma_desc_c_latent
 
         tma_desc_v = tma_desc_c_latent
+        tma_desc_bulk_extra = tma_desc_c_rope
+        tma_desc_sparse_rope = tma_desc_c_latent
+        tma_desc_sparse_extra_rope = tma_desc_c_rope
         if cutlass.const_expr(cfg.num_tokens_per_page == 1):
-            # D512 does not use Q-rope; reuse its descriptor slot for the
-            # second pool's contiguous-run map. Gather maps stay separate.
+            # Bulk maps are separate from query RoPE and the gather maps.
             rows_per_issuer = 32
             tma_desc_v = create_tensor_map_tiled_from_view(
                 c_rows,
@@ -2164,12 +2227,37 @@ class ThroughputLatencyMlaDecodeTs:
                 swizzle=cuda.TensorMapSwizzle.s128b,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
-            tma_desc_q_rope = create_tensor_map_tiled_from_view(
+            tma_desc_bulk_extra = create_tensor_map_tiled_from_view(
                 c_extra_rows,
                 box_dims=(tma_box0, rows_per_issuer),
                 stride_order=(0, 1),
                 swizzle=cuda.TensorMapSwizzle.s128b,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
+
+        if cutlass.const_expr(
+            cfg.num_tokens_per_page == 1 and cfg.rope_dim and not cfg.use_scaled_kv
+        ):
+            tma_desc_sparse_rope = make_sparse_rope_map(c_latent, cfg.qkv_dtype_bytes)
+            tma_desc_sparse_extra_rope = make_sparse_rope_map(
+                c_rope, cfg.qkv_dtype_bytes
+            )
+
+        if cutlass.const_expr(cfg.use_scaled_kv):
+            (
+                tma_desc_c_latent,
+                tma_desc_c_rope,
+                tma_desc_v,
+                tma_desc_bulk_extra,
+                tma_desc_sparse_rope,
+                tma_desc_sparse_extra_rope,
+            ) = make_scaled_kv_maps(
+                c_latent,
+                c_rope,
+                cfg.rope_dim,
+                whole_nope=cfg.async_scaled_kv_gather,
+                primary_format=cfg.kv_cache_format,
+                extra_format=cfg.extra_kv_cache_format,
             )
 
         softmax_scale_log2 = softmax_scale * LOG2_E
@@ -2252,6 +2340,11 @@ class ThroughputLatencyMlaDecodeTs:
             tile_sched_params,
             block_split_kvs,
             output_quant_args,
+            tma_desc_bulk_extra,
+            tma_desc_sparse_rope,
+            tma_desc_sparse_extra_rope,
+            c_latent,
+            q_latent,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -2281,7 +2374,12 @@ class ThroughputLatencyMlaDecodeTs:
                     batch_size,
                 )
                 if cutlass.const_expr(cfg.fuse_sparse_reduction):
-                    reduction_grid = (cfg.logical_num_heads_q, 1, batch_size)
+                    heads_per_cta = elements // cfg.head_dim_v
+                    reduction_grid = (
+                        (cfg.logical_num_heads_q + heads_per_cta - 1) // heads_per_cta,
+                        1,
+                        batch_size,
+                    )
                 reduction_threads = parallel_gmem_reduction_threads(elements)
                 parallel_reducer = self.parallel_gmem_reduction_kernel(
                     o,
@@ -2366,6 +2464,11 @@ class ThroughputLatencyMlaDecodeTs:
         tile_sched_params: object,
         sparse_inputs: object,
         output_quant_args=None,
+        tma_desc_bulk_extra: cutlass.GridConstant[cuda.TensorMap] = None,
+        tma_desc_sparse_rope: cutlass.GridConstant[cuda.TensorMap] = None,
+        tma_desc_sparse_extra_rope: cutlass.GridConstant[cuda.TensorMap] = None,
+        c_latent: cute.Tensor = None,
+        q_nope_tensor: cute.Tensor = None,
     ):
         """Execute one flat-Q, batch, KV-split, and V head-dimension tile."""
         cfg = self._make_config()
@@ -2492,7 +2595,12 @@ class ThroughputLatencyMlaDecodeTs:
             tma_desc_c_latent=tma_desc_c_latent.get_ptr(),
             tma_desc_c_rope=tma_desc_c_rope.get_ptr(),
             tma_desc_v=tma_desc_v.get_ptr(),
+            tma_desc_bulk_extra=tma_desc_bulk_extra.get_ptr(),
+            tma_desc_sparse_rope=tma_desc_sparse_rope.get_ptr(),
+            tma_desc_sparse_extra_rope=tma_desc_sparse_extra_rope.get_ptr(),
             c_rope_tensor=c_rope,
+            c_latent_tensor=c_latent,
+            q_tensor=q_nope_tensor,
             page_offsets=page_offsets,
             cache_seqs=cache_seqs,
             cu_seqlens_q=cu_seqlens_q,

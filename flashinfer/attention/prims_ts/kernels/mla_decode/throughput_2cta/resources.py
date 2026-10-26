@@ -37,7 +37,7 @@ Output
 - GmemOResource     : Direct stores, or Async(2 stages) Correction -> TMA -> GMEM
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields as dataclass_fields
 from typing import Any, ClassVar
 
 from ..helpers.constants import LN_2, LOG2_E
@@ -46,6 +46,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.experimental import primitives as prims
 from cutlass import Boolean, Float32, Int16, Int32, Int64
+from cutlass.cutlass_dsl import dsl_user_op, if_generate
 
 from cutlass.experimental.task_scheduling.resources import (
     MemoryResource,
@@ -69,6 +70,8 @@ from ..helpers.gather import (
     CachedSparseMask,
 )
 
+from .scaled_kv_load import load_scaled_kv_stage, publish_scaled_v
+from ..scaled_kv.tma import prefetch_scaled_row
 from .config import (
     OUTPUT_TMA_STAGE_BYTES,
     V_SMEM_K_BLOCK_TOKENS,
@@ -123,6 +126,7 @@ from ..helpers.ops import (
 )
 from ..helpers.mask import MaskType, mask_visible_k_length
 from ..helpers.query import (
+    copy_q_fp8_to_tmem,
     flat_query_row_state,
     query_batch_bounds,
     runtime_flat_query_tile_has_rows,
@@ -131,6 +135,48 @@ from .work_partition import (
     runtime_split_kv_cap,
     runtime_split_tile_range,
 )
+
+
+# Both CTAs publish converted payloads to the leader with a cluster release.
+# The consumer must acquire at the same scope before reading either payload.
+def with_cluster_acquire_waits(base: object) -> object:
+    """Return ``base`` (a TmaUmma pipeline) with consumer waits/try-waits on the full barriers using acquire at cluster scope."""
+    cls = type(base)
+
+    class ClusterAcquirePipeline(cls):  # type: ignore[valid-type, misc]
+        @cute.jit
+        def try_cluster_acquire(self, state) -> Boolean:
+            bar = self.sync_object_full.get_barrier(state.index)
+            return prims.mbarrier_wait_parity(
+                bar,
+                state.phase,
+                prims.MBarrierWait.TRY,
+                scope=prims.MBarrierScope.CLUSTER,
+                order=prims.MemOrder.ACQUIRE,
+            )
+
+        @cute.jit
+        def wait_cluster_acquire(self, state) -> None:
+            while not self.try_cluster_acquire(state):
+                pass
+
+        @dsl_user_op
+        def consumer_try_wait(self, state, *, loc=None, ip=None) -> Boolean:
+            return self.try_cluster_acquire(state)
+
+        @dsl_user_op
+        def consumer_wait(
+            self, state, try_wait_token=None, *, loc=None, ip=None
+        ) -> None:
+            if_generate(
+                try_wait_token is None or try_wait_token == 0,
+                lambda: self.wait_cluster_acquire(state),
+                loc=loc,
+                ip=ip,
+            )
+
+    values = {f.name: getattr(base, f.name) for f in dataclass_fields(base)}
+    return ClusterAcquirePipeline(**values)
 
 
 def _install_task_local_specs(resource: object, specs: tuple[tuple, ...]) -> None:
@@ -646,6 +692,8 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     """
 
     request_lengths: Any = field(init=False, default=None)
+    primary_cache: Any = None
+    extra_cache: Any = None
     page_offsets: Any = None  # GMEM page-offset tensor
     smem_sparse_offsets: Any = None
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
@@ -739,11 +787,28 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
             )
         else:
             routes = self.page_offsets
-        quad = load_sparse_quad(routes, row, token)
-        self.smem_sparse_offsets.data_ptr(stage_info.stage_idx * 128 + lane * 4).store(
-            quad.load(0, 4), alignment=16
-        )
-        cute.arch.fence_view_async_shared()
+        active = cutlass.Boolean(True)
+        if cutlass.const_expr(
+            self.cfg.use_scaled_kv
+            and getattr(self.page_offsets, "assume_valid_prefix", False)
+        ):
+            active = lane // Int32(16) == cute.arch.make_warp_uniform(
+                cute.arch.block_idx_in_cluster()
+            )
+        if active:
+            quad = load_sparse_quad(routes, row, token)
+            if cutlass.const_expr(self.cfg.use_scaled_kv):
+                cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                if lane // Int32(16) == cta:
+                    for j in cutlass.range_constexpr(4):
+                        prefetch_scaled_row(
+                            self.primary_cache, self.extra_cache, quad[j], self.cfg
+                        )
+
+            self.smem_sparse_offsets.data_ptr(
+                stage_info.stage_idx * 128 + lane * 4
+            ).store(quad.load(0, 4), alignment=16)
+            cute.arch.fence_view_async_shared()
 
     @consumer_work(returns=(cached_mask_low, cached_mask_high))
     @cute.jit
@@ -1052,6 +1117,7 @@ class SmemQResource(HighThroughputMlaResource):
     """
 
     smem_q_latent: Any = None  # SMEM Q latent array
+    tmem_base_addr: Any = None
     smem_q_rope: Any = None  # SMEM Q rope array
     tma_desc_q_latent: Any = None
     tma_desc_q_rope: Any = None
@@ -1179,8 +1245,15 @@ class SmemQResource(HighThroughputMlaResource):
     @consumer_work
     @cute.jit
     def q_desc(self, stage_info: StageInfo) -> None:
-        """Schedule marker after the Q SMEM stage is waited."""
+        """Stage64 local Q rows into the replicated group-2 TMEM A layout."""
         del stage_info
+        if cutlass.const_expr(self.cfg.use_scaled_kv):
+            if prims.elect_sync():
+                copy_q_fp8_to_tmem(
+                    self.smem_q_latent.data_ptr(),
+                    self.tmem_base_addr + Int32(384),
+                    cta_group=2,
+                )
 
 
 # =====================================================================
@@ -1199,6 +1272,8 @@ class SmemKVResource(HighThroughputMlaResource):
     smem_kv: Any = None
     tma_desc_c_latent: Any = None
     tma_desc_c_rope: Any = None
+    tma_desc_sparse_rope: Any = None
+    tma_desc_sparse_extra_rope: Any = None
     tma_desc_c_transpose: Any = None
     tma_desc_extra_v: Any = None
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
@@ -1246,6 +1321,9 @@ class SmemKVResource(HighThroughputMlaResource):
             warp = (
                 cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_tma_warp_id
             )
+            rope = not is_v and subtile_idx >= cfg.iterations_qk_latent_stages
+            primary_k = self.tma_desc_sparse_rope if rope else self.tma_desc_c_latent
+            extra_k = self.tma_desc_sparse_extra_rope if rope else self.tma_desc_c_rope
             # Each issuer owns disjoint four-row quads. K covers 64 rows per
             # CTA (16 quads); V copies 32-token subtiles (8 quads). BF16 V is
             # blocked as 32x64 panels: two 64-feature/128-byte slices cover
@@ -1282,10 +1360,12 @@ class SmemKVResource(HighThroughputMlaResource):
                             self.smem_kv.data_ptr(
                                 base + group * 4 * cfg.mma_qk_tiler_k
                             ),
-                            self.tma_desc_c_latent,
-                            self.tma_desc_c_rope,
+                            primary_k,
+                            extra_k,
                             Int32(
-                                subtile_idx
+                                0
+                                if rope
+                                else subtile_idx
                                 * cfg.kv_subtiles_per_stage
                                 * cfg.mma_qk_tiler_k
                             ),
@@ -1293,7 +1373,7 @@ class SmemKVResource(HighThroughputMlaResource):
                             stage_info.barrier,
                             num_slices=cfg.kv_subtiles_per_stage,
                             dst_stride=64 * cfg.mma_qk_tiler_k * cfg.qkv_dtype_bytes,
-                            col_stride=cfg.mma_qk_tiler_k,
+                            col_stride=0 if rope else cfg.mma_qk_tiler_k,
                         )
                 else:
                     # PV consumes the delayed current-V window; the tail can
@@ -1346,7 +1426,9 @@ class SmemKVResource(HighThroughputMlaResource):
             if cutlass.const_expr(not is_v):
                 for part in cutlass.range_constexpr(cfg.kv_subtiles_per_stage):
                     column = Int32(
-                        (subtile_idx * cfg.kv_subtiles_per_stage + part)
+                        0
+                        if rope
+                        else (subtile_idx * cfg.kv_subtiles_per_stage + part)
                         * cfg.mma_qk_tiler_k
                     )
                     for local_group in cutlass.range(
@@ -1359,8 +1441,8 @@ class SmemKVResource(HighThroughputMlaResource):
                                 + part * 64 * cfg.mma_qk_tiler_k
                                 + group * 4 * cfg.mma_qk_tiler_k
                             ),
-                            self.tma_desc_c_latent,
-                            self.tma_desc_c_rope,
+                            primary_k,
+                            extra_k,
                             column,
                             cached_k_pages,
                             group * 4,
@@ -1662,6 +1744,12 @@ class SmemKResource(HighThroughputMlaResource):
     page_offsets: Any = None
     tma_desc_c_latent: Any = None
     tma_desc_c_rope: Any = None
+    tma_desc_sparse_rope: Any = None
+    tma_desc_sparse_extra_rope: Any = None
+    paired_v: cutlass.Constexpr = None
+    smem_raw: Any = None
+    raw_mbar: Any = None
+    request_lengths: Any = field(init=False, default=None)
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
     desc_k_base: cutlass.Constexpr[TaskLocalVariable] = (
@@ -1676,12 +1764,51 @@ class SmemKResource(HighThroughputMlaResource):
     def init_load_state(self, stage_info: StageInfo) -> None:
         """Initialize per-warp state used by K TMA loads."""
         del stage_info
+        if cutlass.const_expr(self.cfg.use_scaled_kv):
+            self.request_lengths = cutlass.Array(
+                Int32,
+                3,
+                space=cutlass.AddressSpace.rmem,
+            )
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def bind_sparse_request(self, stage_info: StageInfo):
+        if cutlass.const_expr(
+            self.cfg.use_scaled_kv and not self.page_offsets.is_bound
+        ):
+            row = stage_info.work_tile.tile_idx[2]
+            self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
+            self.request_lengths[2] = (self.request_lengths[0] + Int32(127)) // Int32(
+                128
+            )
+
+            self.request_lengths[1] = (
+                Int32(self.page_offsets.extra_lengths[row])
+                if self.page_offsets.has_extra
+                else Int32(0)
+            )
+
+    def create_pipeline(self, pipeline_config):
+        base = super().create_pipeline(pipeline_config)
+        if self.cfg.use_scaled_kv:
+            return with_cluster_acquire_waits(base)
+        return base
 
     @producer_work
     @cute.jit
     def tma_load_shared(self, stage_info: StageInfo, *, page_offset_stage):
         """Read one warp-uniform SMEM quad and reuse it across FP8 feature slices."""
         cfg = self.cfg
+        if cutlass.const_expr(cfg.use_scaled_kv):
+            load_scaled_kv_stage(
+                self,
+                self.paired_v,
+                stage_info,
+                self.paired_v.current_slot[0],
+                page_offset_stage,
+            )
+            return
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_k_warp_id
         base = (
             cute.arch.make_warp_uniform(stage_info.stage_idx) * cfg.smem_k_stage_elems
@@ -1710,6 +1837,20 @@ class SmemKResource(HighThroughputMlaResource):
                 dst_stride=64 * cfg.mma_qk_tiler_k,
                 col_stride=cfg.mma_qk_tiler_k,
             )
+            if cutlass.const_expr(cfg.rope_dim):
+                gather4_uniform_quad_slices(
+                    self.smem_k.data_ptr(
+                        base + 64 * cfg.latent_dim + quad * 4 * cfg.rope_dim
+                    ),
+                    self.tma_desc_sparse_rope,
+                    self.tma_desc_sparse_extra_rope,
+                    Int32(0),
+                    raw,
+                    stage_info.barrier,
+                    num_slices=1,
+                    dst_stride=64 * cfg.rope_dim,
+                    col_stride=0,
+                )
 
     @producer_work
     @cute.jit
@@ -1871,11 +2012,16 @@ class SmemVResource(HighThroughputMlaResource):
     page_offsets: Any = None
     tma_desc_c_transpose: Any = None
     tma_desc_extra_v: Any = None
+    tma_desc_sparse_rope: Any = None
+    tma_desc_sparse_extra_rope: Any = None
+    smem_raw: Any = None
+    raw_mbar: Any = None
     logical_seq_len_q: cutlass.Constexpr[int] = 1
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
     desc_v_base: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+    current_slot: Any = None
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
         ("desc_v_base", Int64, Int64(0), "SMEM descriptor for staged V."),
     )
@@ -1885,12 +2031,29 @@ class SmemVResource(HighThroughputMlaResource):
     def init_load_state(self, stage_info: StageInfo) -> None:
         """Initialize per-warp state used by V TMA loads."""
         del stage_info
+        if cutlass.const_expr(self.cfg.use_scaled_kv):
+            self.current_slot = cutlass.Array(Int32, 2, space=cutlass.AddressSpace.rmem)
+
+    def create_pipeline(self, pipeline_config):
+        base = super().create_pipeline(pipeline_config)
+        if self.cfg.use_scaled_kv:
+            return with_cluster_acquire_waits(base)
+        return base
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def combined_stage(self, stage_info: StageInfo):
+        self.current_slot[0] = stage_info.stage_idx
+        self.current_slot[1] = self.producer_state.phase ^ Int32(1)
 
     @producer_work
     @cute.jit
     def tma_load_shared(self, stage_info: StageInfo, *, page_offset_stage):
         """Read one warp-uniform SMEM quad and reuse it across FP8 V panels."""
         cfg = self.cfg
+        if cutlass.const_expr(cfg.use_scaled_kv):
+            publish_scaled_v(stage_info.barrier, 4096)
+            return
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_v_warp_id
         cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         base = (
@@ -2366,15 +2529,32 @@ class TmemSResource(HighThroughputMlaResource):
                             logical_call_idx > 0 or k_block > 0
                         )
                         if prims.elect_sync():
-                            prims.tcgen05_mma(
-                                mma_kind,
-                                cta_group,
-                                tmem_s_ptr,
-                                desc_q + k_block * 2,
-                                desc_k_subtile + k_block * 2,
-                                idesc_qk,
-                                Boolean(scale_d),
-                            )
+                            if cutlass.const_expr(cfg.use_scaled_kv):
+                                prims.tcgen05_mma(
+                                    mma_kind,
+                                    cta_group,
+                                    tmem_s_ptr,
+                                    prims.make_tmem_ptr(
+                                        self.tmem_base_addr
+                                        + Int32(
+                                            384 + logical_call_idx * 32 + k_block * 8
+                                        ),
+                                        qkv_dtype(cfg),
+                                    ),
+                                    desc_k_subtile + k_block * 2,
+                                    idesc_qk,
+                                    Boolean(scale_d),
+                                )
+                            else:
+                                prims.tcgen05_mma(
+                                    mma_kind,
+                                    cta_group,
+                                    tmem_s_ptr,
+                                    desc_q + k_block * 2,
+                                    desc_k_subtile + k_block * 2,
+                                    idesc_qk,
+                                    Boolean(scale_d),
+                                )
 
         elif cutlass.const_expr(call_idx < cfg.iterations_qk_stages):
             # K rope: build Q rope descriptor unconditionally

@@ -582,7 +582,7 @@ class SmemSoftmaxLocalResource(TmemSoftmaxLocalResource):
             self._alloc = SmemAllocation(
                 name=self.name + "_stats",
                 size_bytes=self.pipeline_config.num_stages
-                * 128
+                * (16 if self.cfg.compact_softmax_stats else 128)
                 * 2
                 * num_softmax_scale_groups(self.cfg)
                 * 4,
@@ -597,13 +597,18 @@ class SmemSoftmaxLocalResource(TmemSoftmaxLocalResource):
             self._alloc,
             Float32,
             self.pipeline_config.num_stages
-            * 128
+            * (16 if self.cfg.compact_softmax_stats else 128)
             * 2
             * num_softmax_scale_groups(self.cfg),
         )
         local_thread = cute.arch.thread_idx()[0] & Int32(127)
+        threads = 16 if self.cfg.compact_softmax_stats else 128
+        if cutlass.const_expr(self.cfg.compact_softmax_stats):
+            local_thread = (local_thread // Int32(32)) * Int32(
+                4
+            ) + local_thread % Int32(4)
         return storage.data_ptr(
-            (stage_info.stage_idx * Int32(128) + local_thread)
+            (stage_info.stage_idx * Int32(threads) + local_thread)
             * Int32(2 * num_softmax_scale_groups(self.cfg))
         )
 
@@ -619,14 +624,31 @@ class SmemSoftmaxLocalResource(TmemSoftmaxLocalResource):
         inst_idx: cutlass.Constexpr[int],
     ):
         n = num_softmax_scale_groups(self.cfg)
-        values = tuple(
-            old_max_arr[i] if inst_idx == 0 else sum_arr[i] for i in range(n)
-        )
+        first = cutlass.Array(Float32, n, space=cutlass.AddressSpace.rmem)
+        for i in cutlass.range_constexpr(n):
+            value = old_max_arr[i] if inst_idx == 0 else sum_arr[i]
+            if cutlass.const_expr(self.cfg.compact_softmax_stats and inst_idx != 0):
+                # The correction task normally performs these exact reductions.
+                # Move them before publication so only four lanes per warp store
+                # partial sums. Maxima already agree within each column group.
+                for delta in cutlass.range_constexpr(3):
+                    value += Float32(
+                        prims.shfl_sync(
+                            thread_mask=0xFFFFFFFF,
+                            val=value,
+                            offset=16 >> delta,
+                            mask_and_clamp=0x1F,
+                            kind=prims.Shfl.BFLY,
+                        )
+                    )
+            first[i] = value
+        values = tuple(first[i] for i in range(n))
         values += tuple(new_max_arr[i] for i in range(n))
-        self._stats_pointer(stage_info).store(
-            vector_from_scalars(values, Float32),
-            alignment=16 if n > 1 else 8,
-        )
+        if not self.cfg.compact_softmax_stats or cute.arch.thread_idx()[0] % 32 < 4:
+            self._stats_pointer(stage_info).store(
+                vector_from_scalars(values, Float32),
+                alignment=16 if n > 1 else 8,
+            )
         cute.arch.fence_view_async_shared()
 
     @cute.jit

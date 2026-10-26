@@ -42,8 +42,8 @@ def _reference(
     sinks=None,
     softmax_scale=512**-0.5,
 ):
-    rows, heads = query.numel() // (query.shape[-2] * 512), query.shape[-2]
-    q = query.reshape(rows, heads, 512)
+    rows, heads = query.numel() // (query.shape[-2] * query.shape[-1]), query.shape[-2]
+    q = query.reshape(rows, heads, query.shape[-1])
     output = torch.empty((rows, heads, 512), device=query.device, dtype=torch.float64)
     lse = torch.empty((rows, heads), device=query.device, dtype=torch.float64)
     bound = torch.empty_like(output)
@@ -84,9 +84,9 @@ def _reference(
         )
         normalizer = normalizer.masked_fill(empty[:, None], 0)
         weights = (logits - normalizer[..., None]).exp()
-        output[start:end] = torch.bmm(weights, kv) * output_scale
+        output[start:end] = torch.bmm(weights, kv[..., :512]) * output_scale
         lse[start:end] = row_lse
-        absolute = kv.abs()
+        absolute = kv[..., :512].abs()
         sensitivity = torch.bmm(weights, absolute)
         underflow = (logits.amax(-1) - normalizer).exp()[..., None] * absolute.sum(1)[
             :, None, :
@@ -97,9 +97,9 @@ def _reference(
             + 1e-6
         ).masked_fill(empty[:, None, None], 0)
     return (
-        output.reshape(query.shape),
+        output.reshape(*query.shape[:-1], 512),
         lse.reshape(query.shape[:-1]),
-        bound.reshape(query.shape),
+        bound.reshape(*query.shape[:-1], 512),
     )
 
 
@@ -1138,3 +1138,281 @@ def test_softmax_score_jumps(heads, dtype):
         else:
             torch.testing.assert_close(out.double(), ref, atol=8e-4, rtol=0.01)
         torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize(
+    "heads,precision",
+    [(h, "nvfp4") for h in (8, 12, 16, 32, 64, 128)]
+    + [(h, p) for h in (64, 128) for p in ("fp8", "bf16")],
+)
+def test_d576_sparse_graph(heads, precision):
+    """Native352 cache mapping, tails, holes and live graph inputs on both families."""
+    torch.manual_seed(123)
+    rows, topk = 160, 513
+    q = (torch.randn(rows, 1, heads, 576, device="cuda") * 0.2).to(
+        torch.bfloat16 if precision == "bf16" else torch.float8_e4m3fn
+    )
+    if precision == "nvfp4":
+        cache = torch.randint(256, (16, 64, 352), dtype=torch.uint8, device="cuda")
+        sf = (torch.rand(16, 64, 32, device="cuda") * 0.1 + 0.01).to(
+            torch.float8_e4m3fn
+        )
+        rope = (torch.randn(16, 64, 64, device="cuda") * 0.2).to(torch.float8_e4m3fn)
+        cache[..., 256:320] = rope.view(torch.uint8)
+        cache[..., 320:] = (
+            sf.view(torch.uint8).unflatten(-1, (8, 4)).transpose(-1, -2).flatten(-2)
+        )
+        packed = cache[..., :256]
+        codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+        lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+        vals = lut[(codes & 7).long()] * torch.where((codes & 8) != 0, -1.0, 1.0)
+        nope = (vals.unflatten(-1, (32, 16)) * sf.float()[..., None]).flatten(-2)
+        ref_cache = torch.cat(
+            (nope.clamp(-448, 448).to(torch.float8_e4m3fn).float(), rope.float()), -1
+        )
+    else:
+        cache = (torch.randn(16, 64, 576, device="cuda") * 0.2).to(q.dtype)
+        ref_cache = cache
+    indices = torch.randint(1024, (rows, topk), device="cuda", dtype=torch.int32)
+    lengths = torch.full((rows,), topk, device="cuda", dtype=torch.int32)
+    lengths[:6] = torch.tensor([0, 1, 127, 128, 129, 512], device="cuda")
+    indices[6, 17::31] = -1
+    w = BatchSparseMLADecodePagedTSWrapper()
+    w.plan(
+        q.device,
+        rows,
+        heads,
+        max_topk=topk,
+        q_data_type=q.dtype,
+        qk_rope_head_dim=64,
+        kv_cache_format="nvfp4.fp8rope" if precision == "nvfp4" else "native",
+        return_lse=True,
+    )
+    out = torch.empty(rows, 1, heads, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(rows, 1, heads, device="cuda", dtype=torch.float32)
+
+    def run():
+        w.run(q, cache, indices, lengths, out=out, lse=lse, validate=False)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for changed in (False, True):
+        if changed:
+            q.copy_((q.float() * -0.5).to(q.dtype))
+            indices.copy_(indices.roll(1, dims=0))
+        graph.replay()
+        ref, ref_lse, bound = _reference(
+            q, ref_cache, None, indices, lengths=lengths, softmax_scale=576**-0.5
+        )
+        if precision == "bf16":
+            torch.testing.assert_close(out.double(), ref, atol=1e-3, rtol=2e-2)
+        else:
+            assert bool(((out.double() - ref).abs() <= bound).all())
+        torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+
+def make_nvfp4_cache(pages, page_size, rope_dim=0):
+    """Token-interleaved bytes plus an independent nibble/scale FP8 oracle."""
+    # One physical padding row per page checks the public stride contract.
+    cache = torch.randint(
+        256, (pages, page_size + 1, 288 + rope_dim), device="cuda", dtype=torch.uint8
+    )[:, :page_size]
+    scales = (torch.rand(pages, page_size, 32, device="cuda") * 0.1 + 0.01).to(
+        torch.float8_e4m3fn
+    )
+    encoded_scales = scales.view(torch.uint8)
+    if rope_dim:
+        encoded_scales = (
+            encoded_scales.unflatten(-1, (8, 4)).transpose(-1, -2).flatten(-2)
+        )
+    cache[..., 256 + rope_dim :] = encoded_scales
+    packed = cache[..., :256]
+    codes = torch.stack((packed & 15, packed >> 4), dim=-1).flatten(-2)
+    lut = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device="cuda")
+    values = lut[(codes & 7).long()] * torch.where((codes & 8) != 0, -1.0, 1.0)
+    values = (values.unflatten(-1, (32, 16)) * scales.float()[..., None]).flatten(-2)
+    values = values.clamp(-448, 448).to(torch.float8_e4m3fn)
+    if rope_dim:
+        rope = (torch.randn(pages, page_size, rope_dim, device="cuda") * 0.2).to(
+            values.dtype
+        )
+        cache[..., 256 : 256 + rope_dim] = rope.view(torch.uint8)
+        values = torch.cat((values.float(), rope.float()), -1)
+    return cache, values
+
+
+def make_mxfp8_cache(pages, page_size):
+    """Token-interleaved E4M3 bytes with independent linear UE8M0 group32 scales."""
+    cache = torch.empty(pages, page_size + 1, 528, device="cuda", dtype=torch.uint8)[
+        :, :page_size
+    ]
+    values = (torch.randn(pages, page_size, 512, device="cuda") * 8).to(
+        torch.float8_e4m3fn
+    )
+    scales = torch.randint(
+        117, 123, (pages, page_size, 16), device="cuda", dtype=torch.uint8
+    )
+    cache[..., :512] = values.view(torch.uint8)
+    cache[..., 512:] = scales
+    decoded = (
+        values.float().unflatten(-1, (16, 32))
+        * torch.exp2(scales.float() - 127)[..., None]
+    ).flatten(-2)
+    return cache.view(torch.float8_e4m3fn), decoded.clamp(-448, 448).to(
+        torch.float8_e4m3fn
+    )
+
+
+@pytest.mark.parametrize(
+    "heads,rows,topk,extra",
+    [(h, 160, 513, 129) for h in (8, 16, 32, 64, 128)]
+    + [(8, 2, 33, 17), (64, 2, 129, 129), (128, 8, 513, 129), (64, 16, 2049, 129)],
+)
+def test_d512_nvfp4_sources_graph(
+    heads,
+    rows,
+    topk,
+    extra,
+    rope_dim=0,
+    primary_format="nvfp4",
+    extra_format="nvfp4",
+    prefix=False,
+):
+    """Both pools use all-NVFP4 D512, including the last 64 rotary/value channels."""
+    torch.manual_seed(124)
+    q = (torch.randn(rows, 1, heads, 512 + rope_dim, device="cuda") * 0.2).to(
+        torch.float8_e4m3fn
+    )
+    primary, primary_ref = (
+        make_mxfp8_cache(16, 64)
+        if primary_format == "mxfp8"
+        else make_nvfp4_cache(16, 64, rope_dim)
+    )
+    secondary, secondary_ref = (
+        make_mxfp8_cache(32, 32)
+        if extra_format == "mxfp8"
+        else make_nvfp4_cache(32, 32, rope_dim)
+    )
+    indices = torch.randint(1024, (rows, topk), device="cuda", dtype=torch.int32)
+    extra_indices = torch.randint(1024, (rows, extra), device="cuda", dtype=torch.int32)
+
+    # Physical-row coordinates account for each pool's independent page stride.
+    def physical(ids, size):
+        return ids // size * (size + 1) + ids % size
+
+    indices = physical(indices, 64)
+    extra_indices = physical(extra_indices, 32)
+    lengths = torch.full((rows,), topk, device="cuda", dtype=torch.int32)
+    extra_lengths = torch.full((rows,), extra, device="cuda", dtype=torch.int32)
+    for i, (p, e) in enumerate(
+        ((0, 0), (0, extra), (1, 1), (127, 128), (128, 0), (129, 129))
+    ):
+        if i < rows:
+            lengths[i], extra_lengths[i] = min(p, topk), min(e, extra)
+    # Invalid anchors must preserve the source tag, including during prefetch.
+    if not prefix:
+        indices[:, 0::31] = -1
+        extra_indices[:, 0::17] = -1
+    w = BatchSparseMLADecodePagedTSWrapper()
+    w.plan(
+        q.device,
+        rows,
+        heads,
+        max_topk=topk,
+        max_extra_topk=extra,
+        q_data_type=q.dtype,
+        kv_cache_format="nvfp4.fp8rope" if rope_dim else primary_format,
+        extra_kv_cache_format="nvfp4.fp8rope" if rope_dim else extra_format,
+        qk_rope_head_dim=rope_dim,
+        return_lse=True,
+        assume_valid_prefix=prefix,
+    )
+    out = torch.empty(rows, 1, heads, 512, device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty(rows, 1, heads, device="cuda", dtype=torch.float32)
+
+    def run():
+        w.run(
+            q,
+            primary,
+            indices,
+            lengths,
+            extra_kv_cache=secondary if extra else None,
+            extra_indices=extra_indices if extra else None,
+            extra_lengths=extra_lengths if extra else None,
+            out=out,
+            lse=lse,
+            validate=False,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for changed in (False, True):
+        if changed:
+            q.copy_((q.float() * -0.5).to(q.dtype))
+            lengths.copy_(lengths.roll(1))
+            extra_lengths.copy_(extra_lengths.roll(-1))
+            indices.copy_(indices.roll(1, dims=0))
+            extra_indices.copy_(extra_indices.roll(-1, dims=0))
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        graph.replay()
+        logical_primary = torch.where(
+            indices < 0, -1, indices // 65 * 64 + indices % 65
+        )
+        logical_extra = torch.where(
+            extra_indices < 0, -1, extra_indices // 33 * 32 + extra_indices % 33
+        )
+        ref, ref_lse, bound = _reference(
+            q,
+            primary_ref,
+            secondary_ref,
+            logical_primary,
+            logical_extra,
+            lengths=lengths,
+            extra_lengths=extra_lengths,
+            softmax_scale=(512 + rope_dim) ** -0.5,
+        )
+        assert bool(((out.double() - ref).abs() <= bound).all())
+        torch.testing.assert_close(lse.double(), ref_lse, atol=2e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("heads", [64, 128])
+def test_d576_nvfp4_sources_graph(heads):
+    test_d512_nvfp4_sources_graph(heads, 160, 513, 129, rope_dim=64)
+
+
+def test_nvfp4_format_contract():
+    plan = dict(
+        device="cuda",
+        batch_size=1,
+        num_heads=8,
+        max_topk=1,
+        q_data_type=torch.float8_e4m3fn,
+        kv_cache_format="nvfp4",
+    )
+    for changes, message in (
+        ({"qk_rope_head_dim": 64}, "D512"),
+        ({"q_data_type": torch.bfloat16}, "E4M3 Q"),
+        ({"kv_cache_format": "nvfp4.fp8rope"}, "512 NoPE and 64 RoPE"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            get_prims_ts_sparse_mla_decode_workspace_size(**(plan | changes))
+
+
+@pytest.mark.parametrize(
+    "heads,rows,topk,extra",
+    [(h, 160, 129, 513) for h in (8, 16, 32, 64, 128)]
+    + [(8, 2, 33, 17), (128, 32, 129, 2049)],
+)
+def test_mxfp8_nvfp4_sources_graph(heads, rows, topk, extra):
+    test_d512_nvfp4_sources_graph(heads, rows, topk, extra, primary_format="mxfp8")
+
+
+def test_mxfp8_prefix_sources_graph():
+    test_d512_nvfp4_sources_graph(
+        128, 160, 129, 513, primary_format="mxfp8", prefix=True
+    )

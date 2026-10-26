@@ -1,6 +1,6 @@
 # Task-Scheduled MLA Decode
 
-Native D512 two-source sparse MLA is available through
+Native D512/D576 two-source sparse MLA is available through
 `BatchSparseMLADecodePagedTSWrapper` (see its `plan()` / `run()` docstrings).
 Every sparse schedule consumes separate storage-row index lists and live lengths
 for the primary and optional extra pool. Pass `indices`, `lengths`, optional
@@ -14,10 +14,140 @@ Index lists use `-1` for holes and need no 128-entry padding.
 The kernel keeps source boundaries aligned to its KV tiles internally.
 The dense API contract below retains its 512-latent plus 64-RoPE layout.
 
+## Block-scaled sparse caches
+
+The cache-format selectors support token-interleaved block-scaled storage with
+E4M3 Q and ordinary FP8 MMA. `kv_cache_format` selects the primary pool;
+`extra_kv_cache_format` defaults to that format. D512 pools may independently
+use `"mxfp8"` or `"nvfp4"`. Native and mixed-RoPE pools require matching formats.
+Caches use uint8 records; MXFP8 also accepts an E4M3 byte view of the complete
+528-byte records, including the scale bytes.
+
+| `kv_cache_format` | QK / V dimensions | `qk_rope_head_dim` | Bytes per token | Scale byte for block `b` |
+| --- | --- | --- | --- | --- |
+| `"mxfp8"` (DS v4.1 SWA) | 512 / 512 | 0 | 512 E4M3 + 16 UE8M0 scales | `512 + b` (block32) |
+| `"nvfp4"` (DS v4.1) | 512 / 512 | 0 | 256 packed E2M1 + 32 E4M3 scales | `256 + b` |
+| `"nvfp4.fp8rope"` | 576 / 512 | 64 | 256 packed E2M1 + 64 E4M3 RoPE + 32 E4M3 scales | `320 + 8*(b % 4) + b//4` |
+
+NVFP4 scales cover 16 consecutive values; even-indexed values occupy the low
+nibble. MXFP8 scales cover 32 values and encode powers of two. Select
+`kv_cache_format="mxfp8", extra_kv_cache_format="nvfp4"` for FP8 SWA plus
+compressed NVFP4 KV. There are no global storage scales. In the DS v4.1 layout all 512
+channels, including the rotated channels, are quantized uniformly. A zero
+`qk_rope_head_dim` means there is no additional QK-only tail; the caller still
+applies any required query/key rotation before attention. The mixed format
+copies its FP8 tail unchanged. NVFP4 conversion applies one saturating RNE
+rounding to E4M3. Both QK and PV use E4M3 operands and FP32 accumulation,
+with BF16 O by default.
+
+Physical storage-row indices still include the external page stride. The
+internal page-size-one gather view does not repack or change the external cache.
+The default softmax scale is `1/sqrt(576)` for D576 and `1/sqrt(512)` for D512.
+
+The H64 throughput policy uses WS M64 QK, native Layout E softmax/correction,
+Q NoPE in TMEM, and two expanded KV tiles retained through both N256 PV passes.
+Eight loader warps convert each tile gathered by metadata. NVFP4 readers snapshot their
+packed data before releasing raw scratch. MXFP8 readers release it after their
+last raw read. Q stages through an empty KV slot before the attention loop.
+
+Small decode grids with long selected lists also use the M64 whole-tile path.
+KV splits fill roughly one resident wave, using power-of-two split counts to
+limit merge traffic. Small H128 grids with an MXFP8 primary pool can use two
+M64 head tiles: repeated KV conversion costs less than group-2 startup in this
+region. The crossover depends on planned query rows, head tiles, selected-list
+capacity and SM count; it is a measured scheduling choice, not a cache-layout
+restriction. No input preparation or extra cache representation is introduced.
+
+The standalone reducer for unquantized M64 whole-tile output processes two
+complete heads per CTA with shared row statistics and vec8 partial-O loads.
+This halves the block count while retaining the same per-output accumulation
+order. Quantized output retains its existing one-head reducer. Both forms
+acquire the producer dependency before reading partial results.
+
+The 1CTA whole-tile path gathers complete records with a shared tensor-map
+helper. MXFP8 uses a Uint32 view of the native 528-byte extent and a 544-byte
+shared-memory pitch: TMA zero-fills the extra 16 bytes so every four-row
+destination is 128-byte aligned. This padding is internal; the caller's cache
+layout and physical row indices are unchanged.
+
+The H128 throughput path uses M128 group-2 MMA with eight loader warps per CTA. Each CTA converts
+64 distinct rows of each 128-row KV tile once, writes its local V features,
+and exchanges the peer's V features through DSMEM (16 KiB in each direction).
+There is no second global V gather or duplicate value conversion. NVFP4 K uses
+whole-record gathers; MXFP8 K uses panel gathers with separate scale scratch.
+
+D512 uses two K stages, three V stages, and direct asynchronous DSMEM stores
+from the conversion registers. D576 uses two stages for each operand and
+warp-private bulk copies from converted K. Coupled K/V acquisition retains the
+bulk-copy source until both V consumers finish. One publishing warp per CTA
+waits for incoming DSMEM completion before allowing the V stage to become full.
+K publication already fences ordinary local V stores, so V publication only
+needs to order the completion acquire before its release.
+
+Both schedules copy FP8 Q into TMEM and use one score stage to reserve its
+columns. The Q copy geometry is shared with the 1CTA WS path; the 2CTA copy
+and dependent MMAs issue in the same leader warp. The Q SMEM lifetime remains
+protected by its existing pipeline, including the separate D576 RoPE tail.
+
+Loaders reuse the next metadata stage under its consumer token for raw K
+prefetch. Source boundaries are cached from live lengths once per query. With
+`assume_valid_prefix=True`, each CTA stages only its own 64 row indices; the
+general hole-masking path retains the full metadata tile. Persistent grids
+balance complete work waves using the existing planned query/head geometry.
+The 2CTA loader selects the source format before calling a format-specialized
+producer, keeping each format's gather and conversion branches together.
+
+The `scaled_kv/` package owns storage layouts, conversions, shared-memory
+publication and TMA preparation for both kernel families. The 2CTA producer
+keeps its task/resource ownership in `throughput_2cta/scaled_kv_load.py`.
+Scaled 2CTA execution always shares converted K/V through DSMEM; the independent
+reload experiment is retained only in the local validation archives.
+
+Both families share record-map construction, source and scale layout helpers,
+packed conversion, vector stores, prefetch, and publication. Cluster consumers
+acquire at cluster scope after producers release converted shared data.
+All conversion lanes receive the source tag, including invalid first entries.
+The MXFP8 scaler shares scale setup across 16 values, uses packed FP16 arithmetic
+for exactly representable powers of two, and falls back to FP32 for the remaining
+UE8M0 range. Both paths implement the same saturating RNE E4M3 result.
+
+H8/H16 use narrow Swap-AB Q tiles with the same raw gather and retained
+converted tiles. H32 can also use Q=32; the measured throughput policy prefers
+WS Q=64 because its N256 PV requires two feature passes instead of four.
+Narrow whole-tile schedules compact softmax statistics to four column-group
+leaders per warp. Tail sums are reduced before publication with the same
+shuffle order, and correction consumes those warp sums without reducing twice.
+This removes redundant statistics storage and makes Q=32 fit the SMEM budget.
+KV release follows the final PV feature slice for every Q tile width.
+
+Both families select primary/extra descriptors from source-tagged indices,
+including the prefetched next tile. Live lengths may move the source boundary
+between graph replays. Different physical page sizes and page padding are
+allowed; each pool retains its own planned record width and scale layout.
+
+For BF16 queries, allocate an E4M3 scratch tensor before capture and call
+`q_fp8.copy_(q_bf16)` immediately before `wrapper.run(...)` **inside** the graph.
+Full-call measurements include this conversion, attention and any reduction.
+Prepared-Q attention-only measurements omit the conversion and have a different
+scope. The local reproduction uses GB300, CUDA 13.4, CUTLASS DSL 4.8.1, the native
+page-64 cache, B32/Q8, top-k 2048 and context 65536 per request. Older toolchains
+retain the conversion fallback; the packed multiply is capability-checked.
+
+**FlashMLA reference scope:** in reference revision
+`e2afa5fd8c220fbd05fe03fc24c9d5e64c24641b`, the 352-byte D576/H128 cache path
+launches the legacy H64 attention kernel twice, for heads 0–63 and 64–127,
+then combines split-KV partials. Both passes use all 576 QK dimensions and
+repeat KV gathering/conversion. The D512 V4.1 path instead has a native H128
+kernel. Report this launch strategy alongside absolute times and speedup
+ratios: a D576/H128 speedup against that revision is against the two-launch
+implementation, and an optimized native D576/H128 reference could narrow it.
+This is implementation coverage, not a hardware restriction. CUDA graphs
+retain both launches; attention-only timing must include both and the combine.
+
 This directory contains the CuTe DSL task-scheduled (TS) Multi-head Latent
 Attention (MLA) decode kernels used by FlashInfer's experimental Blackwell
 paged-cache APIs. The implementation accepts the post-matrix-absorption MLA
-layout: every query/cache row contains a 512-element latent component followed
+layout in the dense API: every query/cache row contains a 512-element latent component followed
 by a 64-element RoPE component, while output contains the 512 latent values.
 
 FlashInfer selects the 1-CTA throughput/latency family or the 2-CTA throughput
@@ -58,7 +188,7 @@ a temporary wrapper, so it is not CUDA-graph-capturable. Graph-sensitive callers
 must plan `BatchMLADecodePagedTSWrapper` before capture and bind the live
 metadata directly in `run()`.
 
-## Supported contract
+## Dense API contract
 
 | Feature | Support |
 | --- | --- |
