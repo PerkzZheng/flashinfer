@@ -575,9 +575,11 @@ class SmemSoftmaxLocalResource(TmemSoftmaxLocalResource):
     """
 
     def get_tmem_requirements(self):
+        """Keep correction statistics in owned SMEM slots rather than aliasing recyclable score TMEM."""
         return []
 
     def get_smem_requirements(self):
+        """Allocate per-stage old/new statistics for full lanes or compact column-group leaders."""
         if self._alloc is None:
             self._alloc = SmemAllocation(
                 name=self.name + "_stats",
@@ -592,6 +594,7 @@ class SmemSoftmaxLocalResource(TmemSoftmaxLocalResource):
 
     @cute.jit
     def _stats_pointer(self, stage_info):
+        """Address this thread's statistics in the current owned SMEM pipeline slot."""
         storage = smem_array(
             stage_info.context,
             self._alloc,
@@ -623,6 +626,7 @@ class SmemSoftmaxLocalResource(TmemSoftmaxLocalResource):
         sum_arr,
         inst_idx: cutlass.Constexpr[int],
     ):
+        """Publish old maxima or reduced sums without reusing the slot before correction consumes it."""
         n = num_softmax_scale_groups(self.cfg)
         first = cutlass.Array(Float32, n, space=cutlass.AddressSpace.rmem)
         for i in cutlass.range_constexpr(n):

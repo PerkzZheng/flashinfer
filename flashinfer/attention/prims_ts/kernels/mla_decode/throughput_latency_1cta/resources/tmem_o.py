@@ -373,7 +373,7 @@ class TmemOResource(MlaResource):
         cfg = self.cfg
         if cutlass.const_expr(cfg.ws_pv):
             assert (
-                cfg.async_scaled_kv_gather
+                cfg.async_nvfp4_kv_gather
                 and cfg.tile_size_q == 64
                 and cfg.tile_size_kv == 128
             )

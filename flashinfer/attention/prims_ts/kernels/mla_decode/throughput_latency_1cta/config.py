@@ -32,10 +32,12 @@ from typing import Any
 
 from ....split_kv_mode_policy import select_split_kv_modes
 from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
-from ..scaled_kv.layout import ScaledKVConfig
+from ..helpers.nvfp4_kv import (
+    Nvfp4KVConfig,
+    nvfp4_row_bytes,
+)
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.query import FlatQueryTileLayout
-from ..scaled_kv.nvfp4 import nvfp4_row_bytes
 
 
 # 1CTA profiles are specialized for these Q/head tiles.  Tile sizes 8/16 use
@@ -80,7 +82,7 @@ def estimated_throughput_latency_smem_data_bytes(cfg: "MlaConfig") -> int:
 
 
 @dataclass(frozen=True)
-class MlaConfig(ScaledKVConfig):
+class MlaConfig(Nvfp4KVConfig):
     """Kernel traits for one throughput-latency 1CTA MLA schedule.
 
     The dataclass groups shape dimensions, tile sizes, CTA decomposition,
@@ -172,8 +174,10 @@ class MlaConfig(ScaledKVConfig):
     compact_nv_rope: bool = False
     q_tma_stage: bool = False
     q_nope_tmem: bool = False
+    # Softmax/correction already use the native WS Layout-E row ownership.
     ws_native_e: bool = False
     ws_qk: bool = False
+    # Use M64 tcgen05.mma.ws for PV; P is staged in SMEM, O follows Layout E.
     ws_pv: bool = False
     kv_cache_format: str = "native"
     extra_kv_cache_format: str = "native"
@@ -217,17 +221,29 @@ class MlaConfig(ScaledKVConfig):
     attention_window_size: int = 0
 
     @property
+    def kv_load_regs(self) -> int:
+        """Give raw-record loaders 96 registers without raising the MMA warp budget.
+
+        Loader warps retain packed values/scales across raw-buffer release.
+        MMA/page warps keep mma_load_regs; raising both exceeds the CTA budget.
+        This is derived from the existing pipeline choice, not a tuning field.
+        """
+        return 96 if self.async_nvfp4_kv_gather else self.mma_load_regs
+
+    @property
     def nvfp4_row_bytes(self) -> int:
+        """Return packed bytes per token, including scales and the optional FP8 RoPE tail."""
         return nvfp4_row_bytes(self.rope_dim)
 
     @property
     def whole_kv_tile_bytes(self) -> int:
+        """Return SMEM bytes retained for one complete converted K/V tile."""
         return self.tile_size_kv * self.head_dim_qk * self.qkv_dtype_bytes
 
     @property
-    def async_scaled_kv_gather(self) -> bool:
+    def async_nvfp4_kv_gather(self) -> bool:
         """Use independent gather/transform warps with two retained tiles."""
-        return self.use_scaled_kv and self.whole_kv_tile
+        return self.has_nvfp4_kv and self.whole_kv_tile
 
     @property
     def one_insts_kv_swap(self) -> bool:
@@ -1768,9 +1784,9 @@ def configure_sparse_mla(
     reuse = profile.reuse_kv
     uniform = profile.uniform_offset_cache
     single = profile.single_kv_stream
-    whole_scaled_kv = profile.whole_kv_tile
-    if whole_scaled_kv and not (
-        cfg.use_scaled_kv
+    whole_nvfp4_kv = profile.whole_kv_tile
+    if whole_nvfp4_kv and not (
+        cfg.has_nvfp4_kv
         and cfg.is_fp8_qkv()
         and cfg.rope_dim in (0, 64)
         and reuse
@@ -1791,9 +1807,9 @@ def configure_sparse_mla(
         raise ValueError("unsupported sparse query tile")
     if single and (
         keep
-        or cfg.tile_size_q not in ((8, 16, 32) if whole_scaled_kv else (8, 16))
+        or cfg.tile_size_q not in ((8, 16, 32) if whole_nvfp4_kv else (8, 16))
         or cfg.num_ctas_per_head_dim != 1
-        or issuers != (8 if whole_scaled_kv else 4)
+        or issuers != (8 if whole_nvfp4_kv else 4)
         or cfg.use_cluster_reduction
         or (cfg.num_ctas_per_seq_kv > 1 and cfg.use_persistent_scheduler)
     ):
@@ -1858,22 +1874,25 @@ def configure_sparse_mla(
         issuers == 8
         and not keep
         and (
-            (cfg.tile_size_q not in (8, 16) and not whole_scaled_kv)
+            (cfg.tile_size_q not in (8, 16) and not whole_nvfp4_kv)
             or cfg.local_kv_tiles(cfg.total_kv_tiles) <= cfg.num_insts_kv
         )
     ):
         raise ValueError("eight Swap-AB issuers require a steady-state loop")
 
-    retained_scaled_kv = (
-        cfg.use_scaled_kv and keep and issuers == 8 and reuse
-    ) or whole_scaled_kv
-    ws_mma = retained_scaled_kv and keep
+    # Retain complete converted FP8 K tiles through every PV feature pass,
+    # avoiding a second NVFP4 gather/conversion for V. Eight loaders and an
+    # independent raw-prefetch buffer provide room for two complete payloads.
+    retained_nvfp4_kv = (
+        cfg.has_nvfp4_kv and keep and issuers == 8 and reuse
+    ) or whole_nvfp4_kv
+    ws_mma = retained_nvfp4_kv and keep
     # Four D128 slices make one D512 tile. FP8/BK64 reuse keeps two tiles;
     # BF16 BK128 retains one, with additional stages used for prefetch.
     kv_stages = (
         profile.reuse_kv_stages if reuse and profile.reuse_kv_stages else cfg.kv_stages
     )
-    if reuse and profile.reuse_kv_stages and not retained_scaled_kv:
+    if reuse and profile.reuse_kv_stages and not retained_nvfp4_kv:
         retained_tiles = (
             2
             if cfg.is_fp8_qkv() or (cfg.tile_size_kv == 64 and not cfg.rope_dim)
@@ -1891,7 +1910,7 @@ def configure_sparse_mla(
         page_stages = 1
     if profile.page_pipeline_stages:
         page_stages = profile.page_pipeline_stages
-    if retained_scaled_kv:
+    if retained_nvfp4_kv:
         page_stages = 2
     if single and reuse and kv_stages >= 6 and not cfg.is_fp8_qkv():
         page_stages = 1
@@ -1955,7 +1974,7 @@ def configure_sparse_mla(
             if balanced
             else cfg.scheduler_regs,
         )
-    if retained_scaled_kv:
+    if retained_nvfp4_kv:
         roles.update(
             threads_per_cta=640,
             page_offsets_warp_idx=9,
@@ -1980,6 +1999,6 @@ def configure_sparse_mla(
         kv_stages=kv_stages,
         page_offsets_stages=page_stages,
         q_stages=1
-        if retained_scaled_kv or single or (reuse and profile.reuse_kv_stages)
+        if retained_nvfp4_kv or single or (reuse and profile.reuse_kv_stages)
         else cfg.q_stages,
     )

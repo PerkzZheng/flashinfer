@@ -35,13 +35,14 @@ from cutlass.experimental.task_scheduling.resources import (
     producer_work,
 )
 
-from ...scaled_kv.memory import publish_scaled_kv
-from ...scaled_kv.fp8 import source_is_fp8
-from ...scaled_kv.tma import (
-    load_scaled_panel,
-    prefetch_scaled_row,
+from ...helpers.sparse_indices import cache_sparse_source_lengths
+from ...helpers.nvfp4_kv import (
+    publish_nvfp4_kv,
+    source_is_fp8,
+    load_nvfp4_panel,
+    prefetch_nvfp4_kv_row,
     copy_fp8_record,
-    load_scaled_panels,
+    load_nvfp4_panels,
     issue_whole_record,
     convert_nvfp4_record,
 )
@@ -137,6 +138,7 @@ class SmemQResource(MlaResource):
     )
 
     def get_tmem_requirements(self):
+        """Reserve NoPE query columns when WS MMA reads Q from TMEM."""
         if not self.cfg.q_nope_tmem:
             return []
         if self._tmem_alloc is None:
@@ -312,6 +314,11 @@ class SmemQResource(MlaResource):
 
     @cute.jit
     def copy_nope_to_tmem(self, stage_info):
+        """Copy Q NoPE through registers from GMEM to TMEM without a TMA scratch stage.
+
+        Four warps write repeated M64 rows for the two WS column halves. This
+        is the direct-copy alternative to stage_q_via_tma, which uses eight
+        load warps and temporarily borrows an empty KV slot for TMA staging."""
         cfg = self.cfg
         assert (
             cfg.tile_size_q == 64
@@ -367,10 +374,16 @@ class SmemQResource(MlaResource):
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
             # Keep the existing36KiB Q transaction accounting: four warp
             # completions cover32KiB logical NoPE, RoPE TMA covers4KiB.
-            publish_scaled_kv(stage_info.barrier, 8192)
+            publish_nvfp4_kv(stage_info.barrier, 8192)
 
     @cute.jit
     def stage_q_via_tma(self, stage_info, rope_stage_base):
+        """Stage Q NoPE with TMA in an empty KV slot, then copy it from SMEM to TMEM.
+
+        Unlike copy_nope_to_tmem, this path avoids wide per-thread GMEM loads.
+        It requires eight loaders and single-raw-prefetch geometry. Acquiring
+        scratch does not advance the KV pipeline cursor; Q finishes before
+        normal KV loading reuses the slot. D576 RoPE keeps its own Q stage."""
         cfg = self.cfg
         assert cfg.q_nope_tmem and cfg.load_num_warps == 8 and cfg.single_raw_prefetch
         relative = cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32)
@@ -436,7 +449,7 @@ class SmemQResource(MlaResource):
             prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
             # One warp now publishes the whole32KiB logical NoPE payload,
             # after its TCGEN copy commit has completed.
-            publish_scaled_kv(stage_info.barrier, 32768)
+            publish_nvfp4_kv(stage_info.barrier, 32768)
         # Every Q staging read ends before any loader may expand KV over it.
         prims.barrier_cta_sync(barrier_id=12, thread_count=256)
 
@@ -677,7 +690,7 @@ class SmemPageOffsetsResource(MlaResource):
             self.request_lengths = cutlass.Array(
                 Int32, 2, space=cutlass.AddressSpace.rmem
             )
-        if cutlass.const_expr(self.cfg.async_scaled_kv_gather):
+        if cutlass.const_expr(self.cfg.async_nvfp4_kv_gather):
             self.nv_target._init_smem_state(stage_info)
             prims.barrier_cta_sync(
                 barrier_id=13,
@@ -688,15 +701,13 @@ class SmemPageOffsetsResource(MlaResource):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def bind_sparse_request(self, stage_info: StageInfo):
-        if cutlass.const_expr(
-            self.cfg.sparse_direct and not self.page_offsets.is_bound
-        ):
-            row = batch_idx_for_stage_cfg(self.batch_idx, self.cfg, stage_info)
-            self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
-            self.request_lengths[1] = (
-                Int32(self.page_offsets.extra_lengths[row])
-                if self.page_offsets.has_extra
-                else Int32(0)
+        """Cache live source lengths for this query before its KV/softmax loop."""
+        if cutlass.const_expr(self.cfg.sparse_direct):
+            cache_sparse_source_lengths(
+                self.page_offsets,
+                batch_idx_for_stage_cfg(self.batch_idx, self.cfg, stage_info),
+                self.request_lengths,
+                include_primary_tiles=False,
             )
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=cached_page_ids)
@@ -766,7 +777,7 @@ class SmemPageOffsetsResource(MlaResource):
             )
             routes = rows.select_source_tile(tile_start)
             position = lane_idx * Int32(4)
-            if cutlass.const_expr(cfg.async_scaled_kv_gather):
+            if cutlass.const_expr(cfg.async_nvfp4_kv_gather):
                 issuer = cute.arch.thread_idx()[0] // 32 - cfg.page_offsets_warp_idx
                 position = issuer * Int32(64) + (lane_idx % Int32(16)) * Int32(4)
             smem_offset = (
@@ -777,9 +788,13 @@ class SmemPageOffsetsResource(MlaResource):
             for j in cutlass.range_constexpr(4):
                 raw[j] = Int32(0x7FFFFFFF)
             if position < pages_per_tile and (
-                not cfg.async_scaled_kv_gather or lane_idx < 16
+                not cfg.async_nvfp4_kv_gather or lane_idx < 16
             ):
-                # Load each index quad once for both metadata and raw gathers.
+                # Fetch four physical storage-row IDs for this lane's source.
+                # The same quad fills the metadata ring and issues the raw TMA
+                # gather, avoiding another global index read in KV loaders.
+                # Full tiles can use unmasked reads; live-length tails and
+                # holes preserve the source tag on synthesized invalid rows.
                 if tile_start + pages_per_tile <= routes.origin + routes.length:
                     quad = routes.load_full_quad(tile_start + position)
                     for j in cutlass.range_constexpr(4):
@@ -792,11 +807,11 @@ class SmemPageOffsetsResource(MlaResource):
                     raw.load(0, 4), alignment=16
                 )
             cute.arch.fence_view_async_shared()
-            if cutlass.const_expr(cfg.async_scaled_kv_gather):
+            if cutlass.const_expr(cfg.async_nvfp4_kv_gather):
                 target = self.nv_target
                 if lane_idx < Int32(16):
                     for j in cutlass.range_constexpr(4):
-                        prefetch_scaled_row(
+                        prefetch_nvfp4_kv_row(
                             target.c_latent_tensor,
                             target.c_rope_tensor,
                             Int32(raw[j]),
@@ -1115,10 +1130,10 @@ class SmemKvResource(MlaResource):
                 alignment=self.cfg.stensor_align,
             )
         allocations = [self._alloc]
-        if self.cfg.use_scaled_kv:
+        if self.cfg.has_nvfp4_kv:
             # Whole-record gather carries SF and RoPE inside the raw record;
             # it never reads the older separate scale scratch allocation.
-            if not self.cfg.async_scaled_kv_gather:
+            if not self.cfg.async_nvfp4_kv_gather:
                 if self._nv_scratch_alloc is None:
                     self._nv_scratch_alloc = SmemAllocation(
                         name=f"{self.name}_nv_scratch",
@@ -1168,7 +1183,7 @@ class SmemKvResource(MlaResource):
                 cutlass.Uint8,
                 128 * self.cfg.raw_record_stride,
             )
-        if cutlass.const_expr(self.cfg.use_scaled_kv):
+        if cutlass.const_expr(self.cfg.has_nvfp4_kv):
             self._nv_scratch = smem_array(
                 context,
                 self._nv_scratch_alloc,
@@ -1216,12 +1231,12 @@ class SmemKvResource(MlaResource):
 
         # Producer aux work initializes K/V SMEM views for the load task.
         self._init_smem_state(stage_info)
-        if cutlass.const_expr(self.cfg.use_scaled_kv):
+        if cutlass.const_expr(self.cfg.has_nvfp4_kv):
             warp = cute.arch.thread_idx()[0] // 32 - self.cfg.load_warp_idx
             if prims.elect_sync():
                 count = Int32(
                     self.cfg.page_offsets_num_warps
-                    if self.cfg.async_scaled_kv_gather
+                    if self.cfg.async_nvfp4_kv_gather
                     else 1
                 )
                 if cutlass.const_expr(self.cfg.single_raw_prefetch):
@@ -1230,7 +1245,7 @@ class SmemKvResource(MlaResource):
                 prims.mbarrier_init(self._nv_barriers.data_ptr(warp), count)
             cute.arch.mbarrier_init_fence()
             cute.arch.sync_warp()
-            if cutlass.const_expr(self.cfg.async_scaled_kv_gather):
+            if cutlass.const_expr(self.cfg.async_nvfp4_kv_gather):
                 # Raw barriers are shared by the gather and transform warps.
                 # IDs 14/15 belong to TMEM; 13 is reserved for this load group.
                 prims.barrier_cta_sync(
@@ -1249,6 +1264,7 @@ class SmemKvResource(MlaResource):
 
     @cute.jit
     def kv_stage_offset(self, stage):
+        """Return the SMEM element offset for a payload slot, accounting for compact RoPE storage."""
         if cutlass.const_expr(self.cfg.whole_kv_tile):
             return stage * Int32(self.cfg.whole_kv_tile_bytes)
         offset = stage * Int32(self.cfg.kv_smem_stage_elements)
@@ -1299,6 +1315,159 @@ class SmemKvResource(MlaResource):
             prims.mbarrier_complete_tx(
                 stage_info.barrier, Int32(cfg.kv_smem_tile_bytes)
             )
+
+    @cute.jit
+    def load_nvfp4_stage_payload(
+        self,
+        stage_info,
+        stage_base,
+        cached_page_ids,
+        dim_offset,
+        warp,
+        *,
+        page_id_slot: cutlass.Constexpr[int],
+        qk_stage_idx: cutlass.Constexpr[int],
+        is_v: cutlass.Constexpr[int],
+        active_width: cutlass.Constexpr[int],
+    ):
+        """Fill a KV stage using whole-record reuse or the shared panel loader.
+
+        The caller owns the stage's full-barrier publication. Whole-record
+        mode waits for metadata-issued TMA and expands/copies only the first
+        feature stage; later stages reuse that payload through PV. Panel mode
+        uses the same conversion helpers for separately staged K or V slices.
+        """
+        cfg = self.cfg
+        rows_per_warp = cfg.tile_size_kv // cfg.load_num_warps
+        if cutlass.const_expr(cfg.async_nvfp4_kv_gather):
+            if cutlass.const_expr(qk_stage_idx == 0):
+                raw_slot = stage_info.stage_idx // Int32(5)
+                raw_phase = self.producer_state.phase ^ Int32(1)
+                if cutlass.const_expr(cfg.single_raw_prefetch):
+                    raw_slot = cached_page_ids[
+                        page_id_slot * cfg.sparse_cache_words + 4
+                    ]
+                    raw_phase = cached_page_ids[
+                        page_id_slot * cfg.sparse_cache_words + 5
+                    ]
+                    # Normal acquire already claimed the first stage.
+                    # Retain all other expanded panels until old PV ends.
+                    if cutlass.const_expr(not cfg.whole_kv_tile):
+                        for part in cutlass.range_constexpr(1, 5):
+                            self.pipeline.sync_object_empty.wait(
+                                stage_info.stage_idx + Int32(part),
+                                self.producer_state.phase,
+                            )
+                raw_barrier = self._nv_barriers.data_ptr(raw_slot)
+                destinations = ()
+                for part in cutlass.range_constexpr(5):
+                    slot = stage_info.stage_idx + Int32(part)
+                    destinations += (
+                        self._smem_kv.data_ptr(
+                            self.kv_stage_offset(stage_info.stage_idx)
+                            + Int32(part * 16384)
+                            if cfg.whole_kv_tile
+                            else self.kv_stage_offset(slot)
+                        ),
+                    )
+                # The metadata warp issues gathers independently, so
+                # all eight original load warps can convert in parallel.
+                while not prims.mbarrier_try_wait_parity(raw_barrier, raw_phase):
+                    pass
+                if source_is_fp8(
+                    cfg,
+                    cached_page_ids[page_id_slot * cfg.sparse_cache_words] < Int32(0),
+                ):
+                    copy_fp8_record(
+                        destinations[0],
+                        self._nv_raw.data_ptr(),
+                        cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                        self._nv_barriers.data_ptr(2),
+                    )
+                elif cutlass.const_expr(cfg.single_raw_prefetch):
+                    convert_nvfp4_record(
+                        destinations[0],
+                        cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                        stage_bytes=cfg.kv_smem_tile_bytes,
+                        rope_dim=cfg.rope_dim,
+                        raw=self._nv_raw.data_ptr(),
+                        raw_empty=self._nv_barriers.data_ptr(2),
+                    )
+                else:
+                    convert_nvfp4_record(
+                        destinations[0],
+                        cute.arch.thread_idx()[0] - Int32(cfg.load_warp_idx * 32),
+                        stage_bytes=cfg.kv_smem_tile_bytes,
+                        rope_dim=cfg.rope_dim,
+                    )
+            return
+        if cutlass.const_expr(cfg.sparse_reuse_kv and not is_v):
+            if cutlass.const_expr(qk_stage_idx == 0):
+                # Retained-K schedules have room for two complete K
+                # tiles. Claim each payload's existing empty barrier
+                # before batching its gathers. The captured schedule
+                # still arms/publishes each full barrier individually.
+                destinations = ()
+                for part in cutlass.range_constexpr(cfg.qk_head_dim_stages):
+                    future = stage_info.stage_idx + part
+                    slot = future - cfg.kv_stages if future >= cfg.kv_stages else future
+                    if cutlass.const_expr(part > 0):
+                        phase = self.producer_state.phase ^ Int32(
+                            future >= cfg.kv_stages
+                        )
+                        self.pipeline.sync_object_empty.wait(slot, phase)
+                    width = 64 if part == 4 else 128
+                    destinations += (
+                        self._smem_kv.data_ptr(
+                            self.kv_stage_offset(slot) + warp * rows_per_warp * width
+                        ),
+                    )
+                load_nvfp4_panels(
+                    destinations,
+                    (Int32(0), Int32(128), Int32(256), Int32(384)),
+                    self._nv_scratch.data_ptr(warp * rows_per_warp * 64),
+                    self._nv_barriers.data_ptr(warp),
+                    cached_page_ids,
+                    page_id_slot * cfg.sparse_cache_words,
+                    self.tma_desc_c_latent,
+                    self.tma_desc_c_rope,
+                    self.tma_desc_v,
+                    self.tma_desc_bulk_extra,
+                    self.tma_desc_sparse_rope,
+                    self.tma_desc_sparse_extra_rope,
+                    rows=rows_per_warp,
+                    rope_dim=cfg.rope_dim,
+                    separate_rope=cfg.rope_dim > 0,
+                    fp8=source_is_fp8(
+                        cfg,
+                        cached_page_ids[page_id_slot * cfg.sparse_cache_words]
+                        < Int32(0),
+                    ),
+                )
+            return
+        load_nvfp4_panel(
+            stage_base.data_ptr(warp * rows_per_warp * active_width),
+            self._nv_scratch.data_ptr(warp * rows_per_warp * 64),
+            self._nv_barriers.data_ptr(warp),
+            cached_page_ids,
+            page_id_slot * cfg.sparse_cache_words,
+            dim_offset,
+            self.tma_desc_c_latent,
+            self.tma_desc_c_rope,
+            self.tma_desc_v,
+            self.tma_desc_bulk_extra,
+            self.tma_desc_sparse_rope,
+            self.tma_desc_sparse_extra_rope,
+            rows=rows_per_warp,
+            rope_dim=cfg.rope_dim,
+            rope_only=not is_v and active_width == 64,
+            load_scales=True,
+            fp8=source_is_fp8(
+                cfg,
+                cached_page_ids[page_id_slot * cfg.sparse_cache_words] < Int32(0),
+            ),
+        )
+        return
 
     @cute.jit
     def _producer_load_kv_stage(
@@ -1378,167 +1547,19 @@ class SmemKvResource(MlaResource):
         # use gather4. The separate empty-window path only zero-fills padding.
         if cutlass.const_expr(cfg.num_tokens_per_page == 1):
             warp = cute.arch.thread_idx()[0] // 32 - cfg.load_warp_idx
-            if cutlass.const_expr(cfg.use_scaled_kv):
-                rows_per_warp = cfg.tile_size_kv // cfg.load_num_warps
-                if cutlass.const_expr(cfg.async_scaled_kv_gather):
-                    if cutlass.const_expr(qk_stage_idx == 0):
-                        raw_slot = stage_info.stage_idx // Int32(5)
-                        raw_phase = self.producer_state.phase ^ Int32(1)
-                        if cutlass.const_expr(cfg.single_raw_prefetch):
-                            raw_slot = cached_page_ids[
-                                page_id_slot * cfg.sparse_cache_words + 4
-                            ]
-                            raw_phase = cached_page_ids[
-                                page_id_slot * cfg.sparse_cache_words + 5
-                            ]
-                            # Normal acquire already claimed the first stage.
-                            # Retain all other expanded panels until old PV ends.
-                            if cutlass.const_expr(not cfg.whole_kv_tile):
-                                for part in cutlass.range_constexpr(1, 5):
-                                    self.pipeline.sync_object_empty.wait(
-                                        stage_info.stage_idx + Int32(part),
-                                        self.producer_state.phase,
-                                    )
-                        raw_barrier = self._nv_barriers.data_ptr(raw_slot)
-                        destinations = ()
-                        for part in cutlass.range_constexpr(5):
-                            slot = stage_info.stage_idx + Int32(part)
-                            destinations += (
-                                self._smem_kv.data_ptr(
-                                    self.kv_stage_offset(stage_info.stage_idx)
-                                    + Int32(part * 16384)
-                                    if cfg.whole_kv_tile
-                                    else self.kv_stage_offset(slot)
-                                ),
-                            )
-                        # The metadata warp issues gathers independently, so
-                        # all eight original load warps can convert in parallel.
-                        while not prims.mbarrier_try_wait_parity(
-                            raw_barrier, raw_phase
-                        ):
-                            pass
-                        if source_is_fp8(
-                            cfg,
-                            cached_page_ids[page_id_slot * cfg.sparse_cache_words]
-                            < Int32(0),
-                        ):
-                            copy_fp8_record(
-                                destinations[0],
-                                self._nv_raw.data_ptr(),
-                                cute.arch.thread_idx()[0]
-                                - Int32(cfg.load_warp_idx * 32),
-                                self._nv_barriers.data_ptr(2),
-                            )
-                        elif cutlass.const_expr(cfg.single_raw_prefetch):
-                            convert_nvfp4_record(
-                                destinations[0],
-                                cute.arch.thread_idx()[0]
-                                - Int32(cfg.load_warp_idx * 32),
-                                stage_bytes=cfg.kv_smem_tile_bytes,
-                                rope_dim=cfg.rope_dim,
-                                raw=self._nv_raw.data_ptr(),
-                                raw_empty=self._nv_barriers.data_ptr(2),
-                            )
-                        else:
-                            convert_nvfp4_record(
-                                destinations[0],
-                                cute.arch.thread_idx()[0]
-                                - Int32(cfg.load_warp_idx * 32),
-                                stage_bytes=cfg.kv_smem_tile_bytes,
-                                rope_dim=cfg.rope_dim,
-                            )
-                    publish_scaled_kv(
-                        stage_info.barrier,
-                        (
-                            cfg.whole_kv_tile_bytes
-                            if cfg.whole_kv_tile
-                            else cfg.kv_smem_tile_bytes
-                        )
-                        // cfg.load_num_warps,
-                    )
-                    return
-                if cutlass.const_expr(cfg.sparse_reuse_kv and not is_v):
-                    if cutlass.const_expr(qk_stage_idx == 0):
-                        # Retained-K schedules have room for two complete K
-                        # tiles. Claim each payload's existing empty barrier
-                        # before batching its gathers. The captured schedule
-                        # still arms/publishes each full barrier individually.
-                        destinations = ()
-                        for part in cutlass.range_constexpr(cfg.qk_head_dim_stages):
-                            future = stage_info.stage_idx + part
-                            slot = (
-                                future - cfg.kv_stages
-                                if future >= cfg.kv_stages
-                                else future
-                            )
-                            if cutlass.const_expr(part > 0):
-                                phase = self.producer_state.phase ^ Int32(
-                                    future >= cfg.kv_stages
-                                )
-                                self.pipeline.sync_object_empty.wait(slot, phase)
-                            width = 64 if part == 4 else 128
-                            destinations += (
-                                self._smem_kv.data_ptr(
-                                    self.kv_stage_offset(slot)
-                                    + warp * rows_per_warp * width
-                                ),
-                            )
-                        load_scaled_panels(
-                            destinations,
-                            (Int32(0), Int32(128), Int32(256), Int32(384)),
-                            self._nv_scratch.data_ptr(warp * rows_per_warp * 64),
-                            self._nv_barriers.data_ptr(warp),
-                            cached_page_ids,
-                            page_id_slot * cfg.sparse_cache_words,
-                            self.tma_desc_c_latent,
-                            self.tma_desc_c_rope,
-                            self.tma_desc_v,
-                            self.tma_desc_bulk_extra,
-                            self.tma_desc_sparse_rope,
-                            self.tma_desc_sparse_extra_rope,
-                            rows=rows_per_warp,
-                            rope_dim=cfg.rope_dim,
-                            separate_rope=cfg.rope_dim > 0,
-                            fp8=source_is_fp8(
-                                cfg,
-                                cached_page_ids[page_id_slot * cfg.sparse_cache_words]
-                                < Int32(0),
-                            ),
-                        )
-                    publish_scaled_kv(
-                        stage_info.barrier,
-                        (
-                            cfg.whole_kv_tile_bytes
-                            if cfg.whole_kv_tile
-                            else cfg.kv_smem_tile_bytes
-                        )
-                        // cfg.load_num_warps,
-                    )
-                    return
-                load_scaled_panel(
-                    stage_base.data_ptr(warp * rows_per_warp * active_width),
-                    self._nv_scratch.data_ptr(warp * rows_per_warp * 64),
-                    self._nv_barriers.data_ptr(warp),
+            if cutlass.const_expr(cfg.has_nvfp4_kv):
+                self.load_nvfp4_stage_payload(
+                    stage_info,
+                    stage_base,
                     cached_page_ids,
-                    page_id_slot * cfg.sparse_cache_words,
                     dim_offset,
-                    self.tma_desc_c_latent,
-                    self.tma_desc_c_rope,
-                    self.tma_desc_v,
-                    self.tma_desc_bulk_extra,
-                    self.tma_desc_sparse_rope,
-                    self.tma_desc_sparse_extra_rope,
-                    rows=rows_per_warp,
-                    rope_dim=cfg.rope_dim,
-                    rope_only=not is_v and active_width == 64,
-                    load_scales=True,
-                    fp8=source_is_fp8(
-                        cfg,
-                        cached_page_ids[page_id_slot * cfg.sparse_cache_words]
-                        < Int32(0),
-                    ),
+                    warp,
+                    page_id_slot=page_id_slot,
+                    qk_stage_idx=qk_stage_idx,
+                    is_v=is_v,
+                    active_width=active_width,
                 )
-                publish_scaled_kv(
+                publish_nvfp4_kv(
                     stage_info.barrier,
                     (
                         cfg.whole_kv_tile_bytes
@@ -2008,6 +2029,7 @@ class SmemKvResource(MlaResource):
     def v_desc_reused_0(
         self, stage_info: StageInfo, *, v_subtile_idx: cutlass.Constexpr[int]
     ):
+        """Bind V consumer zero to the selected feature slice of its retained K payload."""
         return self._set_desc(
             stage_info, 1, 0, k_subtile_idx=v_subtile_idx, reuse_k=True
         )
@@ -2017,6 +2039,7 @@ class SmemKvResource(MlaResource):
     def v_desc_reused_1(
         self, stage_info: StageInfo, *, v_subtile_idx: cutlass.Constexpr[int]
     ):
+        """Bind V consumer one to the selected feature slice of its retained K payload."""
         return self._set_desc(
             stage_info, 1, 1, k_subtile_idx=v_subtile_idx, reuse_k=True
         )

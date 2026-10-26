@@ -89,9 +89,13 @@ class TmemPResource(MlaResource):
         TaskLocalVariable.uninitialized()
     )
 
+    # Two ping-pong M64 x N128 E4M3 probability tiles in SMEM. WS PV reads
+    # this packed A operand rather than the usual A-from-TMEM score alias;
+    # P's pipeline protects each slot while softmax fills the next one.
     _ws_p_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
 
     def get_smem_requirements(self):
+        """Reserve two FP8 probability panels when WS PV reads P from shared memory."""
         if not self.cfg.ws_pv:
             return []
         if self._ws_p_alloc is None:
@@ -337,8 +341,11 @@ class TmemPResource(MlaResource):
             )
 
         if cutlass.const_expr(cfg.ws_pv):
-            # Keep softmax's Layout-F register rows; materialize the entire
-            # dense P tile in ordinary K-major shared memory for WS MMA A.
+            # Materialize P in K-major SMEM for WS MMA A. Native WS QK uses
+            # Layout E; the non-WS M64 path uses Layout F and remaps its rows.
+            # These are PTX data-path layouts, not global-cache layouts:
+            # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-data-path-layout-e
+            # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-data-path-layout-f
             dst = smem_array(stage_info.context, self._ws_p_alloc, Int32, 4096)
             tid = cute.arch.thread_idx()[0]
             row = (tid // 32) * 16 + tid % 16

@@ -134,6 +134,9 @@ class TmemCorrResource(MlaResource):
     cta_idx_head_dim_v: object = None
     store_barrier_id: cutlass.Constexpr[int] = 6
     sum_barrier_id: cutlass.Constexpr[int] = 7
+    # WS means tcgen05.mma.ws (M64 warp-specialized PV). This scratch either
+    # joins the two Layout-E N-column sums (128 FP32 values, 512 bytes) or
+    # relays Layout-F row factors to WS consumers (64 FP32 values, 256 bytes).
     _ws_scale_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
     _sum_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
     _cluster_reduction_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
@@ -1049,6 +1052,12 @@ class TmemCorrResource(MlaResource):
 
     @cute.jit
     def ws_sum_reduce(self, stage_info, value):
+        """Join the two N-column partial softmax sums for each Layout-E M64 query row.
+
+        Threads tid and tid^64 represent the same row in the two column halves
+        of the WS data-path layout. Their sums must be added once before O
+        normalization. The barriers publish scratch and protect it from reuse.
+        PTX: https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-data-path-layout-e"""
         scratch = smem_array(stage_info.context, self._ws_scale_alloc, Float32, 128)
         tid = cute.arch.thread_idx()[0] % Int32(128)
         scratch[tid] = value
@@ -1061,6 +1070,10 @@ class TmemCorrResource(MlaResource):
     def ws_row_scale(self, stage_info, scale):
         # Existing stats arrive in Layout-F thread order. One writer per row;
         # every correction thread participates before warp-local skip logic.
+        """Remap legacy Layout-F row factors to the Layout-E WS PV consumer order.
+
+        One writer per row publishes a factor; all correction threads read the
+        matching row, with barriers before reading and before scratch reuse."""
         scratch = smem_array(stage_info.context, self._ws_scale_alloc, Float32, 64)
         tid = cute.arch.thread_idx()[0] % 128
         if tid % 32 < 16:
@@ -1272,6 +1285,7 @@ class TmemCorrResource(MlaResource):
 
     @cute.jit
     def tensor_scale_tile(self, stage_info, local_tile):
+        """Map one local pipeline-instance tile to its global split-KV offset and query row."""
         cfg = self.cfg
         batch = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
         length = runtime_seq_len_kv_from_task_cache(
@@ -1347,7 +1361,11 @@ class TmemCorrResource(MlaResource):
                     lane_scales_are_identity & scale_0_is_identity & scale_1_is_identity
                 )
 
-        if cutlass.const_expr(cfg.has_tensor_fp8):
+        if cutlass.const_expr(cfg.has_fp8_primary):
+            # O is still expressed in the previous source's V units. Apply
+            # its descale/current descale together with the normal softmax
+            # correction when this stream crosses primary -> extra. This is
+            # independent of the denominator update, which uses softmax only.
             local = (stage_info.loop_offset + Int32(1)) * Int32(
                 cfg.num_insts_kv
             ) + Int32(self.inst_id % cfg.num_insts_kv)
@@ -1360,6 +1378,9 @@ class TmemCorrResource(MlaResource):
             lane_scales_are_identity = lane_scales_are_identity and ratio == Float32(1)
 
         if cutlass.const_expr(cfg.ws_pv and not cfg.ws_native_e):
+            # Legacy non-WS QK produces Layout-F row factors, while WS PV/O
+            # uses Layout E. Relay them before the warp-wide identity test;
+            # every correction lane must participate in the scratch barriers.
             scale_vals[0] = self.ws_row_scale(stage_info, scale_vals[0])
             lane_scales_are_identity = scale_vals[0] == Float32(1.0)
         skip_rescale = prims.vote_sync(
@@ -1611,7 +1632,7 @@ class TmemCorrResource(MlaResource):
                 )
             final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
             final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
-        if cutlass.const_expr(cfg.has_tensor_fp8):
+        if cutlass.const_expr(cfg.has_fp8_primary):
             last0, batch = self.tensor_scale_tile(
                 stage_info, stage_info.loop_end * Int32(cfg.num_insts_kv)
             )
@@ -1671,18 +1692,26 @@ class TmemCorrResource(MlaResource):
             half_warp_col_offset = (warp_idx // Int32(2)) * Int32(128)
 
         if cutlass.const_expr(self.output_quant is not None):
-            # Each lane owns half a head's D stage. K128 can span the two
-            # lanes separated by 16; K32 blocks remain entirely lane-local.
-            width = min(self.output_quant.block_size, cfg.head_dim_per_stage_v // 2)
-            for stripe in cutlass.range_constexpr(
-                0, cfg.head_dim_per_stage_v // 2, width
-            ):
+            # Non-WS Layout F gives each lane half a D128 stage; block128
+            # spans lanes separated by16. WS Layout E gives a lane128 values
+            # in a D256 PV pass, so block32/block128 are both lane-local.
+            # Match the TMEM load shape and extent to the selected layout.
+            lane_columns = 128 if cfg.ws_pv else cfg.head_dim_per_stage_v // 2
+            width = min(self.output_quant.block_size, lane_columns)
+            for stripe in cutlass.range_constexpr(0, lane_columns, width):
                 values = cutlass.Array(Float32, width, space=cutlass.AddressSpace.rmem)
-                loaded = tcgen05_ld_16x32bx2_f32(
-                    prims.make_tmem_ptr(base_addr0 + Int32(stripe), Float32),
-                    num=width,
-                    offset=Int32(cfg.head_dim_per_stage_v // 2),
-                )
+                if cutlass.const_expr(cfg.ws_pv):
+                    loaded = prims.tcgen05_ld(
+                        prims.Tcgen05LdStShape.SHAPE_32X32B,
+                        prims.make_tmem_ptr(base_addr0 + Int32(stripe), Float32),
+                        num=width,
+                    )
+                else:
+                    loaded = tcgen05_ld_16x32bx2_f32(
+                        prims.make_tmem_ptr(base_addr0 + Int32(stripe), Float32),
+                        num=width,
+                        offset=Int32(cfg.head_dim_per_stage_v // 2),
+                    )
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
                 cute.arch.fence_view_async_tmem_load()
                 for i in cutlass.range_constexpr(width):
@@ -1699,8 +1728,11 @@ class TmemCorrResource(MlaResource):
                         + v_stage_idx * cfg.head_dim_per_stage_v
                         + half_warp_col_offset
                         + stripe,
-                        lane_stride=16,
-                        rotary=v_stage_idx + 1 == cfg.v_head_dim_stages,
+                        lane_stride=1 if cfg.ws_pv else 16,
+                        # WS consumes two D128 descriptor slices per PV pass;
+                        # its last even stage owns the final64 rotary channels.
+                        rotary=v_stage_idx + (2 if cfg.ws_pv else 1)
+                        == cfg.v_head_dim_stages,
                     )
             return
 

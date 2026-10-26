@@ -522,6 +522,7 @@ def create_load_combined_task(
 
     @schedule
     def combined_schedule(smem_q, smem_k, smem_v, page_offsets, work_queue=None):
+        """Acquire paired K/V stages, convert once, and publish V after peer DSMEM completion."""
         smem_q.init_load_state()
         smem_k.init_load_state()
         smem_v.init_load_state()

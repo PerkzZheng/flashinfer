@@ -1,6 +1,25 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0 (the "License").
-"""Gather token-interleaved NVFP4/per-tensor FP8 caches into shared FP8 MMA tiles."""
+"""Storage and loader helpers shared by the 1CTA/2CTA NVFP4 MLA paths.
+
+External records are token-interleaved uint8 bytes, with no global NVFP4 scale:
+
+    D512 NVFP4: [ packed E2M1: 256 B ][ E4M3 block16 scales: 32 B ]
+    D576 NVFP4: [ packed E2M1: 256 B ][ E4M3 RoPE: 64 B ][ scales: 32 B ]
+    D512 FP8:   [ E4M3 K/V: 512 B ]   (primary SWA pool only)
+
+D512 scale block b is at byte 256+b. D576 scale block b is at
+320+8*(b%4)+b//4; its RoPE bytes are unscaled. Each NVFP4 byte stores the
+even-indexed value in its low nibble. FP8 primary storage uses one separate
+runtime tensor scale; QK/output arithmetic applies it without changing bytes.
+
+Supported pairs are native/native, NVFP4/NVFP4, D576 NVFP4+FP8-RoPE in both
+pools, and D512 FP8 primary/NVFP4 extra. External physical-page strides are
+preserved when callers expose the internal [1, record_bytes, storage_rows]
+view. Source-tagged indices select either descriptor: bit31 means extra,
+low31 bits select a storage row, and all-one low bits represent an invalid row.
+Both families gather the same records, then consume ordinary FP8 MMA tiles.
+"""
 
 import cutlass
 import cutlass.cute as cute
@@ -8,25 +27,238 @@ from cutlass import Int32, Int64
 from cutlass.experimental import cuda, primitives as prims
 
 from ...tensor_map import create_tensor_map_tiled_from_view
-from ..helpers.gather import gather4, select_gather_map
-from .layout import cache_record_size
-from .nvfp4 import (
-    convert_nvfp4x8,
-    nvfp4_scale_byte_offset,
-    nvfp4_row_bytes,
-    NVFP4_DATA_BYTES,
+from .gather import _address, gather4, select_gather_map
+from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
+    _has_packed_e4m3_e2m1_mul,
 )
-from .memory import store_shared_u32x4, swizzle_byte_offset
+from ...fmha_decode.fmha_decode_resources.smem_transformed_kv import (
+    _cvt_e2m1_word_to_e4m3_words,
+)
+
+
+# ===========================================================================
+# Storage formats and configuration
+# ===========================================================================
+
+
+def cache_record_size(cache_format: str, rope_dim: int) -> int:
+    """Elements per token; quantized formats use uint8 elements."""
+    return {
+        "native": 512 + rope_dim,
+        "nvfp4": 288,
+        "nvfp4.fp8rope": 352,
+        "fp8": 512,
+    }[cache_format]
+
+
+def validate_nvfp4_kv_formats(
+    primary_format, extra_format, rope_dim, qkv_dtype, page_size
+):
+    """Reject unsupported storage/compute pairs before constructing tensor maps.
+
+    Page size one is the internal physical-row view, not an external cache-page
+    restriction. Native/native retains the caller's ordinary paged-cache path.
+    A mixed pair has FP8 only in the primary SWA pool and NVFP4 in the extra.
+    """
+    formats = (primary_format, extra_format)
+    allowed = (
+        ("native", "native"),
+        ("nvfp4", "nvfp4"),
+        ("nvfp4.fp8rope", "nvfp4.fp8rope"),
+        ("fp8", "nvfp4"),
+    )
+    if formats not in allowed:
+        raise ValueError(
+            "cache formats must be native/native, nvfp4/nvfp4, nvfp4.fp8rope/nvfp4.fp8rope, or fp8 primary/nvfp4 extra"
+        )
+    if primary_format == "native":
+        return
+    if qkv_dtype != "e4m3":
+        raise ValueError("NVFP4 KV formats require E4M3 Q")
+    if page_size != 1:
+        raise ValueError("NVFP4 KV requires an internal page-size-one storage-row view")
+    if primary_format == "nvfp4.fp8rope":
+        if rope_dim != 64:
+            raise ValueError("nvfp4.fp8rope requires 512 NoPE and 64 RoPE channels")
+    elif rope_dim != 0:
+        raise ValueError("nvfp4/fp8 require D512 QK/V without an extra RoPE tail")
+
+
+class Nvfp4KVConfig:
+    """Common format predicates for both attention families."""
+
+    @property
+    def has_nvfp4_kv(self) -> bool:
+        """Select row-record loaders for NVFP4 pools or the FP8-primary/NVFP4-extra pair."""
+        return self.kv_cache_format != "native"
+
+    @property
+    def has_fp8_primary(self) -> bool:
+        """Return whether primary K/V bytes need a separate per-tensor descale."""
+        return self.kv_cache_format == "fp8"
+
+    @property
+    def max_cache_record_size(self) -> int:
+        """Return the largest storage-row extent, in bytes for the NVFP4 loader family."""
+        return max(
+            cache_record_size(self.kv_cache_format, self.rope_dim),
+            cache_record_size(self.extra_kv_cache_format, self.rope_dim),
+        )
+
+    @property
+    def raw_record_stride(self) -> int:
+        # gather4 requires every four-row destination to be 128-byte aligned.
+        """Return the raw SMEM row pitch in bytes, aligned for four-row TMA gathers."""
+        return (self.max_cache_record_size + 31) // 32 * 32
+
+
+# ===========================================================================
+# Shared-memory addressing and publication
+# ===========================================================================
+
+
+@cute.jit
+def publish_nvfp4_kv(barrier, count, *, cta_group: cutlass.Constexpr[int] = 1):
+    """Publish ordinary shared stores before signaling the MMA pipeline."""
+    cute.arch.fence_view_async_shared()
+    # The elected publisher must observe every lane's converted stores.
+    # Proxy fencing alone does not make a relaxed manual complete_tx a
+    # release operation. Join the warp, then publish through a release fence.
+    cute.arch.sync_warp()
+    if prims.elect_sync():
+        if cutlass.const_expr(cta_group == 2):
+            prims.fence_sync_restrict(prims.MemOrder.RELEASE)
+            # Use the cluster address mapping API, not encoded CTA-rank bits.
+            leader = prims.mapa(barrier, Int32(0))
+            prims.mbarrier_complete_tx(
+                leader, Int32(count), scope=prims.MemScope.CLUSTER
+            )
+        else:
+            cute.arch.inline_ptx("fence.acq_rel.cta;")
+            prims.mbarrier_complete_tx(barrier, Int32(count))
+
+
+@cute.jit
+def swizzle_byte_offset(offset, width: cutlass.Constexpr[int]):
+    """Map an unswizzled byte offset into the matching 32/64/128-byte TMA swizzle.
+
+    The selected XOR mask changes the 16-byte bank group using row bits;
+    callers must use the same swizzle width as the tensor map and MMA view."""
+    mask = {32: 0x10, 64: 0x30, 128: 0x70}[width]
+    return offset ^ ((offset >> Int32(3)) & Int32(mask))
+
+
+@cute.jit
+def store_shared_u32x4(dst, offset, a, b, c, d):
+    """Store four packed 32-bit words at dst + byte offset with one 16-byte SMEM store.
+
+    The destination must be 16-byte aligned. Publication is a separate
+    operation so a loader can finish its complete tile before signaling MMA."""
+    cute.arch.inline_ptx(
+        "st.shared.v4.b32 [{$r0}], {{$r1}, {$r2}, {$r3}, {$r4}};",
+        read_only_args=[_address(dst, Int32) + offset, a, b, c, d],
+    )
+
+
+# ===========================================================================
+# Primary-pool FP8 selection
+# ===========================================================================
+
+
+@cute.jit
+def source_is_fp8(cfg, use_extra):
+    """Select unchanged FP8 primary bytes from a source-tagged gather group.
+
+    The extra pool is always NVFP4 in a mixed pair; the tag selects a pool,
+    not an element dtype within a record. Broadcast from lane zero because
+    only metadata-issuing lanes have valid source coordinates."""
+    if cutlass.const_expr(cfg.kv_cache_format != "fp8"):
+        return cutlass.Boolean(False)
+    # Only the primary pool can be per-tensor FP8. The extra-source tag means
+    # NVFP4, even when the first selected row is a masked hole. Only issuing
+    # lanes own metadata, so broadcast that tag to every conversion lane.
+    extra = Int32(
+        prims.shfl_sync(
+            thread_mask=0xFFFFFFFF,
+            val=Int32(use_extra),
+            offset=0,
+            mask_and_clamp=0x1F,
+            kind=prims.Shfl.IDX,
+        )
+    )
+    return extra == Int32(0)
+
+
+# ===========================================================================
+# NVFP4 conversion
+# ===========================================================================
+
+NVFP4_DATA_BYTES = 256
+
+
+NVFP4_SCALE_BYTES = 32
+
+
+@cute.jit
+def nvfp4_scale_byte_offset(block, rope_dim: cutlass.Constexpr[int] = 64):
+    """Offset within the scale region; only the mixed format permutes it."""
+    if cutlass.const_expr(rope_dim == 0):
+        return block
+    return 8 * (block % 4) + block // 4
+
+
+def nvfp4_row_bytes(rope_dim: int) -> int:
+    """Packed D512, optional unscaled FP8 tail, and block16 E4M3 scales."""
+    return NVFP4_DATA_BYTES + rope_dim + NVFP4_SCALE_BYTES
+
+
+@cute.jit
+def convert_nvfp4x8(word: Int32, scale: Int32):
+    """Convert eight packed E2M1 values with one E4M3 block-scale byte.
+
+    ``word`` contains eight consecutive four-bit values; ``scale`` stores the
+    E4M3 byte in its low eight bits. Return two words containing eight E4M3
+    bytes, rounded once with saturation for ordinary FP8 MMA. No tensor-wide
+    NVFP4 scale is applied.
+    """
+    if cutlass.const_expr(not _has_packed_e4m3_e2m1_mul()):
+        # Older DSL builds lack packed multiply even with a newer system
+        # toolkit. Convert dense nibbles directly instead of unpacking to
+        # bytes only to repack them inside the multiply fallback.
+        return _cvt_e2m1_word_to_e4m3_words(word, scale)
+    scales = (scale & Int32(255)) * Int32(0x01010101)
+    # Each 16-bit half holds four contiguous E2M1 nibbles. CUDA 13.4's
+    # dense packed operand avoids padded-nibble masks and output permutations.
+    values = cute.arch.inline_ptx(
+        "{ .reg .b16 lo, hi;\n"
+        "  mov.b32 {lo, hi}, {$r0};\n"
+        "  mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite {$w0}, lo, {$r1};\n"
+        "  mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite {$w1}, hi, {$r1};\n"
+        "}",
+        write_only_types=[Int32, Int32],
+        read_only_args=[word, scales],
+    )
+    return values[0], values[1]
+
+
+# ===========================================================================
+# TMA descriptors, gathering and staging
+# ===========================================================================
 
 
 @cute.jit
 def make_whole_record_map(pool, record_bytes: cutlass.Constexpr[int]):
-    """Native record extent with a gather4-aligned shared-memory row pitch."""
-    word_bytes = 4 if record_bytes > 512 else 2
+    """Describe a complete byte record as Uint16 values for unswizzled gather4.
+
+    All supported records fit the 256-element TMA box limit using Uint16.
+    A 32-byte raw row pitch makes each four-row destination 128-byte aligned;
+    global rows retain their original record stride and are not repacked.
+    """
+    word_bytes = 2
     raw_bytes = (record_bytes + 31) // 32 * 32
     packed = cute.make_tensor(
         cute.make_ptr(
-            cutlass.Uint32 if word_bytes == 4 else cutlass.Uint16,
+            cutlass.Uint16,
             pool.iterator.toint(),
             cute.AddressSpace.gmem,
             assumed_align=16,
@@ -46,14 +278,21 @@ def make_whole_record_map(pool, record_bytes: cutlass.Constexpr[int]):
 
 
 @cute.jit
-def make_scaled_kv_maps(
+def make_nvfp4_kv_maps(
     primary,
     extra,
     rope_dim: cutlass.Constexpr[int],
-    whole_nope: cutlass.Constexpr[bool] = False,
+    whole_record: cutlass.Constexpr[bool] = False,
     primary_format: cutlass.Constexpr[str] = "nvfp4",
     extra_format: cutlass.Constexpr[str] = "nvfp4",
 ):
+    """Build paired payload, block-scale and optional RoPE tensor maps.
+
+    Each pool is the internal [1, record_bytes, physical_rows] byte view.
+    Return primary/extra maps in payload, scales, RoPE order. Whole-record
+    maps preserve the token-interleaved representation; panel maps place
+    128 logical values in the MMA swizzle. FP8 primary data has no trailer,
+    so its unused scale/RoPE descriptors are safe aliases inside that pool."""
     nope = 512
     maps = ()
     for pool, fmt in ((primary, primary_format), (extra, extra_format)):
@@ -75,7 +314,7 @@ def make_scaled_kv_maps(
             pool.iterator + (nope // 2 if rope_dim else 0),
             cute.make_layout((64, pool.shape[2]), stride=(1, pool.stride[2])),
         )
-        if cutlass.const_expr(whole_nope):
+        if cutlass.const_expr(whole_record):
             data_map = make_whole_record_map(pool, cache_record_size(fmt, rope_dim))
         elif cutlass.const_expr(fp8):
             data_map = create_tensor_map_tiled_from_view(
@@ -124,6 +363,11 @@ def convert_nvfp4_panel(
     rows: cutlass.Constexpr[int],
     rope_dim: cutlass.Constexpr[int],
 ):
+    """Expand a gathered 128-column E2M1 panel in place into E4M3 MMA bytes.
+
+    TMA B4X16_P64 leaves each eight packed bytes in a sixteen-byte slot.
+    One lane reads sixteen values and their block16 scale, rounds once to
+    E4M3, then fills that slot; D576 uses its permuted scale-byte order."""
     lane = cute.arch.thread_idx()[0] % 32
     for chunk in cutlass.range(lane, rows * 8, 32, unroll=4):
         row, col = chunk // 8, chunk % 8 * 16
@@ -143,6 +387,10 @@ def convert_nvfp4_panel(
 
 @cute.jit
 def begin_raw_load(barrier, count):
+    """Have lane zero arm a raw TMA barrier for count bytes and return its epoch token.
+
+    The warp joins before issuing gathers. Only lane zero later consumes
+    the returned token; other lanes wait through the matching warp join."""
     state = Int64(0)
     if cute.arch.thread_idx()[0] % 32 == 0:
         state = prims.mbarrier_arrive_expect_tx(barrier, Int32(count))
@@ -152,6 +400,7 @@ def begin_raw_load(barrier, count):
 
 @cute.jit
 def wait_raw_load(barrier, state):
+    """Wait in lane zero for the armed raw TMA epoch, then release the whole warp."""
     if cute.arch.thread_idx()[0] % 32 == 0:
         while not prims.mbarrier_try_wait(barrier, state):
             pass
@@ -171,6 +420,11 @@ def gather_cached(
     rows: cutlass.Constexpr[int],
     width,
 ):
+    """Issue four-row TMA gathers from register-cached, source-tagged storage indices.
+
+    Each issuing lane owns one quad; width is its destination bytes per row.
+    The high source bit chooses the pool map and is stripped from row IDs.
+    Invalid rows become the TMA out-of-bounds sentinel and are zero-filled."""
     lane = cute.arch.thread_idx()[0] % 32
     if lane < rows // 4:
         raw = cached[base]
@@ -192,7 +446,7 @@ def gather_cached(
 
 
 @cute.jit
-def load_scaled_panel(
+def load_nvfp4_panel(
     dst,
     scratch,
     barrier,
@@ -212,6 +466,11 @@ def load_scaled_panel(
     load_scales: cutlass.Constexpr[bool],
     fp8=False,
 ):
+    """Gather one feature panel, applying NVFP4 block scales only for packed storage.
+
+    The caller owns the raw barrier and scratch. Payload and scale byte
+    credits match their tensor-map transfers; FP8 primary and unscaled
+    RoPE bypass conversion. MMA publication remains the caller's job."""
     if cutlass.const_expr(rope_only):
         state = begin_raw_load(barrier, rows * 64)
         gather_cached(
@@ -261,7 +520,7 @@ def load_scaled_panel(
 
 
 @cute.jit
-def load_scaled_panels(
+def load_nvfp4_panels(
     destinations,
     columns,
     scratch,
@@ -468,7 +727,7 @@ def copy_fp8_record(dst, raw, thread_idx, raw_empty):
 
 
 @cute.jit
-def prefetch_scaled_row(primary, extra, route, cfg):
+def prefetch_nvfp4_kv_row(primary, extra, route, cfg):
     """Warm the complete selected record while metadata runs ahead of conversion."""
     row = route & Int32(0x7FFFFFFF)
     address = primary.iterator.toint()
@@ -491,7 +750,7 @@ def prefetch_scaled_row(primary, extra, route, cfg):
             cute.arch.inline_ptx(
                 "prefetch.global.L2 [{$r0}];", read_only_args=[address + Int64(351)]
             )
-        if cutlass.const_expr(cfg.has_tensor_fp8):
+        if cutlass.const_expr(cfg.has_fp8_primary):
             if width == Int32(512):
                 for line in cutlass.range_constexpr(3, 4):
                     cute.arch.inline_ptx(

@@ -13,9 +13,11 @@ from cutlass import Int32
 from cutlass.experimental import primitives as prims
 
 from ..helpers.gather import gather4_quad
-from ..scaled_kv.nvfp4 import convert_nvfp4x8, nvfp4_row_bytes, nvfp4_scale_byte_offset
-from ..scaled_kv.memory import (
-    publish_scaled_kv,
+from ..helpers.nvfp4_kv import (
+    convert_nvfp4x8,
+    nvfp4_row_bytes,
+    nvfp4_scale_byte_offset,
+    publish_nvfp4_kv,
     store_shared_u32x4,
     swizzle_byte_offset,
 )
@@ -23,6 +25,7 @@ from ..scaled_kv.memory import (
 
 @cute.jit
 def shared_byte_view(ptr, count: cutlass.Constexpr[int]):
+    """Expose count bytes of CTA-local raw scratch for packed scale/payload reads."""
     return cutlass.Array(ptr, dtype=cutlass.Uint8, shape=(count,), addrspace=3)
 
 
@@ -37,6 +40,7 @@ def arm_raw_load(barrier, tx_bytes: cutlass.Constexpr[int], reset=False):
 
 @cute.jit
 def wait_raw_load(barrier, phase):
+    """Acquire completion of the current per-warp TMA epoch before reading raw bytes."""
     while not prims.mbarrier_wait_parity(barrier, phase, prims.MBarrierWait.TRY):
         pass
 
@@ -57,12 +61,17 @@ def load_shared_words(addr, count: cutlass.Constexpr[int]):
     return cutlass.inttoptr(addr, 3, Int32).load(count=count, alignment=4 * count)
 
 
-def scaled_kv_scratch_bytes(rope_dim):
+def nvfp4_kv_scratch_bytes(rope_dim):
+    """Return bytes for the 64 NVFP4 rows owned by one CTA; FP8 gathers directly into K."""
     return 64 * nvfp4_row_bytes(rope_dim)
 
 
 @cute.jit
 def issue_k_gathers(k, raw, dst, barrier, rows, q: cutlass.Constexpr[int], warp, fp8):
+    """Gather one warp-owned four-row group into raw NVFP4 scratch or FP8 K panels.
+
+    FP8 primary emits four 128-byte panel gathers. NVFP4 emits one whole
+    record gather and converts later; both routes use the same source tag."""
     if fp8:
         quad = warp * Int32(2) + Int32(q)
         for part in cutlass.range_constexpr(4):
@@ -87,6 +96,10 @@ def issue_k_gathers(k, raw, dst, barrier, rows, q: cutlass.Constexpr[int], warp,
 
 @cute.jit
 def store_v_remote(dst, offset, done, owner, a, b, c, d):
+    """Send sixteen converted V bytes to the peer CTA and credit its completion barrier.
+
+    Offset is in bytes within the peer V stage. The stage must be acquired
+    before this asynchronous store; the publisher waits for all peer bytes."""
     destination = cute.make_ptr(
         cutlass.Int32,
         dst.toint(Int32) + offset,
@@ -114,6 +127,13 @@ def convert_k_and_exchange_v(
     register_exchange: cutlass.Constexpr[bool],
     rope_dim: cutlass.Constexpr[int],
 ):
+    """Convert eight owned token rows and distribute their V features across the CTA pair.
+
+    Each lane handles sixteen columns. Its CTA keeps one 256-feature V
+    half and sends the other half to its peer. FP8 primary K is already in
+    place; NVFP4 is expanded once and reused for both QK and PV. Register
+    exchange permits unequal K/V stage counts; bulk exchange retains K
+    as the copy source until both V consumers finish."""
     stride = nvfp4_row_bytes(rope_dim)
     for i in cutlass.range(8, unroll=2 if fp8 else 8):
         row = warp * Int32(8) + Int32(i)
@@ -163,7 +183,7 @@ def convert_k_and_exchange_v(
             wr[2],
             wr[3],
         )
-    publish_scaled_kv(barrier, 8 * (512 + rope_dim), cta_group=2)
+    publish_nvfp4_kv(barrier, 8 * (512 + rope_dim), cta_group=2)
     if cutlass.const_expr(not register_exchange):
         # This warp owns all eight source rows; K publication supplied its
         # proxy fence and warp join. Coupled K/V slots retain the copy source.
@@ -187,7 +207,7 @@ def convert_k_and_exchange_v(
 
 
 @cute.jit
-def load_scaled_source_stage(
+def load_nvfp4_source_stage(
     k, v, stage_info, v_stage, page_stage, *, fp8_source: cutlass.Constexpr[bool]
 ):
     """Specialize the complete producer so source-format branches stay together."""
@@ -288,11 +308,15 @@ def load_scaled_source_stage(
 
 
 @cute.jit
-def publish_scaled_v(barrier, count):
+def publish_nvfp4_v(barrier, count):
     # K publication has already proxy-fenced and warp-joined every ordinary
     # local V store. The remaining writes are async DSMEM transactions.
     # Warp0's incoming completion acquire is ordered before this release;
     # its withheld credit keeps V-full closed until all received bytes arrive.
+    """Publish V only after local stores and incoming DSMEM transfers are complete.
+
+    K publication already fenced the local writes. The designated publisher
+    acquired peer completion before releasing the cluster-wide V-full credit."""
     if prims.elect_sync():
         prims.fence_sync_restrict(prims.MemOrder.RELEASE)
         prims.mbarrier_complete_tx(
@@ -302,9 +326,13 @@ def publish_scaled_v(barrier, count):
 
 @cute.jit
 def tile_is_fp8(k, stage_info, offset):
+    """Select the primary FP8 producer for the current or prefetched KV tile.
+
+    Compare logical tile position with the live primary boundary cached
+    by the metadata task. The extra source always selects NVFP4."""
     cfg = k.cfg
-    if cutlass.const_expr(cfg.kv_cache_format == cfg.extra_kv_cache_format):
-        return cutlass.Boolean(cfg.kv_cache_format == "fp8")
+    if cutlass.const_expr(cfg.kv_cache_format != "fp8"):
+        return cutlass.Boolean(False)
     extra = cutlass.Boolean(False)
     if cutlass.const_expr(k.page_offsets.has_extra):
         primary_tiles = Int32(0)
@@ -315,17 +343,13 @@ def tile_is_fp8(k, stage_info, offset):
         else:
             primary_tiles = k.request_lengths[2]
         extra = Int32(stage_info.work_tile.k_index_base) + offset >= primary_tiles
-    if cutlass.const_expr(cfg.extra_kv_cache_format == "fp8"):
-        return extra
     return not extra
 
 
 @cute.jit
-def load_scaled_kv_stage(k, v, stage_info, v_stage, page_stage):
+def load_nvfp4_kv_stage(k, v, stage_info, v_stage, page_stage):
     """Select the format once before the specialized gather/conversion path."""
     if tile_is_fp8(k, stage_info, Int32(stage_info.loop_offset)):
-        load_scaled_source_stage(k, v, stage_info, v_stage, page_stage, fp8_source=True)
+        load_nvfp4_source_stage(k, v, stage_info, v_stage, page_stage, fp8_source=True)
     else:
-        load_scaled_source_stage(
-            k, v, stage_info, v_stage, page_stage, fp8_source=False
-        )
+        load_nvfp4_source_stage(k, v, stage_info, v_stage, page_stage, fp8_source=False)

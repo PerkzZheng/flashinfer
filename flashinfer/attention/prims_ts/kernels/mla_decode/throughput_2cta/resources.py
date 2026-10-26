@@ -70,8 +70,9 @@ from ..helpers.gather import (
     CachedSparseMask,
 )
 
-from .scaled_kv_load import load_scaled_kv_stage, publish_scaled_v
-from ..scaled_kv.tma import prefetch_scaled_row
+from .nvfp4_kv_load import load_nvfp4_kv_stage, publish_nvfp4_v
+from ..helpers.sparse_indices import cache_sparse_source_lengths
+from ..helpers.nvfp4_kv import prefetch_nvfp4_kv_row
 from .config import (
     OUTPUT_TMA_STAGE_BYTES,
     V_SMEM_K_BLOCK_TOKENS,
@@ -146,6 +147,7 @@ def with_cluster_acquire_waits(base: object) -> object:
     class ClusterAcquirePipeline(cls):  # type: ignore[valid-type, misc]
         @cute.jit
         def try_cluster_acquire(self, state) -> Boolean:
+            """Try the full-stage barrier with cluster acquire ordering for both CTAs' payloads."""
             bar = self.sync_object_full.get_barrier(state.index)
             return prims.mbarrier_wait_parity(
                 bar,
@@ -157,17 +159,20 @@ def with_cluster_acquire_waits(base: object) -> object:
 
         @cute.jit
         def wait_cluster_acquire(self, state) -> None:
+            """Wait until the full stage is visible under the producer's cluster release."""
             while not self.try_cluster_acquire(state):
                 pass
 
         @dsl_user_op
         def consumer_try_wait(self, state, *, loc=None, ip=None) -> Boolean:
+            """Adapt the pipeline try-wait hook to the cluster-scope payload acquire."""
             return self.try_cluster_acquire(state)
 
         @dsl_user_op
         def consumer_wait(
             self, state, try_wait_token=None, *, loc=None, ip=None
         ) -> None:
+            """Complete the cluster acquire unless an earlier successful try-wait already did so."""
             if_generate(
                 try_wait_token is None or try_wait_token == 0,
                 lambda: self.wait_cluster_acquire(state),
@@ -774,6 +779,12 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
     @producer_work
     @cute.jit
     def load_sparse_offsets(self, stage_info: StageInfo):
+        """Stage source-tagged physical row IDs for the next K/V tile.
+
+        With assume_valid_prefix, entries before each live length contain no
+        -1 holes, so each CTA can retain only its own 64 rows. Otherwise keep
+        the full 128-row metadata tile for score masking. Valid-prefix does
+        not imply contiguous physical rows, sorted indices, or no tail padding."""
         lane = cute.arch.thread_idx()[0] % 32
         k_index = stage_info.work_tile.k_index_base + Int32(stage_info.loop_offset)
         token = k_index * Int32(128) + lane * Int32(4)
@@ -789,7 +800,7 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
             routes = self.page_offsets
         active = cutlass.Boolean(True)
         if cutlass.const_expr(
-            self.cfg.use_scaled_kv
+            self.cfg.has_nvfp4_kv
             and getattr(self.page_offsets, "assume_valid_prefix", False)
         ):
             active = lane // Int32(16) == cute.arch.make_warp_uniform(
@@ -797,11 +808,11 @@ class PageOffsetWindowResource(HighThroughputMlaResource):
             )
         if active:
             quad = load_sparse_quad(routes, row, token)
-            if cutlass.const_expr(self.cfg.use_scaled_kv):
+            if cutlass.const_expr(self.cfg.has_nvfp4_kv):
                 cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
                 if lane // Int32(16) == cta:
                     for j in cutlass.range_constexpr(4):
-                        prefetch_scaled_row(
+                        prefetch_nvfp4_kv_row(
                             self.primary_cache, self.extra_cache, quad[j], self.cfg
                         )
 
@@ -1247,7 +1258,7 @@ class SmemQResource(HighThroughputMlaResource):
     def q_desc(self, stage_info: StageInfo) -> None:
         """Stage64 local Q rows into the replicated group-2 TMEM A layout."""
         del stage_info
-        if cutlass.const_expr(self.cfg.use_scaled_kv):
+        if cutlass.const_expr(self.cfg.has_nvfp4_kv):
             if prims.elect_sync():
                 copy_q_fp8_to_tmem(
                     self.smem_q_latent.data_ptr(),
@@ -1764,7 +1775,7 @@ class SmemKResource(HighThroughputMlaResource):
     def init_load_state(self, stage_info: StageInfo) -> None:
         """Initialize per-warp state used by K TMA loads."""
         del stage_info
-        if cutlass.const_expr(self.cfg.use_scaled_kv):
+        if cutlass.const_expr(self.cfg.has_nvfp4_kv):
             self.request_lengths = cutlass.Array(
                 Int32,
                 3,
@@ -1774,24 +1785,19 @@ class SmemKResource(HighThroughputMlaResource):
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def bind_sparse_request(self, stage_info: StageInfo):
-        if cutlass.const_expr(
-            self.cfg.use_scaled_kv and not self.page_offsets.is_bound
-        ):
-            row = stage_info.work_tile.tile_idx[2]
-            self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
-            self.request_lengths[2] = (self.request_lengths[0] + Int32(127)) // Int32(
-                128
-            )
-
-            self.request_lengths[1] = (
-                Int32(self.page_offsets.extra_lengths[row])
-                if self.page_offsets.has_extra
-                else Int32(0)
+        """Cache live source lengths for this query before its KV/softmax loop."""
+        if cutlass.const_expr(self.cfg.has_nvfp4_kv):
+            cache_sparse_source_lengths(
+                self.page_offsets,
+                stage_info.work_tile.tile_idx[2],
+                self.request_lengths,
+                include_primary_tiles=True,
             )
 
     def create_pipeline(self, pipeline_config):
+        """Use cluster-scope consumer acquires for K published by both conversion CTAs."""
         base = super().create_pipeline(pipeline_config)
-        if self.cfg.use_scaled_kv:
+        if self.cfg.has_nvfp4_kv:
             return with_cluster_acquire_waits(base)
         return base
 
@@ -1800,8 +1806,8 @@ class SmemKResource(HighThroughputMlaResource):
     def tma_load_shared(self, stage_info: StageInfo, *, page_offset_stage):
         """Read one warp-uniform SMEM quad and reuse it across FP8 feature slices."""
         cfg = self.cfg
-        if cutlass.const_expr(cfg.use_scaled_kv):
-            load_scaled_kv_stage(
+        if cutlass.const_expr(cfg.has_nvfp4_kv):
+            load_nvfp4_kv_stage(
                 self,
                 self.paired_v,
                 stage_info,
@@ -2031,18 +2037,20 @@ class SmemVResource(HighThroughputMlaResource):
     def init_load_state(self, stage_info: StageInfo) -> None:
         """Initialize per-warp state used by V TMA loads."""
         del stage_info
-        if cutlass.const_expr(self.cfg.use_scaled_kv):
+        if cutlass.const_expr(self.cfg.has_nvfp4_kv):
             self.current_slot = cutlass.Array(Int32, 2, space=cutlass.AddressSpace.rmem)
 
     def create_pipeline(self, pipeline_config):
+        """Use cluster-scope consumer acquires for V assembled from local and peer data."""
         base = super().create_pipeline(pipeline_config)
-        if self.cfg.use_scaled_kv:
+        if self.cfg.has_nvfp4_kv:
             return with_cluster_acquire_waits(base)
         return base
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def combined_stage(self, stage_info: StageInfo):
+        """Expose the acquired V stage index and phase to the paired K/V producer."""
         self.current_slot[0] = stage_info.stage_idx
         self.current_slot[1] = self.producer_state.phase ^ Int32(1)
 
@@ -2051,8 +2059,8 @@ class SmemVResource(HighThroughputMlaResource):
     def tma_load_shared(self, stage_info: StageInfo, *, page_offset_stage):
         """Read one warp-uniform SMEM quad and reuse it across FP8 V panels."""
         cfg = self.cfg
-        if cutlass.const_expr(cfg.use_scaled_kv):
-            publish_scaled_v(stage_info.barrier, 4096)
+        if cutlass.const_expr(cfg.has_nvfp4_kv):
+            publish_nvfp4_v(stage_info.barrier, 4096)
             return
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - cfg.load_v_warp_id
         cta = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -2448,14 +2456,14 @@ class TmemSResource(HighThroughputMlaResource):
     @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def bind_sparse_request(self, stage_info: StageInfo):
-        """Cache live source lengths once per query tile, including graph replay."""
-        if cutlass.const_expr(
-            isinstance(self.page_offsets, SparseKVIndices)
-            and not self.page_offsets.is_bound
-        ):
-            row = stage_info.work_tile.tile_idx[2]
-            self.request_lengths[0] = Int32(self.page_offsets.primary_lengths[row])
-            self.request_lengths[1] = Int32(self.page_offsets.extra_lengths[row])
+        """Cache live source lengths for this query before its KV/softmax loop."""
+        if cutlass.const_expr(isinstance(self.page_offsets, SparseKVIndices)):
+            cache_sparse_source_lengths(
+                self.page_offsets,
+                stage_info.work_tile.tile_idx[2],
+                self.request_lengths,
+                include_primary_tiles=False,
+            )
 
     @producer_work
     @cute.jit
@@ -2529,7 +2537,11 @@ class TmemSResource(HighThroughputMlaResource):
                             logical_call_idx > 0 or k_block > 0
                         )
                         if prims.elect_sync():
-                            if cutlass.const_expr(cfg.use_scaled_kv):
+                            if cutlass.const_expr(cfg.has_nvfp4_kv):
+                                # Q NoPE occupies TMEM columns 384:512:
+                                # 512 E4M3 bytes / 4 bytes per column = 128.
+                                # Each D128 slice advances 32 columns; each
+                                # K32 MMA step advances another 8 columns.
                                 prims.tcgen05_mma(
                                     mma_kind,
                                     cta_group,
@@ -2724,7 +2736,7 @@ class TmemSResource(HighThroughputMlaResource):
             )
         else:
             mask_page_offsets = self.page_offsets
-        if cutlass.const_expr(cfg.has_tensor_fp8):
+        if cutlass.const_expr(cfg.has_fp8_primary):
             scale = mask_page_offsets.tensor_scale(tile_offset_k)
             if scale != cutlass.Float32(1):
                 for i in cutlass.range_constexpr(0, 64, 2):
@@ -3410,7 +3422,7 @@ class TmemCorrResource(HighThroughputMlaResource):
         correction_regs = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         correction_regs[0] = row_sum_out
         correction_regs[1] = row_max_new
-        if cutlass.const_expr(cfg.has_tensor_fp8):
+        if cutlass.const_expr(cfg.has_fp8_primary):
             work = stage_info.work_tile
             current = (work.k_index_base + Int32(stage_info.loop_offset)) * Int32(
                 cfg.mma_qk_tiler[1]
@@ -3881,6 +3893,10 @@ class GmemOResource(HighThroughputMlaResource):
 
     @cute.jit
     def _normalization_scale(self, row_sum, row_max, local_tidx, blk_coord, stage_info):
+        """Compute output normalization including sink mass and the final source's V units.
+
+        Row sums retain the FP8 probability scale. Apply tensor-FP8 V descale
+        only to O, after denominator/sink normalization; it must not change LSE."""
         safe_sum = row_sum if row_sum > Float32(0) else Float32(1)
         scale = self.output_scale * cute.math.rcp(safe_sum, approx=True)
         if cutlass.const_expr(self.atten_sinks is not None):
@@ -3919,7 +3935,7 @@ class GmemOResource(HighThroughputMlaResource):
                     * rescale
                     * cute.math.rcp(denominator, approx=True)
                 )
-        if cutlass.const_expr(self.cfg.has_tensor_fp8):
+        if cutlass.const_expr(self.cfg.has_fp8_primary):
             work = stage_info.work_tile
             last = (work.k_index_base + work.k_tile_count - Int32(1)) * Int32(
                 self.cfg.mma_qk_tiler[1]

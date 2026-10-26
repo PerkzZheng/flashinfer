@@ -96,8 +96,11 @@ from .parallel_reduction import (
 )
 from .reduction import gmem_reduction_launch_shape, run_gmem_reduction_kernel
 from ..helpers.gather import make_sparse_rope_map
-from ..scaled_kv.layout import ScaledKVConfig
-from ..scaled_kv.tma import make_scaled_kv_maps
+from ..helpers.nvfp4_kv import (
+    validate_nvfp4_kv_formats,
+    Nvfp4KVConfig,
+    make_nvfp4_kv_maps,
+)
 from ..helpers.constants import LOG2_E, TMEM_LIFECYCLE_BARRIER_ID, TMEM_READY_BARRIER_ID
 from ..helpers.mask import MaskType, normalize_mask_type
 from ..helpers.tile import (
@@ -1394,7 +1397,7 @@ def _make_single_kv_pipe_task_graph(
     )
     if cfg.q_tma_stage:
         smem_q.kv_alias_ref = smem_kv
-    if cfg.async_scaled_kv_gather:
+    if cfg.async_nvfp4_kv_gather:
         smem_page_offsets.nv_target = smem_kv
     tmem_s = (TmemSResource if cfg.one_insts_kv_swap else TmemSKeepsResource)(
         cfg=cfg,
@@ -1694,7 +1697,7 @@ def _make_single_kv_pipe_task_graph(
     return task_manager, corr
 
 
-class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
+class ThroughputLatencyMlaDecodeTs(Nvfp4KVConfig):
     """Throughput-latency 1CTA MLA over dense pages or prepared sparse rows."""
 
     def __init__(
@@ -1815,6 +1818,10 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
         self.lse_dtype = lse_dtype
 
     def _parallel_reduction_setup(self, cfg):
+        """Select reducer geometry for complete D512 heads and the planned split capacity.
+
+        Unquantized retained-KV M64 uses two heads per block; quantized output
+        keeps one head so its group/block scale ownership stays unchanged."""
         if cfg.fuse_sparse_reduction:
             if cfg.logical_seq_len_q != 1:
                 raise ValueError(
@@ -1833,7 +1840,7 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
             # one-head path until its wider-fragment contract is qualified.
             heads_per_cta = (
                 2
-                if cfg.use_scaled_kv
+                if cfg.has_nvfp4_kv
                 and cfg.whole_kv_tile
                 and cfg.tile_size_q == 64
                 and self.output_quant is None
@@ -1888,6 +1895,13 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
 
     def _make_config(self):
         """Create the static throughput-latency MLA config for this wrapper."""
+        validate_nvfp4_kv_formats(
+            self.kv_cache_format,
+            self.extra_kv_cache_format,
+            self.rope_dim,
+            self.qkv_dtype,
+            self.page_size,
+        )
         cfg = make_throughput_latency_mla_config(
             batch_size=self.batch_size,
             num_heads_q=self.num_heads,
@@ -2239,14 +2253,14 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
             )
 
         if cutlass.const_expr(
-            cfg.num_tokens_per_page == 1 and cfg.rope_dim and not cfg.use_scaled_kv
+            cfg.num_tokens_per_page == 1 and cfg.rope_dim and not cfg.has_nvfp4_kv
         ):
             tma_desc_sparse_rope = make_sparse_rope_map(c_latent, cfg.qkv_dtype_bytes)
             tma_desc_sparse_extra_rope = make_sparse_rope_map(
                 c_rope, cfg.qkv_dtype_bytes
             )
 
-        if cutlass.const_expr(cfg.use_scaled_kv):
+        if cutlass.const_expr(cfg.has_nvfp4_kv):
             (
                 tma_desc_c_latent,
                 tma_desc_c_rope,
@@ -2254,11 +2268,11 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
                 tma_desc_bulk_extra,
                 tma_desc_sparse_rope,
                 tma_desc_sparse_extra_rope,
-            ) = make_scaled_kv_maps(
+            ) = make_nvfp4_kv_maps(
                 c_latent,
                 c_rope,
                 cfg.rope_dim,
-                whole_nope=cfg.async_scaled_kv_gather,
+                whole_record=cfg.async_nvfp4_kv_gather,
                 primary_format=cfg.kv_cache_format,
                 extra_format=cfg.extra_kv_cache_format,
             )
@@ -2479,7 +2493,7 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, os, sinks, ks, eks = sparse_inputs
+            si, ci, sl, cl, sm, os, sinks, ks = sparse_inputs
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
@@ -2492,12 +2506,7 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
                 query_row=request,
                 assume_valid_prefix=cfg.sparse_valid_prefix,
                 has_extra=cfg.sparse_direct_capacities[1] > 0,
-                tensor_scales=(
-                    ks if cfg.kv_cache_format == "fp8" else None,
-                    eks if cfg.extra_kv_cache_format == "fp8" else None,
-                )
-                if "fp8" in (cfg.kv_cache_format, cfg.extra_kv_cache_format)
-                else None,
+                primary_tensor_scale=ks if cfg.kv_cache_format == "fp8" else None,
             )
             if cutlass.const_expr(not cfg.sparse_static_scales):
                 # Caller scales already include Q/K/V descales.

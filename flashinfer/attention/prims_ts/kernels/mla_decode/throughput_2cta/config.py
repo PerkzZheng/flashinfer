@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Tuple
 
 from ..helpers.constants import MAX_MLA_SPLITS_KV, SUPPORTED_MLA_PAGE_SIZES
-from ..scaled_kv.layout import ScaledKVConfig
+from ..helpers.nvfp4_kv import Nvfp4KVConfig, validate_nvfp4_kv_formats
 from ..helpers.mask import MaskType, normalize_mask_type
 
 
@@ -121,7 +121,7 @@ def compute_workspace_size(
 
 
 @dataclass
-class MlaDecodeConfig(ScaledKVConfig):
+class MlaDecodeConfig(Nvfp4KVConfig):
     """MLA decode kernel configuration.
 
     All values are plain Python ints/tuples so they can be used as
@@ -268,8 +268,10 @@ class MlaDecodeConfig(ScaledKVConfig):
     # the useful split prefix. Grid and workspace geometry retain the maximum.
     is_var_split_kv: bool = False
     cache_uniform_sparse_pages: bool = False
-    # Token-interleaved block-scaled storage is independent of the E4M3 MMA
-    # dtype. Both source formats share the existing K/V stages and ownership.
+    # Storage pairs: native/native; D512 nvfp4/nvfp4 or fp8/nvfp4;
+    # D576 nvfp4.fp8rope/nvfp4.fp8rope. NVFP4 paths require E4M3 Q/MMA.
+    # The FP8 primary has a separate tensor scale; NVFP4 uses embedded block
+    # scales. Both pools retain their physical row strides and share stages.
     kv_cache_format: str = "native"
     extra_kv_cache_format: str = "native"
     # Causal is bottom-right aligned for speculative decode. Dense still masks
@@ -357,17 +359,17 @@ def make_mla_decode_config(
     extra_kv_cache_format: str = "native",
 ) -> MlaDecodeConfig:
     """Create and populate a MlaDecodeConfig from problem parameters."""
-    use_scaled_kv = kv_cache_format != "native"
-    if use_scaled_kv and not (
+    validate_nvfp4_kv_formats(
+        kv_cache_format, extra_kv_cache_format, rope_dim, qkv_dtype, page_size
+    )
+    has_nvfp4_kv = kv_cache_format != "native"
+    if has_nvfp4_kv and not (
         qkv_dtype == "e4m3"
         and page_size == 1
         and rope_dim in (0, 64)
         and sparse_gather_warps == 1
-        and not fuse_output_quant
     ):
-        raise ValueError(
-            "Scaled KV needs sparse E4M3 D512/D576 (page size 1) without output quantization"
-        )
+        raise ValueError("NVFP4 KV needs sparse E4M3 D512/D576 (internal page size 1)")
     cfg = MlaDecodeConfig()
     cfg.kv_cache_format = kv_cache_format
     cfg.extra_kv_cache_format = extra_kv_cache_format
@@ -448,7 +450,7 @@ def make_mla_decode_config(
             # index prefetch can run ahead of both streams.
             # Packed rows already have independent prefetch scratch. Two K
             # slots let QK advance while the previous V tile is consumed.
-            cfg.load_k_stage, cfg.load_v_stage = (2, 1) if use_scaled_kv else (2, 2)
+            cfg.load_k_stage, cfg.load_v_stage = (2, 1) if has_nvfp4_kv else (2, 2)
             cfg.use_fp8_dual_softmax_schedule = False
             cfg.second_compute_warp_ids = ()
             cfg.num_softmax_groups = 1
@@ -458,9 +460,18 @@ def make_mla_decode_config(
             cfg.threads_per_cta = cfg.threads_per_warp * 20
             cfg.other_reg_num = 48
 
-    if use_scaled_kv:
-        assert use_scaled_kv
-        cfg.load_k_stage, cfg.load_v_stage = 2, 2 if rope_dim else 3
+    if has_nvfp4_kv:
+        # Convert each CTA's 64 rows once. D512 sends V directly from registers,
+        # allowing three V stages against two K stages; D576 bulk exchange
+        # retains the K source, so K and V lifetimes use paired two-stage slots.
+        # One S stage leaves the TMEM columns needed to retain FP8 NoPE Q.
+        # Fused FP8 output needs a 32-KiB shared output stage. Pair K/V at
+        # two stages for that path to fit the SMEM budget; equal stage counts
+        # select bulk DSMEM exchange and retain K until both V readers finish.
+        cfg.load_k_stage, cfg.load_v_stage = (
+            2,
+            2 if rope_dim or fuse_output_quant else 3,
+        )
         cfg.load_num_warps = 8
         cfg.mma_s_stage = 1
         cfg.load_v_warp_id = cfg.load_k_warp_id
@@ -500,13 +511,13 @@ def make_mla_decode_config(
         cfg.softmax_reg_num = 144
         cfg.correction_reg_num = 144
         cfg.other_reg_num = 64
-        if use_scaled_kv and not rope_dim:
+        if has_nvfp4_kv and not rope_dim:
             # Tensor-scale score/correction state needs more softmax registers.
             # Borrow eight from the other warps; stay within the CTA's initial
             # allocation (60,416 registers versus its 61,440-register credit).
-            cfg.softmax_reg_num = 112 if cfg.has_tensor_fp8 else 96
+            cfg.softmax_reg_num = 112 if cfg.has_fp8_primary else 96
             cfg.correction_reg_num = 96
-            cfg.other_reg_num = 88 if cfg.has_tensor_fp8 else 96
+            cfg.other_reg_num = 88 if cfg.has_fp8_primary else 96
 
     if fuse_output_quant and cfg.is_fp8_qkv() and cfg.threads_per_cta == 640:
         # Quantization keeps an output block and rotary coefficients live.
@@ -516,7 +527,7 @@ def make_mla_decode_config(
         cfg.correction_reg_num = 176
         cfg.other_reg_num = 48
 
-    if cfg.use_scaled_kv:
+    if cfg.has_nvfp4_kv:
         cfg.p_mma_stage = 2 if rope_dim else 1
         assert cfg.sparse_offset_stages >= 2
 

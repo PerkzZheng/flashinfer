@@ -85,11 +85,13 @@ from .resources import (
     WorkThrottleBarrierResource,
 )
 from ..helpers.math import qkv_dtype
-from .scaled_kv_load import scaled_kv_scratch_bytes
+from .nvfp4_kv_load import nvfp4_kv_scratch_bytes
 from ..helpers.gather import make_sparse_rope_map
-from ..scaled_kv.nvfp4 import nvfp4_row_bytes
-from ..scaled_kv.layout import ScaledKVConfig
-from ..scaled_kv.tma import make_whole_record_map
+from ..helpers.nvfp4_kv import (
+    nvfp4_row_bytes,
+    Nvfp4KVConfig,
+    make_whole_record_map,
+)
 from ..parallel_reduction_topology import (
     ParallelReductionTopology,
     make_balanced_parallel_reduction_topology,
@@ -390,7 +392,7 @@ def build_mla_decode_task_manager(
             consumer_group=pipeline.CooperativeGroup(
                 Agent.Thread,
                 (
-                    (1 if cfg.use_scaled_kv else 2) * cfg.load_num_warps
+                    (1 if cfg.has_nvfp4_kv else 2) * cfg.load_num_warps
                     + (4 if shared_mask_enabled else 0)
                 )
                 * 32,
@@ -549,7 +551,7 @@ def build_mla_decode_task_manager(
     wg2_reg_count = cfg.other_reg_num
 
     if cfg.use_fp8_split_mma_schedule:
-        if cfg.use_scaled_kv:
+        if cfg.has_nvfp4_kv:
             smem_k.paired_v = smem_v
             smem_k.page_window = page_offset_window
             load_k_task = create_load_combined_task(
@@ -843,7 +845,7 @@ def build_mla_decode_task_manager(
 # =====================================================================
 
 
-class MlaDecodeTs(ScaledKVConfig):
+class MlaDecodeTs(Nvfp4KVConfig):
     """Warp-specialised MLA decode kernel using the TS framework.
 
     Usage::
@@ -1326,9 +1328,16 @@ class MlaDecodeTs(ScaledKVConfig):
             c_latent.iterator,
             cute.select(c_latent.layout, mode=[1, 0, 2]),
         )
-        if cutlass.const_expr(cfg.use_scaled_kv):
-            # Each pool keeps its own token-interleaved format. Reuse the
-            # sparse K/extra-K, tail/extra-tail and V/extra-V ABI slots.
+        if cutlass.const_expr(cfg.has_nvfp4_kv):
+            # Byte views are [1, record_bytes, physical_rows], preserving each
+            # pool's page stride. Each logical token is contiguous:
+            #   D512 NVFP4: [256 B nibbles | 32 B block16 scales]
+            #   D576 NVFP4: [256 B nibbles | 64 B FP8 RoPE | 32 B scales]
+            #   FP8 SWA:    [512 B E4M3], primary only; scale is a run input.
+            # NVFP4 whole-record gathers feed conversion scratch. FP8 panels
+            # land directly in K's MMA swizzle. Source tags select primary or
+            # extra maps through the existing K/tail/V descriptor ABI slots.
+            # Full offsets and nibble/scale ordering: helpers/nvfp4_kv.py.
             maps = ()
             for pool, fmt in (
                 (c_latent, cfg.kv_cache_format),
@@ -1457,11 +1466,11 @@ class MlaDecodeTs(ScaledKVConfig):
 
         if cutlass.const_expr(cfg.page_size != 1):
             tma_desc_extra_v = tma_desc_c_transpose
-        if cutlass.const_expr(not cfg.use_scaled_kv):
+        if cutlass.const_expr(not cfg.has_nvfp4_kv):
             tma_desc_sparse_rope = tma_desc_c_latent
             tma_desc_sparse_extra_rope = tma_desc_c_rope
         if cutlass.const_expr(
-            cfg.page_size == 1 and cfg.rope_dim and not cfg.use_scaled_kv
+            cfg.page_size == 1 and cfg.rope_dim and not cfg.has_nvfp4_kv
         ):
             tma_desc_sparse_rope = make_sparse_rope_map(c_latent, cfg.qkv_dtype_bytes)
             tma_desc_sparse_extra_rope = make_sparse_rope_map(
@@ -1682,7 +1691,7 @@ class MlaDecodeTs(ScaledKVConfig):
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, os, sinks, ks, eks = block_split_kvs
+            si, ci, sl, cl, sm, os, sinks, ks = block_split_kvs
             capacity = cutlass.const_expr(
                 max(
                     256,
@@ -1710,12 +1719,7 @@ class MlaDecodeTs(ScaledKVConfig):
                 query_row=request,
                 assume_valid_prefix=self.assume_valid_prefix,
                 has_extra=self.direct_sparse_capacities[1] > 0,
-                tensor_scales=(
-                    ks if self.kv_cache_format == "fp8" else None,
-                    eks if self.extra_kv_cache_format == "fp8" else None,
-                )
-                if "fp8" in (self.kv_cache_format, self.extra_kv_cache_format)
-                else None,
+                primary_tensor_scale=ks if self.kv_cache_format == "fp8" else None,
             )
             if cutlass.const_expr(not self.direct_static_scales):
                 # Caller scales already include Q/K/V descales.
@@ -1798,10 +1802,10 @@ class MlaDecodeTs(ScaledKVConfig):
         # NVFP4 pool: per-loader-warp raw-row scratch buffers and their re-armed mbarriers.
         smem_raw_arr = None
         raw_mbar_arr = None
-        if cutlass.const_expr(cfg.use_scaled_kv):
+        if cutlass.const_expr(cfg.has_nvfp4_kv):
             smem_raw_arr = cutlass.Array(
                 cutlass.Uint8,
-                scaled_kv_scratch_bytes(cfg.rope_dim),
+                nvfp4_kv_scratch_bytes(cfg.rope_dim),
                 space=cutlass.AddressSpace.smem,
                 alignment=128,
             )
@@ -2152,7 +2156,7 @@ class MlaDecodeTs(ScaledKVConfig):
 
             # Initialize pipelines (creates mbarriers in SMEM)
             task_manager.setup_resources_and_tasks()
-            if cutlass.const_expr(cfg.use_scaled_kv):
+            if cutlass.const_expr(cfg.has_nvfp4_kv):
                 if warp_idx == 0 and prims.elect_sync():
                     for stage in cutlass.range_constexpr(cfg.load_v_stage):
                         prims.mbarrier_init(
