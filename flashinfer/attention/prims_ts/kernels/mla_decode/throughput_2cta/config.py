@@ -496,14 +496,17 @@ def make_mla_decode_config(
             raise ValueError("balanced registers require sparse FP8")
         # D512's register DSMEM stores benefit from a larger loader budget;
         # D576's bulk copies retain more registers for softmax/correction.
-        # Both splits claim61440 registers in the640-thread CTA.
+        # Base splits claim 61,440 registers in the 640-thread CTA.
         cfg.softmax_reg_num = 144
         cfg.correction_reg_num = 144
         cfg.other_reg_num = 64
         if use_scaled_kv and not rope_dim:
-            cfg.softmax_reg_num = 96
+            # Tensor-scale score/correction state needs more softmax registers.
+            # Borrow eight from the other warps; stay within the CTA's initial
+            # allocation (60,416 registers versus its 61,440-register credit).
+            cfg.softmax_reg_num = 112 if cfg.has_tensor_fp8 else 96
             cfg.correction_reg_num = 96
-            cfg.other_reg_num = 96
+            cfg.other_reg_num = 88 if cfg.has_tensor_fp8 else 96
 
     if fuse_output_quant and cfg.is_fp8_qkv() and cfg.threads_per_cta == 640:
         # Quantization keeps an output block and rotary coefficients live.

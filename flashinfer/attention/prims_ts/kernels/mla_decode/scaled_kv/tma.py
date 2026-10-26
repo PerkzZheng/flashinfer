@@ -1,6 +1,6 @@
 # Copyright (c) 2026 by FlashInfer team.
 # Licensed under the Apache License, Version 2.0 (the "License").
-"""Gather token-interleaved NVFP4/MXFP8 caches into shared FP8 MMA tiles."""
+"""Gather token-interleaved NVFP4/per-tensor FP8 caches into shared FP8 MMA tiles."""
 
 import cutlass
 import cutlass.cute as cute
@@ -10,7 +10,6 @@ from cutlass.experimental import cuda, primitives as prims
 from ...tensor_map import create_tensor_map_tiled_from_view
 from ..helpers.gather import gather4, select_gather_map
 from .layout import cache_record_size
-from .mxfp8 import scale_fp8_tile, scale_fp8x16
 from .nvfp4 import (
     convert_nvfp4x8,
     nvfp4_scale_byte_offset,
@@ -58,7 +57,7 @@ def make_scaled_kv_maps(
     nope = 512
     maps = ()
     for pool, fmt in ((primary, primary_format), (extra, extra_format)):
-        fp8 = fmt == "mxfp8"
+        fp8 = fmt == "fp8"
         data = cute.make_tensor(
             pool.iterator,
             cute.make_layout(
@@ -67,7 +66,7 @@ def make_scaled_kv_maps(
             ),
         )
         scales = cute.make_tensor(
-            pool.iterator + (512 if fp8 else nope // 2 + rope_dim),
+            pool.iterator + (0 if fp8 else nope // 2 + rope_dim),
             cute.make_layout(
                 (16 if fp8 else 32, pool.shape[2]), stride=(1, pool.stride[2])
             ),
@@ -211,7 +210,7 @@ def load_scaled_panel(
     rope_dim: cutlass.Constexpr[int],
     rope_only: cutlass.Constexpr[bool],
     load_scales: cutlass.Constexpr[bool],
-    mxfp8=False,
+    fp8=False,
 ):
     if cutlass.const_expr(rope_only):
         state = begin_raw_load(barrier, rows * 64)
@@ -231,7 +230,7 @@ def load_scaled_panel(
         # B4X16_P64 writes 8 packed bytes followed by 8 pad bytes per 16
         # values. Its completion count is the packed bytes, not padded SMEM.
         state = begin_raw_load(
-            barrier, rows * ((128 if mxfp8 else 64) + (32 if load_scales else 0))
+            barrier, rows * (128 if fp8 else 64 + (32 if load_scales else 0))
         )
         gather_cached(
             dst,
@@ -244,7 +243,7 @@ def load_scaled_panel(
             rows=rows,
             width=128,
         )
-        if cutlass.const_expr(load_scales):
+        if load_scales and not fp8:
             gather_cached(
                 scratch,
                 scale_map,
@@ -257,9 +256,7 @@ def load_scaled_panel(
                 width=32,
             )
         wait_raw_load(barrier, state)
-        if mxfp8:
-            scale_fp8_tile(dst, scratch, column, rows=rows)
-        else:
+        if not fp8:
             convert_nvfp4_panel(dst, scratch, column, rows=rows, rope_dim=rope_dim)
 
 
@@ -281,13 +278,18 @@ def load_scaled_panels(
     rows: cutlass.Constexpr[int],
     rope_dim: cutlass.Constexpr[int],
     separate_rope: cutlass.Constexpr[bool],
-    mxfp8=False,
+    fp8=False,
 ):
     """Overlap all feature-panel gathers before one raw-data wait."""
     panels = len(columns)
     state = begin_raw_load(
         barrier,
-        rows * (panels * (128 if mxfp8 else 64) + 32 + (64 if separate_rope else 0)),
+        rows
+        * (
+            panels * (128 if fp8 else 64)
+            + (0 if fp8 else 32)
+            + (64 if separate_rope else 0)
+        ),
     )
     for part in cutlass.range_constexpr(panels):
         gather_cached(
@@ -301,17 +303,18 @@ def load_scaled_panels(
             rows=rows,
             width=128,
         )
-    gather_cached(
-        scratch,
-        scale_map,
-        extra_scale_map,
-        Int32(0),
-        barrier,
-        cached,
-        cache_base,
-        rows=rows,
-        width=32,
-    )
+    if not fp8:
+        gather_cached(
+            scratch,
+            scale_map,
+            extra_scale_map,
+            Int32(0),
+            barrier,
+            cached,
+            cache_base,
+            rows=rows,
+            width=32,
+        )
     if cutlass.const_expr(separate_rope):
         gather_cached(
             destinations[panels],
@@ -326,9 +329,7 @@ def load_scaled_panels(
         )
     wait_raw_load(barrier, state)
     for part in cutlass.range_constexpr(panels):
-        if mxfp8:
-            scale_fp8_tile(destinations[part], scratch, columns[part], rows=rows)
-        else:
+        if not fp8:
             convert_nvfp4_panel(
                 destinations[part], scratch, columns[part], rows=rows, rope_dim=rope_dim
             )
@@ -338,7 +339,7 @@ def load_scaled_panels(
 def issue_whole_record(
     dst, barrier, cached, data_map, extra_data_map, *, issuer, row_bytes
 ):
-    """One gather per quad for a complete NVFP4 or MXFP8 storage record."""
+    """One gather per quad for a complete NVFP4 or per-tensor FP8 storage record."""
     begin_raw_load(barrier, Int32(64) * row_bytes)
     gather_cached(
         dst + issuer * Int32(64) * row_bytes,
@@ -448,8 +449,8 @@ def convert_nvfp4_record(
 
 
 @cute.jit
-def scale_mxfp8_record(dst, raw, thread_idx, raw_empty):
-    """Eight warps scale disjoint sixteen-value groups in four retained panels."""
+def copy_fp8_record(dst, raw, thread_idx, raw_empty):
+    """Reorder unmodified FP8 bytes into four retained MMA panels."""
     lane = thread_idx % Int32(32)
     warp = thread_idx // Int32(32)
     for i in cutlass.range(16, unroll=2):
@@ -458,15 +459,9 @@ def scale_mxfp8_record(dst, raw, thread_idx, raw_empty):
             row * Int32(128) + (lane % Int32(8)) * Int32(16), 128
         )
         words = cutlass.Pointer(
-            raw + row * Int32(544) + lane * Int32(16), dtype=Int32
+            raw + row * Int32(512) + lane * Int32(16), dtype=Int32
         ).load(count=4, alignment=16)
-        sf = Int32(
-            cutlass.Array(raw, dtype=cutlass.Uint8)[
-                row * Int32(544) + Int32(512) + lane // Int32(2)
-            ]
-        )
-        a, b, c, d = scale_fp8x16(words[0], words[1], words[2], words[3], sf)
-        store_shared_u32x4(dst, offset, a, b, c, d)
+        store_shared_u32x4(dst, offset, words[0], words[1], words[2], words[3])
     cute.arch.sync_warp()
     if prims.elect_sync():
         prims.mbarrier_arrive(raw_empty, scope=prims.MemScope.CTA)
@@ -496,9 +491,9 @@ def prefetch_scaled_row(primary, extra, route, cfg):
             cute.arch.inline_ptx(
                 "prefetch.global.L2 [{$r0}];", read_only_args=[address + Int64(351)]
             )
-        if cutlass.const_expr(cfg.has_mxfp8):
-            if width == Int32(528):
-                for line in cutlass.range_constexpr(3, 5):
+        if cutlass.const_expr(cfg.has_tensor_fp8):
+            if width == Int32(512):
+                for line in cutlass.range_constexpr(3, 4):
                     cute.arch.inline_ptx(
                         "prefetch.global.L2 [{$r0}];",
                         read_only_args=[address + Int64(line * 128)],

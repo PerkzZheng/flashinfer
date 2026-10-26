@@ -9,7 +9,7 @@ def cache_record_size(cache_format: str, rope_dim: int) -> int:
         "native": 512 + rope_dim,
         "nvfp4": 288,
         "nvfp4.fp8rope": 352,
-        "mxfp8": 528,
+        "fp8": 512,
     }[cache_format]
 
 
@@ -21,8 +21,8 @@ class ScaledKVConfig:
         return self.kv_cache_format != "native"
 
     @property
-    def has_mxfp8(self) -> bool:
-        return "mxfp8" in (self.kv_cache_format, self.extra_kv_cache_format)
+    def has_tensor_fp8(self) -> bool:
+        return "fp8" in (self.kv_cache_format, self.extra_kv_cache_format)
 
     @property
     def max_cache_record_size(self) -> int:

@@ -19,20 +19,21 @@ The dense API contract below retains its 512-latent plus 64-RoPE layout.
 The cache-format selectors support token-interleaved block-scaled storage with
 E4M3 Q and ordinary FP8 MMA. `kv_cache_format` selects the primary pool;
 `extra_kv_cache_format` defaults to that format. D512 pools may independently
-use `"mxfp8"` or `"nvfp4"`. Native and mixed-RoPE pools require matching formats.
-Caches use uint8 records; MXFP8 also accepts an E4M3 byte view of the complete
-528-byte records, including the scale bytes.
+use `"fp8"` or `"nvfp4"`. Native and mixed-RoPE pools require matching formats.
+Caches use uint8 records; per-tensor FP8 also accepts E4M3 tensors. Its scale is a separate
+per-run scalar, with no scale bytes in the cache record.
 
 | `kv_cache_format` | QK / V dimensions | `qk_rope_head_dim` | Bytes per token | Scale byte for block `b` |
 | --- | --- | --- | --- | --- |
-| `"mxfp8"` (DS v4.1 SWA) | 512 / 512 | 0 | 512 E4M3 + 16 UE8M0 scales | `512 + b` (block32) |
+| `"fp8"` (per-tensor SWA) | 512 / 512 | 0 | 512 E4M3 | separate `kv_cache_scale` |
 | `"nvfp4"` (DS v4.1) | 512 / 512 | 0 | 256 packed E2M1 + 32 E4M3 scales | `256 + b` |
 | `"nvfp4.fp8rope"` | 576 / 512 | 64 | 256 packed E2M1 + 64 E4M3 RoPE + 32 E4M3 scales | `320 + 8*(b % 4) + b//4` |
 
 NVFP4 scales cover 16 consecutive values; even-indexed values occupy the low
-nibble. MXFP8 scales cover 32 values and encode powers of two. Select
-`kv_cache_format="mxfp8", extra_kv_cache_format="nvfp4"` for FP8 SWA plus
-compressed NVFP4 KV. There are no global storage scales. In the DS v4.1 layout all 512
+nibble. Select `kv_cache_format="fp8", extra_kv_cache_format="nvfp4"`
+for per-tensor FP8 SWA plus compressed NVFP4 KV. Pass the primary tensor
+scale as `kv_cache_scale` to `run()` (or `extra_kv_cache_scale` for an FP8
+extra pool). NVFP4 has no global storage scale. In the DS v4.1 layout all 512
 channels, including the rotated channels, are quantized uniformly. A zero
 `qk_rope_head_dim` means there is no additional QK-only tail; the caller still
 applies any required query/key rotation before attention. The mixed format
@@ -47,12 +48,12 @@ The default softmax scale is `1/sqrt(576)` for D576 and `1/sqrt(512)` for D512.
 The H64 throughput policy uses WS M64 QK, native Layout E softmax/correction,
 Q NoPE in TMEM, and two expanded KV tiles retained through both N256 PV passes.
 Eight loader warps convert each tile gathered by metadata. NVFP4 readers snapshot their
-packed data before releasing raw scratch. MXFP8 readers release it after their
-last raw read. Q stages through an empty KV slot before the attention loop.
+packed data before releasing raw scratch. FP8 readers release it after their
+last raw copy. Q stages through an empty KV slot before the attention loop.
 
 Small decode grids with long selected lists also use the M64 whole-tile path.
 KV splits fill roughly one resident wave, using power-of-two split counts to
-limit merge traffic. Small H128 grids with an MXFP8 primary pool can use two
+limit merge traffic. Small H128 grids with an FP8 primary pool can use two
 M64 head tiles: repeated KV conversion costs less than group-2 startup in this
 region. The crossover depends on planned query rows, head tiles, selected-list
 capacity and SM count; it is a measured scheduling choice, not a cache-layout
@@ -65,16 +66,15 @@ order. Quantized output retains its existing one-head reducer. Both forms
 acquire the producer dependency before reading partial results.
 
 The 1CTA whole-tile path gathers complete records with a shared tensor-map
-helper. MXFP8 uses a Uint32 view of the native 528-byte extent and a 544-byte
-shared-memory pitch: TMA zero-fills the extra 16 bytes so every four-row
-destination is 128-byte aligned. This padding is internal; the caller's cache
-layout and physical row indices are unchanged.
+helper. Per-tensor FP8 records contain exactly 512 bytes. Loader warps only
+reorder those bytes into the retained MMA panels; there are no block-scale
+loads or FP8 conversions.
 
 The H128 throughput path uses M128 group-2 MMA with eight loader warps per CTA. Each CTA converts
 64 distinct rows of each 128-row KV tile once, writes its local V features,
 and exchanges the peer's V features through DSMEM (16 KiB in each direction).
 There is no second global V gather or duplicate value conversion. NVFP4 K uses
-whole-record gathers; MXFP8 K uses panel gathers with separate scale scratch.
+whole-record gathers; FP8 K uses panel gathers directly into the K stage, with no scale scratch load.
 
 D512 uses two K stages, three V stages, and direct asynchronous DSMEM stores
 from the conversion registers. D576 uses two stages for each operand and
@@ -107,9 +107,14 @@ Both families share record-map construction, source and scale layout helpers,
 packed conversion, vector stores, prefetch, and publication. Cluster consumers
 acquire at cluster scope after producers release converted shared data.
 All conversion lanes receive the source tag, including invalid first entries.
-The MXFP8 scaler shares scale setup across 16 values, uses packed FP16 arithmetic
-for exactly representable powers of two, and falls back to FP32 for the remaining
-UE8M0 range. Both paths implement the same saturating RNE E4M3 result.
+Per-tensor FP8 scales multiply QK accumulators before the online softmax.
+PV accumulates in each source's stored units. The existing O correction
+changes units once at a source boundary, using the ratio of previous/current
+source scales, and the final normalization applies the last source's scale.
+The softmax denominator and LSE never receive this V correction. This retains
+unmodified FP8 MMA inputs and applies arbitrary positive tensor scales in
+FP32, including when live lengths move the boundary between graph replays. The 2CTA softmax and output-correction producers
+reuse the cached request lengths to avoid recurring metadata loads.
 
 H8/H16 use narrow Swap-AB Q tiles with the same raw gather and retained
 converted tiles. H32 can also use Q=32; the measured throughput policy prefers

@@ -13,7 +13,6 @@ from cutlass import Int32
 from cutlass.experimental import primitives as prims
 
 from ..helpers.gather import gather4_quad
-from ..scaled_kv.mxfp8 import scale_fp8x16
 from ..scaled_kv.nvfp4 import convert_nvfp4x8, nvfp4_row_bytes, nvfp4_scale_byte_offset
 from ..scaled_kv.memory import (
     publish_scaled_kv,
@@ -63,8 +62,8 @@ def scaled_kv_scratch_bytes(rope_dim):
 
 
 @cute.jit
-def issue_k_gathers(k, raw, dst, barrier, rows, q: cutlass.Constexpr[int], warp, mxfp8):
-    if mxfp8:
+def issue_k_gathers(k, raw, dst, barrier, rows, q: cutlass.Constexpr[int], warp, fp8):
+    if fp8:
         quad = warp * Int32(2) + Int32(q)
         for part in cutlass.range_constexpr(4):
             gather4_quad(
@@ -75,14 +74,6 @@ def issue_k_gathers(k, raw, dst, barrier, rows, q: cutlass.Constexpr[int], warp,
                 rows,
                 barrier,
             )
-        gather4_quad(
-            raw + q * 128,
-            k.tma_desc_sparse_rope,
-            k.tma_desc_sparse_extra_rope,
-            Int32(0),
-            rows,
-            barrier,
-        )
     else:
         gather4_quad(
             raw + q * 4 * nvfp4_row_bytes(k.cfg.rope_dim),
@@ -119,25 +110,20 @@ def convert_k_and_exchange_v(
     barrier,
     done,
     *,
-    mxfp8: cutlass.Constexpr[bool],
+    fp8: cutlass.Constexpr[bool],
     register_exchange: cutlass.Constexpr[bool],
     rope_dim: cutlass.Constexpr[int],
 ):
     stride = nvfp4_row_bytes(rope_dim)
-    for i in cutlass.range(8, unroll=2 if mxfp8 else 8):
+    for i in cutlass.range(8, unroll=2 if fp8 else 8):
         row = warp * Int32(8) + Int32(i)
         offset = (lane >> Int32(3)) * Int32(8192) + swizzle_byte_offset(
             row * Int32(128) + (lane & Int32(7)) * Int32(16), 128
         )
         a, b, c, d = Int32(0), Int32(0), Int32(0), Int32(0)
-        if cutlass.const_expr(mxfp8):
+        if cutlass.const_expr(fp8):
             k8 = load_shared_words(kdst.toint(Int32) + offset, 4)
-            sf = Int32(
-                shared_byte_view(kraw, 256)[
-                    swizzle_byte_offset(Int32(i * 32) + lane // Int32(2), 32)
-                ]
-            )
-            a, b, c, d = scale_fp8x16(k8[0], k8[1], k8[2], k8[3], sf)
+            a, b, c, d = k8[0], k8[1], k8[2], k8[3]
         else:
             k4 = load_shared_words(
                 kraw.toint(Int32) + Int32(i * stride) + lane * Int32(8), 2
@@ -150,7 +136,10 @@ def convert_k_and_exchange_v(
             )
             a, b = convert_nvfp4x8(k4[0], sf)
             c, d = convert_nvfp4x8(k4[1], sf)
-        store_shared_u32x4(kdst, offset, a, b, c, d)
+        # FP8 panel TMA already populated K. Only NVFP4 needs a K write;
+        # both formats reuse these registers for local/remote V publication.
+        if cutlass.const_expr(not fp8):
+            store_shared_u32x4(kdst, offset, a, b, c, d)
         owner = (lane >> Int32(3)) & Int32(1)
         voffset = (cta * Int32(2) + (lane >> Int32(4))) * Int32(8192)
         voffset += swizzle_byte_offset(
@@ -199,7 +188,7 @@ def convert_k_and_exchange_v(
 
 @cute.jit
 def load_scaled_source_stage(
-    k, v, stage_info, v_stage, page_stage, *, mx: cutlass.Constexpr[bool]
+    k, v, stage_info, v_stage, page_stage, *, fp8_source: cutlass.Constexpr[bool]
 ):
     """Specialize the complete producer so source-format branches stay together."""
     cfg = k.cfg
@@ -224,17 +213,17 @@ def load_scaled_source_stage(
         prims.mbarrier_arrive_expect_tx(done, Int32(16384))
     base = page_stage * Int32(128) + cta * Int32(64)
     loop = Int32(stage_info.loop_offset)
-    if mx or loop == Int32(0):
+    if fp8_source or loop == Int32(0):
         if prims.elect_sync():
-            if mx:
-                arm_raw_load(raw_bar, 8 * (512 + 32), loop == Int32(0))
+            if fp8_source:
+                arm_raw_load(raw_bar, 8 * 512, loop == Int32(0))
             else:
                 arm_raw_load(raw_bar, raw_bytes, True)
             for q in cutlass.range_constexpr(2):
                 rows = load_shared_row_quad(
                     k.smem_sparse_offsets, base + warp * Int32(8) + Int32(q * 4)
                 )
-                issue_k_gathers(k, raw, kdst, raw_bar, rows, q, warp, mx)
+                issue_k_gathers(k, raw, kdst, raw_bar, rows, q, warp, fp8_source)
     has_next = loop + Int32(1) < Int32(stage_info.work_tile.k_tile_count)
     next_stage = Int32(0)
     if has_next:
@@ -245,7 +234,7 @@ def load_scaled_source_stage(
         k.page_window.pipeline.consumer_wait(upcoming)
         next_stage = upcoming.index
     wait_raw_load(raw_bar, loop & Int32(1))
-    if mx:
+    if fp8_source:
         convert_k_and_exchange_v(
             raw,
             kdst,
@@ -255,7 +244,7 @@ def load_scaled_source_stage(
             cta,
             stage_info.barrier,
             done,
-            mxfp8=True,
+            fp8=True,
             register_exchange=register_exchange,
             rope_dim=cfg.rope_dim,
         )
@@ -269,17 +258,17 @@ def load_scaled_source_stage(
             cta,
             stage_info.barrier,
             done,
-            mxfp8=False,
+            fp8=False,
             register_exchange=register_exchange,
             rope_dim=cfg.rope_dim,
         )
 
-    # Prefetch only raw NVFP4 K; MXFP8 writes the next acquired K stage directly.
+    # Prefetch only raw NVFP4 K; per-tensor FP8 writes the next acquired K stage directly.
     if has_next:
         # K publication already joined all raw readers.
         next_base = next_stage * Int32(128) + cta * Int32(64) + warp * Int32(8)
-        next_mx = tile_is_mxfp8(k, stage_info, loop + Int32(1))
-        if not next_mx and prims.elect_sync():
+        next_fp8 = tile_is_fp8(k, stage_info, loop + Int32(1))
+        if not next_fp8 and prims.elect_sync():
             arm_raw_load(raw_bar, raw_bytes)
             rows0 = load_shared_row_quad(k.smem_sparse_offsets, next_base)
             rows1 = load_shared_row_quad(k.smem_sparse_offsets, next_base + Int32(4))
@@ -312,10 +301,10 @@ def publish_scaled_v(barrier, count):
 
 
 @cute.jit
-def tile_is_mxfp8(k, stage_info, offset):
+def tile_is_fp8(k, stage_info, offset):
     cfg = k.cfg
     if cutlass.const_expr(cfg.kv_cache_format == cfg.extra_kv_cache_format):
-        return cutlass.Boolean(cfg.kv_cache_format == "mxfp8")
+        return cutlass.Boolean(cfg.kv_cache_format == "fp8")
     extra = cutlass.Boolean(False)
     if cutlass.const_expr(k.page_offsets.has_extra):
         primary_tiles = Int32(0)
@@ -326,7 +315,7 @@ def tile_is_mxfp8(k, stage_info, offset):
         else:
             primary_tiles = k.request_lengths[2]
         extra = Int32(stage_info.work_tile.k_index_base) + offset >= primary_tiles
-    if cutlass.const_expr(cfg.extra_kv_cache_format == "mxfp8"):
+    if cutlass.const_expr(cfg.extra_kv_cache_format == "fp8"):
         return extra
     return not extra
 
@@ -334,7 +323,9 @@ def tile_is_mxfp8(k, stage_info, offset):
 @cute.jit
 def load_scaled_kv_stage(k, v, stage_info, v_stage, page_stage):
     """Select the format once before the specialized gather/conversion path."""
-    if tile_is_mxfp8(k, stage_info, Int32(stage_info.loop_offset)):
-        load_scaled_source_stage(k, v, stage_info, v_stage, page_stage, mx=True)
+    if tile_is_fp8(k, stage_info, Int32(stage_info.loop_offset)):
+        load_scaled_source_stage(k, v, stage_info, v_stage, page_stage, fp8_source=True)
     else:
-        load_scaled_source_stage(k, v, stage_info, v_stage, page_stage, mx=False)
+        load_scaled_source_stage(
+            k, v, stage_info, v_stage, page_stage, fp8_source=False
+        )

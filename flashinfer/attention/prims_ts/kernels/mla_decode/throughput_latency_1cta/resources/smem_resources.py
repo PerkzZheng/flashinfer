@@ -36,11 +36,11 @@ from cutlass.experimental.task_scheduling.resources import (
 )
 
 from ...scaled_kv.memory import publish_scaled_kv
-from ...scaled_kv.mxfp8 import source_is_mxfp8
+from ...scaled_kv.fp8 import source_is_fp8
 from ...scaled_kv.tma import (
     load_scaled_panel,
     prefetch_scaled_row,
-    scale_mxfp8_record,
+    copy_fp8_record,
     load_scaled_panels,
     issue_whole_record,
     convert_nvfp4_record,
@@ -830,8 +830,8 @@ class SmemPageOffsetsResource(MlaResource):
                             target._smem_kv.data_ptr(target.kv_stage_offset(slot)),
                         )
                 record_bytes = Int32(cfg.nvfp4_row_bytes)
-                if source_is_mxfp8(cfg, raw[0] < Int32(0)):
-                    record_bytes = Int32(544)
+                if source_is_fp8(cfg, raw[0] < Int32(0)):
+                    record_bytes = Int32(512)
                 issue_whole_record(
                     destinations[0],
                     target._nv_barriers.data_ptr(stage_info.stage_idx),
@@ -1417,12 +1417,12 @@ class SmemKvResource(MlaResource):
                             raw_barrier, raw_phase
                         ):
                             pass
-                        if source_is_mxfp8(
+                        if source_is_fp8(
                             cfg,
                             cached_page_ids[page_id_slot * cfg.sparse_cache_words]
                             < Int32(0),
                         ):
-                            scale_mxfp8_record(
+                            copy_fp8_record(
                                 destinations[0],
                                 self._nv_raw.data_ptr(),
                                 cute.arch.thread_idx()[0]
@@ -1499,7 +1499,7 @@ class SmemKvResource(MlaResource):
                             rows=rows_per_warp,
                             rope_dim=cfg.rope_dim,
                             separate_rope=cfg.rope_dim > 0,
-                            mxfp8=source_is_mxfp8(
+                            fp8=source_is_fp8(
                                 cfg,
                                 cached_page_ids[page_id_slot * cfg.sparse_cache_words]
                                 < Int32(0),
@@ -1532,7 +1532,7 @@ class SmemKvResource(MlaResource):
                     rope_dim=cfg.rope_dim,
                     rope_only=not is_v and active_width == 64,
                     load_scales=True,
-                    mxfp8=source_is_mxfp8(
+                    fp8=source_is_fp8(
                         cfg,
                         cached_page_ids[page_id_slot * cfg.sparse_cache_words]
                         < Int32(0),

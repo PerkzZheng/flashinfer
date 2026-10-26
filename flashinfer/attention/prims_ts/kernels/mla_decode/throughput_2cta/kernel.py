@@ -1334,7 +1334,7 @@ class MlaDecodeTs(ScaledKVConfig):
                 (c_latent, cfg.kv_cache_format),
                 (c_rope, cfg.extra_kv_cache_format),
             ):
-                if cutlass.const_expr(fmt != "mxfp8"):
+                if cutlass.const_expr(fmt != "fp8"):
                     whole_map = make_whole_record_map(
                         pool, nvfp4_row_bytes(cfg.rope_dim)
                     )
@@ -1342,7 +1342,7 @@ class MlaDecodeTs(ScaledKVConfig):
                 else:
                     pieces = (
                         (0, 512, 128, cuda.TensorMapSwizzle.s128b),
-                        (512, 16, 32, cuda.TensorMapSwizzle.s32b),
+                        (0, 16, 32, cuda.TensorMapSwizzle.s32b),
                         (0, 512, 128, cuda.TensorMapSwizzle.s128b),
                     )
                     for offset, width, box, swizzle in pieces:
@@ -1682,7 +1682,7 @@ class MlaDecodeTs(ScaledKVConfig):
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, os, sinks = block_split_kvs
+            si, ci, sl, cl, sm, os, sinks, ks, eks = block_split_kvs
             capacity = cutlass.const_expr(
                 max(
                     256,
@@ -1710,6 +1710,12 @@ class MlaDecodeTs(ScaledKVConfig):
                 query_row=request,
                 assume_valid_prefix=self.assume_valid_prefix,
                 has_extra=self.direct_sparse_capacities[1] > 0,
+                tensor_scales=(
+                    ks if self.kv_cache_format == "fp8" else None,
+                    eks if self.extra_kv_cache_format == "fp8" else None,
+                )
+                if "fp8" in (self.kv_cache_format, self.extra_kv_cache_format)
+                else None,
             )
             if cutlass.const_expr(not self.direct_static_scales):
                 # Caller scales already include Q/K/V descales.
@@ -2204,6 +2210,9 @@ class MlaDecodeTs(ScaledKVConfig):
 
             # Set runtime params on TmemS (softmax)
             named_res["tmem_s"].softmax_scale_log2 = softmax_scale_log2
+            named_res["tmem_corr"].page_offsets = page_offsets
+            named_res["tmem_corr"].score_resource = named_res["tmem_s"]
+            named_res["gmem_o"].page_offsets = page_offsets
             named_res["tmem_s"].smem_exchange = softmax_exchange_arr
 
             named_res[
@@ -2349,7 +2358,7 @@ class MlaDecodeTs(ScaledKVConfig):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         atten_sinks = None
         if cutlass.const_expr(self.fuse_sparse_reduction):
-            atten_sinks = block_split_kvs[-1]
+            atten_sinks = block_split_kvs[6]
             block_split_kvs = None
         topology = self._reduction_topology()
         run_parallel_reduction_kernel(

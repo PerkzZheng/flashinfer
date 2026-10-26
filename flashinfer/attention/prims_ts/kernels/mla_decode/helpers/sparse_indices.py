@@ -42,6 +42,7 @@ class SparseKVIndices:
             self.query_row,
             self.primary_length,
             self.extra_length,
+            self.tensor_scales,
         ) = values
         self.capacity = capacity
         self.assume_valid_prefix = assume_valid_prefix
@@ -86,11 +87,48 @@ class SparseKVIndices:
                 )
                 if cutlass.const_expr(self.has_extra)
                 else Int32(0),
+                self.tensor_scales,
             ),
             self.capacity,
             self.assume_valid_prefix,
             self.has_extra,
         )
+
+    @cute.jit
+    def tensor_scale_is_extra(self, tile_start, query_row=None):
+        if cutlass.const_expr(not self.has_extra):
+            return cutlass.Boolean(False)
+        length = (
+            self.primary_length
+            if cutlass.const_expr(self.is_bound)
+            else Int32(self.primary_lengths[Int64(query_row)])
+        )
+        return tile_start >= (length + Int32(127)) // Int32(128) * Int32(128)
+
+    @cute.jit
+    def tensor_scale(self, tile_start, query_row=None):
+        """Load only the selected source's scalar; NVFP4 needs no tensor scale."""
+        scale = cutlass.Float32(1)
+        if self.tensor_scale_is_extra(tile_start, query_row):
+            if cutlass.const_expr(self.tensor_scales[1] is not None):
+                scale = cutlass.Float32(self.tensor_scales[1][0])
+        else:
+            if cutlass.const_expr(self.tensor_scales[0] is not None):
+                scale = cutlass.Float32(self.tensor_scales[0][0])
+        return scale
+
+    @cute.jit
+    def tensor_scale_ratio(self, current, previous, query_row=None):
+        """Change O's units at a source boundary; preserve exact identity elsewhere."""
+        ratio = cutlass.Float32(1)
+        if cutlass.const_expr(self.has_extra):
+            if self.tensor_scale_is_extra(
+                current, query_row
+            ) != self.tensor_scale_is_extra(previous, query_row):
+                ratio = self.tensor_scale(previous, query_row) / self.tensor_scale(
+                    current, query_row
+                )
+        return ratio
 
     @cute.jit
     def select_source_tile(
@@ -279,6 +317,7 @@ def bind_sparse_kv_indices(
     query_row=None,
     assume_valid_prefix: cutlass.Constexpr[bool] = False,
     has_extra: cutlass.Constexpr[bool] = True,
+    tensor_scales=None,
 ):
     """Bind index readers and scheduler lengths without copying metadata."""
     indices = SparseKVIndices(
@@ -290,6 +329,7 @@ def bind_sparse_kv_indices(
             None,
             None,
             None,
+            tensor_scales,
         ),
         capacity,
         assume_valid_prefix,

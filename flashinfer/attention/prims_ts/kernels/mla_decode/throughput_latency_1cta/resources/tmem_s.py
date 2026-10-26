@@ -593,6 +593,12 @@ class TmemSResource(MlaResource):
                 s_vals[q_repeats * 4 + ld_base + 2] = loaded1[ld_base + 2]
                 s_vals[q_repeats * 4 + ld_base + 3] = loaded1[ld_base + 3]
 
+        if cutlass.const_expr(cfg.has_tensor_fp8):
+            scale = self.page_offsets.tensor_scale(tile_offset_k, batch_idx)
+            if scale != cutlass.Float32(1):
+                for i in cutlass.range_constexpr(num_s_regs_per_thread(cfg)):
+                    s_vals[i] *= scale
+
         should_apply_dense_mask = (
             (seq_len_kv % Int32(cfg.tile_size_kv)) != Int32(0)
         ) or (next_tile_offset_k > seq_len_kv)

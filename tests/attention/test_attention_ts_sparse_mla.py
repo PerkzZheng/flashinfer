@@ -1243,26 +1243,15 @@ def make_nvfp4_cache(pages, page_size, rope_dim=0):
     return cache, values
 
 
-def make_mxfp8_cache(pages, page_size):
-    """Token-interleaved E4M3 bytes with independent linear UE8M0 group32 scales."""
-    cache = torch.empty(pages, page_size + 1, 528, device="cuda", dtype=torch.uint8)[
-        :, :page_size
-    ]
-    values = (torch.randn(pages, page_size, 512, device="cuda") * 8).to(
-        torch.float8_e4m3fn
+def make_tensor_fp8_cache(pages, page_size):
+    """Per-tensor FP8 payload with padded physical pages and no scale trailer."""
+    cache = torch.empty(
+        pages, page_size + 1, 512, device="cuda", dtype=torch.float8_e4m3fn
+    )[:, :page_size]
+    cache.copy_(
+        (torch.randn(pages, page_size, 512, device="cuda") * 0.2).to(cache.dtype)
     )
-    scales = torch.randint(
-        117, 123, (pages, page_size, 16), device="cuda", dtype=torch.uint8
-    )
-    cache[..., :512] = values.view(torch.uint8)
-    cache[..., 512:] = scales
-    decoded = (
-        values.float().unflatten(-1, (16, 32))
-        * torch.exp2(scales.float() - 127)[..., None]
-    ).flatten(-2)
-    return cache.view(torch.float8_e4m3fn), decoded.clamp(-448, 448).to(
-        torch.float8_e4m3fn
-    )
+    return cache, cache.float()
 
 
 @pytest.mark.parametrize(
@@ -1286,13 +1275,13 @@ def test_d512_nvfp4_sources_graph(
         torch.float8_e4m3fn
     )
     primary, primary_ref = (
-        make_mxfp8_cache(16, 64)
-        if primary_format == "mxfp8"
+        make_tensor_fp8_cache(16, 64)
+        if primary_format == "fp8"
         else make_nvfp4_cache(16, 64, rope_dim)
     )
     secondary, secondary_ref = (
-        make_mxfp8_cache(32, 32)
-        if extra_format == "mxfp8"
+        make_tensor_fp8_cache(32, 32)
+        if extra_format == "fp8"
         else make_nvfp4_cache(32, 32, rope_dim)
     )
     indices = torch.randint(1024, (rows, topk), device="cuda", dtype=torch.int32)
@@ -1329,6 +1318,16 @@ def test_d512_nvfp4_sources_graph(
         return_lse=True,
         assume_valid_prefix=prefix,
     )
+    primary_scale = (
+        torch.tensor([0.3], device="cuda", dtype=torch.float32)
+        if primary_format == "fp8"
+        else 1.0
+    )
+    secondary_scale = (
+        torch.tensor([1.7], device="cuda", dtype=torch.float32)
+        if extra_format == "fp8"
+        else 1.0
+    )
     out = torch.empty(rows, 1, heads, 512, device="cuda", dtype=torch.bfloat16)
     lse = torch.empty(rows, 1, heads, device="cuda", dtype=torch.float32)
 
@@ -1341,6 +1340,8 @@ def test_d512_nvfp4_sources_graph(
             extra_kv_cache=secondary if extra else None,
             extra_indices=extra_indices if extra else None,
             extra_lengths=extra_lengths if extra else None,
+            kv_cache_scale=primary_scale,
+            extra_kv_cache_scale=secondary_scale,
             out=out,
             lse=lse,
             validate=False,
@@ -1352,6 +1353,10 @@ def test_d512_nvfp4_sources_graph(
         run()
     for changed in (False, True):
         if changed:
+            if isinstance(primary_scale, torch.Tensor):
+                primary_scale.fill_(1.7)
+            if isinstance(secondary_scale, torch.Tensor):
+                secondary_scale.fill_(0.3)
             q.copy_((q.float() * -0.5).to(q.dtype))
             lengths.copy_(lengths.roll(1))
             extra_lengths.copy_(extra_lengths.roll(-1))
@@ -1368,8 +1373,8 @@ def test_d512_nvfp4_sources_graph(
         )
         ref, ref_lse, bound = _reference(
             q,
-            primary_ref,
-            secondary_ref,
+            primary_ref.float() * primary_scale,
+            secondary_ref.float() * secondary_scale,
             logical_primary,
             logical_extra,
             lengths=lengths,
@@ -1408,11 +1413,9 @@ def test_nvfp4_format_contract():
     [(h, 160, 129, 513) for h in (8, 16, 32, 64, 128)]
     + [(8, 2, 33, 17), (128, 32, 129, 2049)],
 )
-def test_mxfp8_nvfp4_sources_graph(heads, rows, topk, extra):
-    test_d512_nvfp4_sources_graph(heads, rows, topk, extra, primary_format="mxfp8")
+def test_tensor_fp8_nvfp4_sources_graph(heads, rows, topk, extra):
+    test_d512_nvfp4_sources_graph(heads, rows, topk, extra, primary_format="fp8")
 
 
-def test_mxfp8_prefix_sources_graph():
-    test_d512_nvfp4_sources_graph(
-        128, 160, 129, 513, primary_format="mxfp8", prefix=True
-    )
+def test_tensor_fp8_prefix_sources_graph():
+    test_d512_nvfp4_sources_graph(128, 160, 129, 513, primary_format="fp8", prefix=True)

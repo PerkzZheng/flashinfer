@@ -92,6 +92,8 @@ from ...helpers.tile import (
     cta_idx_kv_for_stage,
     cta_idx_q_for_stage,
     head_idx_for_stage,
+    global_kv_tile_idx,
+    runtime_seq_len_kv_from_task_cache,
 )
 
 from .common import (
@@ -124,6 +126,7 @@ class TmemCorrResource(MlaResource):
     acc_o_tensor: object = None
     acc_lse_tensor: object = None
     cache_seqs: object = None
+    page_offsets: object = None
     head_idx: object = None
     batch_idx: object = None
     cta_idx_q: object = None
@@ -1268,6 +1271,22 @@ class TmemCorrResource(MlaResource):
         return
 
     @cute.jit
+    def tensor_scale_tile(self, stage_info, local_tile):
+        cfg = self.cfg
+        batch = batch_idx_for_stage_cfg(self.batch_idx, cfg, stage_info)
+        length = runtime_seq_len_kv_from_task_cache(
+            cfg,
+            decode_gen_task_cache(stage_info),
+            cta_idx_q_for_stage(self.cta_idx_q, stage_info),
+            self.cu_seqlens_q,
+            batch,
+        )
+        tile = global_kv_tile_idx(
+            cfg, local_tile, length, cta_idx_kv_for_stage(self.cta_idx_kv, stage_info)
+        )
+        return tile * Int32(cfg.tile_size_kv), batch
+
+    @cute.jit
     def _rescale_loop_o(
         self,
         stage_info: StageInfo,
@@ -1327,6 +1346,18 @@ class TmemCorrResource(MlaResource):
                 lane_scales_are_identity = (
                     lane_scales_are_identity & scale_0_is_identity & scale_1_is_identity
                 )
+
+        if cutlass.const_expr(cfg.has_tensor_fp8):
+            local = (stage_info.loop_offset + Int32(1)) * Int32(
+                cfg.num_insts_kv
+            ) + Int32(self.inst_id % cfg.num_insts_kv)
+            current, batch = self.tensor_scale_tile(stage_info, local)
+            ratio = self.page_offsets.tensor_scale_ratio(
+                current, current - Int32(cfg.num_insts_kv * cfg.tile_size_kv), batch
+            )
+            for i in cutlass.range_constexpr(num_scale_groups):
+                scale_vals[i] *= ratio
+            lane_scales_are_identity = lane_scales_are_identity and ratio == Float32(1)
 
         if cutlass.const_expr(cfg.ws_pv and not cfg.ws_native_e):
             scale_vals[0] = self.ws_row_scale(stage_info, scale_vals[0])
@@ -1580,6 +1611,17 @@ class TmemCorrResource(MlaResource):
                 )
             final_scale0[scale_idx] = norm_scale * exp_scale0[scale_idx]
             final_scale1[scale_idx] = norm_scale * exp_scale1[scale_idx]
+        if cutlass.const_expr(cfg.has_tensor_fp8):
+            last0, batch = self.tensor_scale_tile(
+                stage_info, stage_info.loop_end * Int32(cfg.num_insts_kv)
+            )
+            scale0 = self.page_offsets.tensor_scale(last0, batch)
+            scale1 = self.page_offsets.tensor_scale(
+                last0 + Int32(cfg.tile_size_kv), batch
+            )
+            for i in cutlass.range_constexpr(num_scale_groups):
+                final_scale0[i] *= scale0
+                final_scale1[i] *= scale1
         return final_max, reduced_sum, final_scale0, final_scale1
 
     @cute.jit

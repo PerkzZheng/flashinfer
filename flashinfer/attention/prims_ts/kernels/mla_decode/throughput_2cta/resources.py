@@ -2724,6 +2724,15 @@ class TmemSResource(HighThroughputMlaResource):
             )
         else:
             mask_page_offsets = self.page_offsets
+        if cutlass.const_expr(cfg.has_tensor_fp8):
+            scale = mask_page_offsets.tensor_scale(tile_offset_k)
+            if scale != cutlass.Float32(1):
+                for i in cutlass.range_constexpr(0, 64, 2):
+                    pair = mul_packed_f32x2(
+                        (qk_acc_regs[i], qk_acc_regs[i + 1]), (scale, scale)
+                    )
+                    qk_acc_regs[i], qk_acc_regs[i + 1] = pair[0], pair[1]
+
         if cutlass.const_expr(cached_mask_low is not None):
             mask_routes = CachedSparseMask((cached_mask_low, cached_mask_high), False)
             # The cached invalid bits already include the live K boundary.
@@ -3324,6 +3333,8 @@ class TmemCorrResource(HighThroughputMlaResource):
     cfg: cutlass.Constexpr = field(default_factory=MlaDecodeConfig)
     cta_rank: Any = field(init=False, default=None)
     final_row_stats: Any = field(init=False, default=None)
+    score_resource: Any = None
+    page_offsets: Any = None
     row_sum: cutlass.Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     row_max: cutlass.Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     epilogue_row_sum: cutlass.Constexpr[TaskLocalVariable] = (
@@ -3399,6 +3410,27 @@ class TmemCorrResource(HighThroughputMlaResource):
         correction_regs = cutlass.Array(Float32, 4, space=cutlass.AddressSpace.rmem)
         correction_regs[0] = row_sum_out
         correction_regs[1] = row_max_new
+        if cutlass.const_expr(cfg.has_tensor_fp8):
+            work = stage_info.work_tile
+            current = (work.k_index_base + Int32(stage_info.loop_offset)) * Int32(
+                cfg.mma_qk_tiler[1]
+            )
+            if cutlass.const_expr(self.page_offsets.is_bound):
+                routes = self.page_offsets
+            else:
+                routes = self.page_offsets.bind_query_row(
+                    work.tile_idx[2],
+                    self.score_resource.request_lengths[0],
+                    self.score_resource.request_lengths[1],
+                )
+            ratio = routes.tensor_scale_ratio(
+                current, current - Int32(cfg.mma_qk_tiler[1])
+            )
+            if stage_info.loop_offset != Int32(0):
+                correction_factor_out *= ratio
+                no_correction_out = Int32(
+                    no_correction_out != 0 and ratio == cutlass.Float32(1)
+                )
         correction_regs[2] = correction_factor_out
         correction_regs[3] = prims.mov_b32(no_correction_out, target_type=Float32)
 
@@ -3816,6 +3848,7 @@ class GmemOResource(HighThroughputMlaResource):
     tmem_o_ref: Any = None  # Reference to TmemOResource for tmem_base_addr
     tmem_corr_ref: Any = None  # Reference to TmemCorrResource for correction data
     output_scale: Any = None
+    page_offsets: Any = None
     atten_sinks: Any = None
     output_quant: cutlass.Constexpr = None
     output_quant_args: Any = None
@@ -3847,7 +3880,7 @@ class GmemOResource(HighThroughputMlaResource):
             prims.prefetch_l1(cache_row + 32)
 
     @cute.jit
-    def _normalization_scale(self, row_sum, row_max, local_tidx, blk_coord):
+    def _normalization_scale(self, row_sum, row_max, local_tidx, blk_coord, stage_info):
         safe_sum = row_sum if row_sum > Float32(0) else Float32(1)
         scale = self.output_scale * cute.math.rcp(safe_sum, approx=True)
         if cutlass.const_expr(self.atten_sinks is not None):
@@ -3886,6 +3919,12 @@ class GmemOResource(HighThroughputMlaResource):
                     * rescale
                     * cute.math.rcp(denominator, approx=True)
                 )
+        if cutlass.const_expr(self.cfg.has_tensor_fp8):
+            work = stage_info.work_tile
+            last = (work.k_index_base + work.k_tile_count - Int32(1)) * Int32(
+                self.cfg.mma_qk_tiler[1]
+            )
+            scale *= self.page_offsets.tensor_scale(last, work.tile_idx[2])
         return scale
 
     @cute.jit
@@ -4086,7 +4125,9 @@ class GmemOResource(HighThroughputMlaResource):
         # causal query rows have no visible K values in this split. Store zero
         # O and -inf LSE so split-KV reduction gives those rows zero weight.
         row_has_values = row_sum > Float32(0)
-        norm_scale = self._normalization_scale(row_sum, row_max, local_tidx, blk_coord)
+        norm_scale = self._normalization_scale(
+            row_sum, row_max, local_tidx, blk_coord, stage_info
+        )
 
         for iter_n in cutlass.range_constexpr(cfg.iterations_pv_n):
             # Load O from TMEM
@@ -4345,7 +4386,9 @@ class GmemOResource(HighThroughputMlaResource):
         num_tmem_loads = 4
         qk_acc_regs = cutlass.Array(Float32, 128, space=cutlass.AddressSpace.rmem)
         row_has_values = row_sum > Float32(0)
-        norm_scale = self._normalization_scale(row_sum, row_max, local_tidx, blk_coord)
+        norm_scale = self._normalization_scale(
+            row_sum, row_max, local_tidx, blk_coord, stage_info
+        )
 
         tile_h = cfg.mma_pv_tiler[0] // cfg.num_mma_ctas
         tile_d = cfg.mma_pv_tiler[1]

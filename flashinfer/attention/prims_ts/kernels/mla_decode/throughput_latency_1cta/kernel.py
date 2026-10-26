@@ -839,6 +839,7 @@ def build_throughput_latency_mla_task_manager(
     global1 = TmemSoftmaxGlobalResource(cfg=cfg, inst_id=1, name="ll_mla_global1")
     corr0 = TmemCorrResource(
         cfg=cfg,
+        page_offsets=page_offsets,
         inst_id=0,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
@@ -860,6 +861,7 @@ def build_throughput_latency_mla_task_manager(
     )
     corr1 = TmemCorrResource(
         cfg=cfg,
+        page_offsets=page_offsets,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
@@ -1461,6 +1463,7 @@ def _make_single_kv_pipe_task_graph(
     )
     corr = TmemCorrResource(
         cfg=cfg,
+        page_offsets=page_offsets,
         inst_id=1,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
@@ -2360,7 +2363,7 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
                 reducer_cfg, topology, elements = self._parallel_reduction_setup(cfg)
                 atten_sinks = None
                 if cutlass.const_expr(cfg.fuse_sparse_reduction):
-                    atten_sinks = block_split_kvs[-1]
+                    atten_sinks = block_split_kvs[6]
                 reduction_grid, reduction_cluster = (
                     parallel_gmem_reduction_launch_shape(
                         reducer_cfg,
@@ -2476,7 +2479,7 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
         if cutlass.const_expr(cfg.sparse_direct):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
-            si, ci, sl, cl, sm, os, sinks = sparse_inputs
+            si, ci, sl, cl, sm, os, sinks, ks, eks = sparse_inputs
             request = None
             if cutlass.const_expr(cfg.use_persistent_scheduler != 1):
                 request = cutlass.Int64(cute.arch.block_idx()[2])
@@ -2489,6 +2492,12 @@ class ThroughputLatencyMlaDecodeTs(ScaledKVConfig):
                 query_row=request,
                 assume_valid_prefix=cfg.sparse_valid_prefix,
                 has_extra=cfg.sparse_direct_capacities[1] > 0,
+                tensor_scales=(
+                    ks if cfg.kv_cache_format == "fp8" else None,
+                    eks if cfg.extra_kv_cache_format == "fp8" else None,
+                )
+                if "fp8" in (cfg.kv_cache_format, cfg.extra_kv_cache_format)
+                else None,
             )
             if cutlass.const_expr(not cfg.sparse_static_scales):
                 # Caller scales already include Q/K/V descales.

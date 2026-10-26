@@ -461,7 +461,7 @@ def select_sparse_mla_profile(
 ):
     """Resolve one complete schedule from the validated public plan bounds."""
     if (
-        kv_cache_format in ("nvfp4", "nvfp4.fp8rope", "mxfp8")
+        kv_cache_format in ("nvfp4", "nvfp4.fp8rope", "fp8")
         and dtype == "fp8"
         and rope_dim in (0, 64)
         and heads <= 32
@@ -495,11 +495,11 @@ def select_sparse_mla_profile(
         and rows * 2 < sm_count
     ):
         if heads == 64 or (
-            heads == 128 and kv_cache_format == "mxfp8" and rows * 4 < sm_count
+            heads == 128 and kv_cache_format == "fp8" and rows * 4 < sm_count
         ):
             # Small packed grids still benefit from whole-record gathers and
             # retained WS tiles. At low row counts, two M64 head tiles also
-            # beat group-2 MX-primary startup despite repeating KV conversion.
+            # beat group-2 mixed-pool startup despite repeating KV conversion.
             # Power-of-two splits fill most of a resident wave without adding
             # a short split for a source-boundary tile.
             work = rows * ceil(heads / 64)
