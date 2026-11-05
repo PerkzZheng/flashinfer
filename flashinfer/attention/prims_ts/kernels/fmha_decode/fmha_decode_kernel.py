@@ -729,6 +729,8 @@ def _build_decode_gen_schedule(
         # The loader fills a raw interleaved-NVFP4 ring for TransformKvTask,
         # which in turn produces the FP8 K and V rings MMA consumes.
         assert use_one_inst_qkv and cfg.transformed_kv_stages > 0
+        # The raw-ring TMA descriptor exists only for gather4 fragment rows.
+        assert cfg.nvfp4_raw_cfg.uses_nvfp4_gather4_kv
         raw_tile_bytes = cfg.nvfp4_raw_cfg.smem_kv_tile_bytes
         smem_kv_raw_cfg = PipelineConfig(
             num_stages=cfg.kv_stages,

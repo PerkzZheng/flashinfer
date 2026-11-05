@@ -3787,19 +3787,32 @@ def _prepare_prims_ts_batch_decode_plan(
         split_kv,
         share_pattern_across_kv_heads,
     )
+    # Flat compact-HND locators view each cache as one 2-D map of page-fragment
+    # rows: they need semantic subpages, contiguous K/V, an Int32 row index and
+    # head-aware locators when there are several KV heads.
+    flat_native_kv_cache = (
+        use_q_token_kv_block_sparse_route
+        and storage_page_size != page_size
+        and (num_kv_heads == 1 or (allow_head_aware_locators and not direct_q1_inputs))
+        and k_cache.is_contiguous()
+        and v_cache.is_contiguous()
+        and int(k_cache.shape[0]) * storage_page_size * num_kv_heads < (1 << 31)
+    )
     # FP8-MMA NVFP4 with five or more grouped Q tokens runs the FP8 Keeps
     # recipe (softmax per Q row instead of per K row); TransformKvTask feeds
     # its K/V rings from the interleaved NVFP4 cache. Fewer tokens keep the
     # TMEM-transformed Swaps recipe, whose per-K-row softmax is cheaper there.
     # Keeps also needs at least one wave of (batch, KV head) work tiles: its
     # M=64 MMAs and transform keep each tile longer, so with idle SMs the
-    # Swaps recipe finishes first.
+    # Swaps recipe finishes first. Its raw NVFP4 ring is filled only by flat
+    # TMA gather4 copies (see FmhaDecodeConfig.uses_nvfp4_gather4_kv).
     nvfp4_keeps_source = False
     if (
         nvfp4_interleaved_kv
         and use_q_token_kv_block_sparse_route
         and query.dtype == torch.float8_e4m3fn
         and seq_len_q >= 5
+        and flat_native_kv_cache
     ):
         from .kernels.fmha_decode.fmha_decode_config import (
             get_max_active_clusters_for_cluster_size,
@@ -3820,12 +3833,14 @@ def _prepare_prims_ts_batch_decode_plan(
         keeps_cfg = keeps_spec.config
         # The transform writes D256 SW128 FP8 slabs for KV128 tiles of the
         # one-instance recipe and runs only in persistent whole-sequence work
-        # tiles; any other FP8 recipe keeps the Swaps NVFP4 path.
+        # tiles, loaded four page fragments per gather4 copy; any other FP8
+        # recipe or fragment count keeps the Swaps NVFP4 path.
         if (
             keeps_cfg.use_keeps_mma_ab
             and keeps_cfg.num_insts_kv == 1
             and keeps_cfg.head_dim_kv_stage == 256
             and keeps_cfg.tile_size_kv == 128
+            and (keeps_cfg.tile_size_kv // page_size) % 4 == 0
             and not keeps_cfg.use_split_kv
             and not keeps_cfg.runtime_split_kv
         ):
@@ -3948,22 +3963,17 @@ def _prepare_prims_ts_batch_decode_plan(
             page_capacity=max_num_pages,
             fixed_query_len=direct_q1_fixed_query_len,
         )
-    flat_native_kv_tma = (
-        use_q_token_kv_block_sparse_route
-        and (
-            (
-                spec.config.uses_staged_one_inst_tmem_p
-                and (spec.config.use_bf16_qkv or spec.config.use_fp8_qkv)
-            )
-            # Interleaved NVFP4 gathers four flat fragment rows per copy.
-            or spec.config.nvfp4_interleaved_kv
-            or spec.config.nvfp4_kv_source
+    flat_native_kv_tma = flat_native_kv_cache and (
+        (
+            spec.config.uses_staged_one_inst_tmem_p
+            and (spec.config.use_bf16_qkv or spec.config.use_fp8_qkv)
         )
-        and spec.config.has_storage_subpages
-        and (num_kv_heads == 1 or (allow_head_aware_locators and not direct_q1_inputs))
-        and k_cache.is_contiguous()
-        and normalized_cache.v_cache.is_contiguous()
-        and int(k_cache.shape[0]) * storage_page_size * num_kv_heads < (1 << 31)
+        # Interleaved NVFP4 gathers four flat fragment rows per copy. Tiles
+        # of fewer fragments keep the head-aware 4-D paged copies.
+        or (
+            (spec.config.nvfp4_interleaved_kv or spec.config.nvfp4_kv_source)
+            and (spec.config.tile_size_kv // page_size) % 4 == 0
+        )
     )
     compile_spec = _make_decode_compile_spec(
         spec,

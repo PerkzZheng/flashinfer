@@ -1281,6 +1281,15 @@ class FmhaDecodeConfig:
 
         Needs flat compact-HND locators: each fragment is then one contiguous
         row of a 2-D map, and gather4 takes four arbitrary row coordinates.
+
+        Only NVFP4 gains from this. Its fragments land in an unswizzled raw
+        ring that the K/V transform re-lays out for the MMA, so a TMA row can
+        span a whole fragment (all of its tokens), and one gather4 fetches
+        four selected fragments where tiled copies need four instructions.
+        FP8/BF16 K/V tiles are loaded directly in the SW128 MMA operand
+        layout, one token per 128-byte TMA row, so gather4 there would still
+        fetch four token rows per instruction, the same as a tiled copy of
+        one 4-token fragment.
         """
         return (
             self.nvfp4_interleaved_kv
