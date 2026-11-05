@@ -386,6 +386,7 @@ def test_q_token_kv_block_sparse_wrapper_matches_plan_run_grammar() -> None:
         "sm_scale",
         "v_scale",
         "out",
+        "kv_scale_factors",
     )
     assert run_parameters["token_to_request"].default is None
     assert run_parameters["query_positions"].default is None
@@ -4042,6 +4043,167 @@ def test_grouped_q_token_kv_block_sparse_physical_sparse_pages_match_torch_refer
     torch.testing.assert_close(
         output.float(), reference, rtol=tolerance, atol=tolerance
     )
+
+
+def _dequantize_nvfp4(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Decode E2M1 bytes (even element in the low nibble) with per-16 E4M3 scales."""
+
+    lut = torch.tensor(
+        (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+        + (-0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0),
+        device=payload.device,
+    )
+    nibbles = torch.stack((payload & 0x0F, payload >> 4), dim=-1).flatten(-2)
+    return lut[nibbles.long()] * scales.float().repeat_interleave(16, dim=-1)
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize(
+    ("query_dtype", "interleaved_scales", "full_wave"),
+    (
+        (torch.bfloat16, True, False),
+        (torch.float8_e4m3fn, True, False),
+        (torch.float8_e4m3fn, False, False),
+        (torch.float8_e4m3fn, True, True),
+    ),
+    ids=("bf16-rows", "fp8-rows", "fp8-scale-tensors", "fp8-rows-full-wave"),
+)
+def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
+    query_dtype: torch.dtype, interleaved_scales: bool, full_wave: bool
+) -> None:
+    """Attend packed NVFP4 K/V and compare with the dequantized cache.
+
+    BF16 Q runs the exact BF16 transform; FP8 Q rounds the transformed
+    operands to E4M3. Rows either interleave each token's scales after its
+    payload or pass separate scale tensors. G5 with at least one wave of
+    (request, KV head) work tiles runs the FP8 Keeps recipe fed by the NVFP4
+    transform task; the smaller launches run the TMEM-transformed recipe.
+    """
+
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        get_max_active_clusters_for_cluster_size,
+    )
+
+    head_dim, num_qo_heads, block_topk, page_size, num_pages = 256, 4, 64, 16, 96
+    group_size = 5
+    num_requests = get_max_active_clusters_for_cluster_size(1) if full_wave else 2
+    generator = torch.Generator(device="cuda").manual_seed(2027)
+    positions = torch.arange(
+        1023, 1023 + group_size, dtype=torch.int64, device="cuda"
+    ).repeat(num_requests)
+    requests = torch.arange(
+        num_requests, dtype=torch.int32, device="cuda"
+    ).repeat_interleave(group_size)
+    # Each query token owns a distinct final block, as in the reference test.
+    blocks = torch.arange(block_topk, dtype=torch.int32, device="cuda").repeat(
+        num_requests * group_size, 1
+    )
+    blocks[:, -1] = (
+        torch.arange(64, 64 + group_size, dtype=torch.int32, device="cuda")
+    ).repeat(num_requests)
+    # Requests share one shuffled page order and therefore one cache.
+    table = (
+        torch.randperm(num_pages, generator=generator, device="cuda")
+        .to(torch.int32)
+        .repeat(num_requests, 1)
+    )
+    shape = (num_pages, 1, page_size)
+    payload = [
+        torch.randint(
+            0, 256, (*shape, head_dim // 2), generator=generator, device="cuda"
+        ).to(torch.uint8)
+        for _ in range(2)
+    ]
+    scales = [
+        (torch.rand((*shape, head_dim // 16), generator=generator, device="cuda") / 2)
+        .add(0.05)
+        .to(torch.float8_e4m3fn)
+        for _ in range(2)
+    ]
+    if interleaved_scales:
+        caches = tuple(
+            torch.cat((data, scale.view(torch.uint8)), dim=-1).contiguous()
+            for data, scale in zip(payload, scales, strict=True)
+        )
+        kv_scale_factors = None
+    else:
+        caches = tuple(payload)
+        # V scales use TRT-LLM's four-token interleaved order.
+        v_scale = (
+            scales[1]
+            .reshape(num_pages, 1, page_size // 4, 4, 4, head_dim // 64)
+            .permute(0, 1, 2, 4, 5, 3)
+            .reshape(scales[1].shape)
+            .contiguous()
+        )
+        kv_scale_factors = (scales[0], v_scale)
+    query = torch.randn(
+        (num_requests, 1, group_size, num_qo_heads, head_dim),
+        generator=generator,
+        device="cuda",
+    ).to(torch.bfloat16)
+    query = query.to(query_dtype)
+    output = torch.empty(query.shape, dtype=torch.bfloat16, device="cuda")
+    max_seq_len_kv = num_pages * page_size
+    workspace = torch.zeros(
+        get_q_token_kv_block_sparse_workspace_size(
+            query,
+            caches[0],
+            table,
+            block_topk=block_topk,
+            max_seq_len_kv=max_seq_len_kv,
+            out_dtype=output.dtype,
+            group_size=group_size,
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    q_token_kv_block_sparse_attention_with_paged_kv_cache(
+        query,
+        caches,
+        table,
+        blocks,
+        requests,
+        positions,
+        workspace,
+        max_seq_len_kv=max_seq_len_kv,
+        group_size=group_size,
+        out=output,
+        kv_scale_factors=kv_scale_factors,
+    )
+
+    keys, values = (
+        _dequantize_nvfp4(data, scale)
+        for data, scale in zip(payload, scales, strict=True)
+    )
+    tolerance = 5e-2 if query_dtype == torch.float8_e4m3fn else 2e-2
+    for request in (0, num_requests - 1):
+        for group_idx in range(group_size):
+            token = request * group_size + group_idx
+            visible = int(positions[token]) + 1
+            selected = blocks[token, : min(visible // 4, block_topk)].long()
+            token_ids = (
+                selected[:, None] * 4 + torch.arange(4, device="cuda")
+            ).flatten()
+            if visible % 4:
+                token_ids = torch.cat(
+                    (
+                        token_ids,
+                        torch.arange(visible - visible % 4, visible, device="cuda"),
+                    )
+                )
+            pages = table[request, token_ids // page_size].long()
+            slots = token_ids % page_size
+            scores = (
+                query[request, 0, group_idx].float() @ keys[pages, 0, slots].T
+            ) / head_dim**0.5
+            reference = torch.softmax(scores, dim=-1) @ values[pages, 0, slots]
+            torch.testing.assert_close(
+                output[request, 0, group_idx].float(),
+                reference,
+                rtol=tolerance,
+                atol=tolerance,
+            )
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
