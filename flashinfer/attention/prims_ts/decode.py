@@ -3802,25 +3802,15 @@ def _prepare_prims_ts_batch_decode_plan(
     # recipe (softmax per Q row instead of per K row); TransformKvTask feeds
     # its K/V rings from the interleaved NVFP4 cache. Fewer tokens keep the
     # TMEM-transformed Swaps recipe, whose per-K-row softmax is cheaper there.
-    # Keeps also needs at least one wave of (batch, KV head) work tiles: its
-    # M=64 MMAs and transform keep each tile longer, so with idle SMs the
-    # Swaps recipe finishes first. Its raw NVFP4 ring is filled only by flat
-    # TMA gather4 copies (see FmhaDecodeConfig.uses_nvfp4_gather4_kv).
-    nvfp4_keeps_source = False
-    if (
+    # Its raw NVFP4 ring is filled only by flat TMA gather4 copies (see
+    # FmhaDecodeConfig.uses_nvfp4_gather4_kv).
+    nvfp4_keeps_source = (
         nvfp4_interleaved_kv
         and use_q_token_kv_block_sparse_route
         and query.dtype == torch.float8_e4m3fn
         and seq_len_q >= 5
         and flat_native_kv_cache
-    ):
-        from .kernels.fmha_decode.fmha_decode_config import (
-            get_max_active_clusters_for_cluster_size,
-        )
-
-        nvfp4_keeps_source = (
-            batch_size * num_kv_heads >= get_max_active_clusters_for_cluster_size(1)
-        )
+    )
     spec = None
     if nvfp4_keeps_source:
         keeps_spec = _resolve_decode_launch_spec(
@@ -3832,9 +3822,11 @@ def _prepare_prims_ts_batch_decode_plan(
         )
         keeps_cfg = keeps_spec.config
         # The transform writes D256 SW128 FP8 slabs for KV128 tiles of the
-        # one-instance recipe and runs only in persistent whole-sequence work
-        # tiles, loaded four page fragments per gather4 copy; any other FP8
-        # recipe or fragment count keeps the Swaps NVFP4 path.
+        # one-instance recipe and runs only in whole-sequence work tiles,
+        # loaded four page fragments per gather4 copy; any other FP8 recipe,
+        # split-KV launch or fragment count keeps the Swaps NVFP4 path.
+        # Below one wave of work tiles Keeps still wins when its FP8 recipe
+        # does not split: on GB300, 128 tiles at G5/G8 run 9-15% faster.
         if (
             keeps_cfg.use_keeps_mma_ab
             and keeps_cfg.num_insts_kv == 1

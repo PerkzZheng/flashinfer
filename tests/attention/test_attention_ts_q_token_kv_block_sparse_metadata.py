@@ -4059,20 +4059,22 @@ def _dequantize_nvfp4(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tens
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize(
-    ("query_dtype", "interleaved_scales", "full_wave", "cache_layout"),
+    ("query_dtype", "interleaved_scales", "launch", "cache_layout"),
     (
-        (torch.bfloat16, True, False, "flat"),
-        (torch.float8_e4m3fn, True, False, "flat"),
-        (torch.float8_e4m3fn, False, False, "flat"),
-        (torch.float8_e4m3fn, True, True, "flat"),
-        (torch.float8_e4m3fn, True, True, "page4"),
-        (torch.float8_e4m3fn, True, True, "block64"),
-        (torch.float8_e4m3fn, True, True, "kv-pair"),
+        (torch.bfloat16, True, "split", "flat"),
+        (torch.float8_e4m3fn, True, "split", "flat"),
+        (torch.float8_e4m3fn, False, "split", "flat"),
+        (torch.float8_e4m3fn, True, "partial-wave", "flat"),
+        (torch.float8_e4m3fn, True, "full-wave", "flat"),
+        (torch.float8_e4m3fn, True, "full-wave", "page4"),
+        (torch.float8_e4m3fn, True, "full-wave", "block64"),
+        (torch.float8_e4m3fn, True, "full-wave", "kv-pair"),
     ),
     ids=(
         "bf16-rows",
         "fp8-rows",
         "fp8-scale-tensors",
+        "fp8-rows-partial-wave",
         "fp8-rows-full-wave",
         "fp8-rows-full-wave-page4",
         "fp8-rows-full-wave-block64",
@@ -4082,16 +4084,18 @@ def _dequantize_nvfp4(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tens
 def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
     query_dtype: torch.dtype,
     interleaved_scales: bool,
-    full_wave: bool,
+    launch: str,
     cache_layout: str,
 ) -> None:
     """Attend packed NVFP4 K/V and compare with the dequantized cache.
 
     BF16 Q runs the exact BF16 transform; FP8 Q rounds the transformed
     operands to E4M3. Rows either interleave each token's scales after its
-    payload or pass separate scale tensors. G5 with at least one wave of
-    (request, KV head) work tiles runs the FP8 Keeps recipe fed by the NVFP4
-    transform task; the smaller launches run the TMEM-transformed recipe.
+    payload or pass separate scale tensors. FP8-Q G5 launches whose FP8
+    Keeps policy runs whole-sequence work tiles (``partial-wave`` and
+    ``full-wave``: below and at one wave of (request, KV head) tiles) use
+    that recipe fed by the NVFP4 transform task; the two-request launches
+    split the KV sequence and run the TMEM-transformed recipe.
 
     The Keeps recipe loads four flat page-fragment rows per TMA gather4.
     Caches without flat rows (``page4``: no storage subpages; ``kv-pair``:
@@ -4112,7 +4116,11 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
         "block64": (64, 8, 128),
     }[cache_layout]
     num_pages = 1536 // page_size
-    num_requests = get_max_active_clusters_for_cluster_size(1) if full_wave else 2
+    num_requests = {
+        "split": 2,
+        "partial-wave": get_max_active_clusters_for_cluster_size(1) * 5 // 6,
+        "full-wave": get_max_active_clusters_for_cluster_size(1),
+    }[launch]
     generator = torch.Generator(device="cuda").manual_seed(2027)
     positions = torch.arange(
         1023, 1023 + group_size, dtype=torch.int64, device="cuda"
