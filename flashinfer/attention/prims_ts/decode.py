@@ -3805,14 +3805,15 @@ def _prepare_prims_ts_batch_decode_plan(
     # FP8-MMA NVFP4 with five or more grouped Q tokens runs the FP8 Keeps
     # recipe (softmax per Q row instead of per K row); TransformKvTask feeds
     # its K/V rings from the interleaved NVFP4 cache. Fewer tokens keep the
-    # TMEM-transformed Swaps recipe, whose per-K-row softmax is cheaper there.
+    # TMEM-transformed Swaps recipe, whose per-K-row softmax is cheaper there,
+    # unless the group's Q rows exceed the widest (32-row) Swaps Q tile.
     # Its raw NVFP4 ring is filled only by flat TMA gather4 copies (see
     # FmhaDecodeConfig.uses_nvfp4_gather4_kv).
     nvfp4_keeps_source = (
         nvfp4_interleaved_kv
         and use_q_token_kv_block_sparse_route
         and query.dtype == torch.float8_e4m3fn
-        and seq_len_q >= 5
+        and (seq_len_q >= 5 or seq_len_q * (num_qo_heads // num_kv_heads) > 32)
         and flat_native_kv_cache
     )
     spec = None
@@ -3859,16 +3860,21 @@ def _prepare_prims_ts_batch_decode_plan(
         spec = replace(spec, config=replace(spec.config, query_major_memberships=True))
     if nvfp4_keeps_source:
         cfg = spec.config
+        # Q64: SMEM goes to the raw NVFP4 ring. With every SM streaming, its
+        # bytes in flight bound the load rate. One 32 KB FP8 stage per operand
+        # suffices because converting a tile is shorter than the Softmax it
+        # overlaps; six 18 KB raw stages plus one Q stage then fit. Deeper FP8
+        # rings or a second Q stage measured slower.
+        # Q128 doubles the MMA and Softmax per tile, so one FP8 stage stalls
+        # the transform behind PV; two FP8 stages with two raw stages (the
+        # 32 KB Q stage leaves no room for more) measured 4-10% faster on
+        # GB300 at 16 Q heads per KV head.
+        transformed_kv_stages, kv_stages = (2, 2) if cfg.tile_size_q == 128 else (1, 6)
         keeps_profile = dict(
             nvfp4_kv_source=True,
-            # SMEM goes to the raw NVFP4 ring: with every SM streaming, its
-            # bytes in flight bound the load rate. One 32 KB FP8 stage per
-            # operand suffices because converting a tile is shorter than the
-            # Softmax it overlaps; six 18 KB raw stages plus one Q stage then
-            # fit. Deeper FP8 rings or a second Q stage measured slower.
-            transformed_kv_stages=1,
+            transformed_kv_stages=transformed_kv_stages,
             q_stages=1,
-            kv_stages=6,
+            kv_stages=kv_stages,
             load_warp_idx=8,
             clc_load_warp_idx=8,
             load_num_warps=4,

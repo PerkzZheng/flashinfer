@@ -4059,16 +4059,19 @@ def _dequantize_nvfp4(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tens
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize(
-    ("query_dtype", "interleaved_scales", "launch", "cache_layout"),
+    ("query_dtype", "interleaved_scales", "launch", "cache_layout", "geometry"),
     (
-        (torch.bfloat16, True, "split", "flat"),
-        (torch.float8_e4m3fn, True, "split", "flat"),
-        (torch.float8_e4m3fn, False, "split", "flat"),
-        (torch.float8_e4m3fn, True, "partial-wave", "flat"),
-        (torch.float8_e4m3fn, True, "full-wave", "flat"),
-        (torch.float8_e4m3fn, True, "full-wave", "page4"),
-        (torch.float8_e4m3fn, True, "full-wave", "block64"),
-        (torch.float8_e4m3fn, True, "full-wave", "kv-pair"),
+        (torch.bfloat16, True, "split", "flat", (4, 5)),
+        (torch.float8_e4m3fn, True, "split", "flat", (4, 5)),
+        (torch.float8_e4m3fn, False, "split", "flat", (4, 5)),
+        (torch.float8_e4m3fn, True, "partial-wave", "flat", (4, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "flat", (4, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "page4", (4, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "block64", (4, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "kv-pair", (4, 5)),
+        (torch.float8_e4m3fn, True, "split", "flat", (16, 4)),
+        (torch.float8_e4m3fn, True, "split", "flat", (16, 5)),
+        (torch.float8_e4m3fn, True, "full-wave", "flat", (16, 8)),
     ),
     ids=(
         "bf16-rows",
@@ -4079,6 +4082,9 @@ def _dequantize_nvfp4(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tens
         "fp8-rows-full-wave-page4",
         "fp8-rows-full-wave-block64",
         "fp8-rows-full-wave-kv-pair",
+        "fp8-rows-gqa16-g4",
+        "fp8-rows-gqa16-g5",
+        "fp8-rows-gqa16-g8-full-wave",
     ),
 )
 def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
@@ -4086,6 +4092,7 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
     interleaved_scales: bool,
     launch: str,
     cache_layout: str,
+    geometry: tuple[int, int],
 ) -> None:
     """Attend packed NVFP4 K/V and compare with the dequantized cache.
 
@@ -4102,13 +4109,18 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
     K/V views of one ``[pages, 2, ...]`` tensor) or with fewer than four
     fragments per KV tile (``block64``) must take the TMEM-transformed
     recipe with paged copies instead.
+
+    ``geometry`` is (Q heads per KV head, G). Sixteen Q heads per KV head
+    give 64-128 Q rows per group, more than any Swaps Q tile holds, so G4
+    runs Keeps Q64 and G5/G8 run Keeps Q128 with the NVFP4 transform.
     """
 
     from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
         get_max_active_clusters_for_cluster_size,
     )
 
-    head_dim, num_qo_heads, group_size = 256, 4, 5
+    head_dim = 256
+    num_qo_heads, group_size = geometry
     block_size, block_topk, page_size = {
         "flat": (4, 64, 16),
         "kv-pair": (4, 64, 16),

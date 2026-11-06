@@ -1122,33 +1122,47 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     if out_dtype is None:
         out_dtype = q_dtype
     _, device_index = _resolve_cuda_device(device)
-    spec = _resolve_decode_launch_spec(
-        device_index,
-        groups,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        fragment_size,
-        max_seq_len,
-        group_size,
-        _dtype_key(q_dtype),
-        _dtype_key(kv_dtype),
-        _dtype_key(kv_dtype),
-        _dtype_key(out_dtype),
-        "HND",
-        "causal",
-        packed_query,
-        -1,
-        storage_page_size,
-        True,
-        True,
-        split_kv,
-        share_pattern_across_kv_heads,
+    # Interleaved NVFP4 rows with FP8 Q may run the FP8 Keeps recipe fed by the
+    # NVFP4 transform (see _prepare_prims_ts_batch_decode_plan); groups wider
+    # than a Swaps Q tile have no other NVFP4 recipe.
+    nvfp4_keeps_source = (
+        kv_dtype == torch.uint8
+        and q_dtype == torch.float8_e4m3fn
+        and (group_size >= 5 or group_size * (num_qo_heads // num_kv_heads) > 32)
     )
+    try:
+        spec = _resolve_decode_launch_spec(
+            device_index,
+            groups,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            fragment_size,
+            max_seq_len,
+            group_size,
+            _dtype_key(q_dtype),
+            _dtype_key(kv_dtype),
+            _dtype_key(kv_dtype),
+            _dtype_key(out_dtype),
+            "HND",
+            "causal",
+            packed_query,
+            -1,
+            storage_page_size,
+            True,
+            True,
+            split_kv,
+            share_pattern_across_kv_heads,
+        )
+    except ValueError:
+        if not nvfp4_keeps_source:
+            raise
+        spec = None
     # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
     # Other profiles and the standalone metadata API retain page-byte masks.
     query_major_memberships = (
         sparse_block_size == 4
+        and spec is not None
         and spec.config.use_fp8_qkv
         and replace(spec.config, fixed_seqlen=True).supports_query_major_memberships
     )
@@ -1177,15 +1191,17 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
     seq_lens_numel = metadata_rows
     seq_lens_bytes = seq_lens_numel * 4
-    attention_layout = _make_decode_workspace_layout(
-        spec.scratch_shapes,
-        out_dtype,
-        use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
-        use_split_kv=spec.config.use_split_kv,
-    )
-    attention_scratch_bytes = attention_layout.total_bytes
-    uses_split_kv = attention_layout.uses_split_kv
-    if kv_dtype == torch.uint8 and q_dtype == torch.float8_e4m3fn and group_size >= 5:
+    attention_scratch_bytes, uses_split_kv = 0, False
+    if spec is not None:
+        attention_layout = _make_decode_workspace_layout(
+            spec.scratch_shapes,
+            out_dtype,
+            use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
+            use_split_kv=spec.config.use_split_kv,
+        )
+        attention_scratch_bytes = attention_layout.total_bytes
+        uses_split_kv = attention_layout.uses_split_kv
+    if nvfp4_keeps_source:
         # Interleaved NVFP4 rows can instead run the FP8 Keeps recipe fed by
         # the NVFP4 transform (see _prepare_prims_ts_batch_decode_plan), whose
         # split fanout can differ; size scratch for whichever is larger.
