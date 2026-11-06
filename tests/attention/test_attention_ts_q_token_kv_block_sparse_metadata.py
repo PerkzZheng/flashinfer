@@ -4091,11 +4091,11 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
 
     BF16 Q runs the exact BF16 transform; FP8 Q rounds the transformed
     operands to E4M3. Rows either interleave each token's scales after its
-    payload or pass separate scale tensors. FP8-Q G5 launches whose FP8
-    Keeps policy runs whole-sequence work tiles (``partial-wave`` and
-    ``full-wave``: below and at one wave of (request, KV head) tiles) use
-    that recipe fed by the NVFP4 transform task; the two-request launches
-    split the KV sequence and run the TMEM-transformed recipe.
+    payload or pass separate scale tensors. FP8-Q G5 launches with
+    interleaved rows run the FP8 Keeps recipe fed by the NVFP4 transform
+    task, split along KV (``split``: two requests), below one wave
+    (``partial-wave``) or at one wave (``full-wave``) of (request, KV head)
+    tiles; the other launches run the TMEM-transformed recipe.
 
     The Keeps recipe loads four flat page-fragment rows per TMA gather4.
     Caches without flat rows (``page4``: no storage subpages; ``kv-pair``:

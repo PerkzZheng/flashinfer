@@ -1184,6 +1184,45 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         use_split_kv=spec.config.use_split_kv,
     )
     attention_scratch_bytes = attention_layout.total_bytes
+    uses_split_kv = attention_layout.uses_split_kv
+    if kv_dtype == torch.uint8 and q_dtype == torch.float8_e4m3fn and group_size >= 5:
+        # Interleaved NVFP4 rows can instead run the FP8 Keeps recipe fed by
+        # the NVFP4 transform (see _prepare_prims_ts_batch_decode_plan), whose
+        # split fanout can differ; size scratch for whichever is larger.
+        keeps_spec = _resolve_decode_launch_spec(
+            device_index,
+            groups,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            fragment_size,
+            max_seq_len,
+            group_size,
+            _dtype_key(q_dtype),
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            _dtype_key(out_dtype),
+            "HND",
+            "causal",
+            packed_query,
+            -1,
+            storage_page_size,
+            True,
+            True,
+            split_kv,
+            share_pattern_across_kv_heads,
+            prefer_keeps_mma_ab=True,
+        )
+        keeps_layout = _make_decode_workspace_layout(
+            keeps_spec.scratch_shapes,
+            out_dtype,
+            use_separate_reduction_kernel=(
+                keeps_spec.config.use_separate_reduction_kernel
+            ),
+            use_split_kv=keeps_spec.config.use_split_kv,
+        )
+        attention_scratch_bytes = max(attention_scratch_bytes, keeps_layout.total_bytes)
+        uses_split_kv = uses_split_kv or keeps_layout.uses_split_kv
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
         seq_lens_byte_offset + seq_lens_bytes
     )
@@ -1197,7 +1236,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         seq_lens_bytes=seq_lens_bytes,
         attention_workspace_byte_offset=attention_workspace_byte_offset,
         attention_scratch_bytes=attention_scratch_bytes,
-        uses_split_kv=attention_layout.uses_split_kv,
+        uses_split_kv=uses_split_kv,
         query_major_memberships=query_major_memberships,
         max_seq_len=max_seq_len,
         total_bytes=attention_workspace_byte_offset + attention_scratch_bytes,

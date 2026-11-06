@@ -1253,6 +1253,7 @@ def _resolve_decode_launch_spec(
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
     use_attention_sinks: bool = False,
+    prefer_keeps_mma_ab: bool = False,
 ) -> _DecodeLaunchSpec:
     """Resolve automatic policy and workspace geometry without compiling."""
 
@@ -1368,6 +1369,7 @@ def _resolve_decode_launch_spec(
                 use_pdl=use_pdl,
                 split_kv=split_kv,
                 share_pattern_across_kv_heads=share_pattern_across_kv_heads,
+                prefer_keeps_mma_ab=prefer_keeps_mma_ab,
             )
         else:
             config_overrides = {"use_pdl": use_pdl}
@@ -3134,6 +3136,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
     use_pdl: bool,
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
+    prefer_keeps_mma_ab: bool = False,
 ) -> "FmhaDecodeConfig":
     """Resolve the private encoded-page QToken-KvBlock-Sparse-Attention profile without compiling it."""
 
@@ -3190,6 +3193,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         route_kv_tokens=max_kv_len,
         multi_processor_count=max_active_clusters,
         split_kv=split_kv,
+        prefer_keeps_mma_ab=prefer_keeps_mma_ab and not use_nvfp4_kv,
     )
     if use_nvfp4_kv:
         # The NVFP4 transform needs a complete warp group: each warp may only
@@ -3819,21 +3823,23 @@ def _prepare_prims_ts_batch_decode_plan(
             "float8_e4m3fn",
             *policy_args[11:],
             use_attention_sinks=use_attention_sinks,
+            prefer_keeps_mma_ab=True,
         )
         keeps_cfg = keeps_spec.config
         # The transform writes D256 SW128 FP8 slabs for KV128 tiles of the
-        # one-instance recipe and runs only in whole-sequence work tiles,
-        # loaded four page fragments per gather4 copy; any other FP8 recipe,
-        # split-KV launch or fragment count keeps the Swaps NVFP4 path.
-        # Below one wave of work tiles Keeps still wins when its FP8 recipe
-        # does not split: on GB300, 128 tiles at G5/G8 run 9-15% faster.
+        # one-instance recipe, loaded four page fragments per gather4 copy;
+        # any other FP8 recipe or fragment count keeps the Swaps NVFP4 path.
+        # The FP8 policy is asked to prefer Keeps even where Swaps would split
+        # KV: Keeps then splits with its own one-instance fanout and a
+        # separate reduction. On GB300 that beats the Swaps NVFP4 split by
+        # 8-15% at 4-64 work tiles, and the unsplit Keeps launch beats it by
+        # 9-15% at 128 tiles.
         if (
             keeps_cfg.use_keeps_mma_ab
             and keeps_cfg.num_insts_kv == 1
             and keeps_cfg.head_dim_kv_stage == 256
             and keeps_cfg.tile_size_kv == 128
             and (keeps_cfg.tile_size_kv // page_size) % 4 == 0
-            and not keeps_cfg.use_split_kv
             and not keeps_cfg.runtime_split_kv
         ):
             spec = keeps_spec
