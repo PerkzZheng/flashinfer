@@ -657,8 +657,23 @@ class QTokenKvBlockSparsePagedTSWrapper:
         sm_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         out: Optional[torch.Tensor] = None,
+        kv_scale_factors: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Build live routes and launch the current QToken attention plan.
+
+        Packed NVFP4 K/V (``torch.uint8``, E2M1 with the even element in the
+        low nibble) takes one of two layouts:
+
+        - ``[pages, Hkv, page_size, D/2]`` with
+          ``kv_scale_factors=(K_SF, V_SF)``: E4M3 tensors shaped
+          ``[pages, Hkv, page_size, D/16]``, K token-major and V in TRT-LLM's
+          four-token interleaved order.
+        - ``[pages, Hkv, page_size, D/2 + D/16]`` without
+          ``kv_scale_factors``: each token row holds its payload followed by
+          its own D/16 E4M3 block scales.
+
+        Use BF16 Q for exact BF16 MMA operands or FP8 Q for E4M3-rounded FP8
+        MMA operands.
 
         Packed Q is ``[total_q, Hq, D]`` with ``qo_indptr``. Fixed Q is
         ``[B, Nq, G, Hq, D]`` without ``qo_indptr``. ``indexer_block_ids`` is
@@ -821,11 +836,22 @@ class QTokenKvBlockSparsePagedTSWrapper:
         k_cache, v_cache = _validate_q_token_kv_block_sparse_paged_kv_cache(
             paged_kv_cache
         )
+        # Packed NVFP4 stores two E2M1 values per byte. Without separate scale
+        # tensors, each row also carries the token's D/16 E4M3 block scales.
+        cache_head_dim = config.head_dim
+        if config.kv_dtype == torch.uint8:
+            cache_head_dim = config.head_dim // 2 + (
+                config.head_dim // 16 if kv_scale_factors is None else 0
+            )
+        elif kv_scale_factors is not None:
+            raise ValueError(
+                "kv_scale_factors are accepted only with packed NVFP4 torch.uint8 K/V"
+            )
         if (
             k_cache.device != config.device
             or k_cache.dtype != config.kv_dtype
             or tuple(k_cache.shape[1:])
-            != (config.num_kv_heads, config.page_size, config.head_dim)
+            != (config.num_kv_heads, config.page_size, cache_head_dim)
         ):
             raise ValueError("paged_kv_cache does not match the planned HND cache ABI")
         required_columns = (
@@ -868,6 +894,10 @@ class QTokenKvBlockSparsePagedTSWrapper:
             _q_token_tensor_abi_key(k_cache, include_storage=True),
             _q_token_tensor_abi_key(v_cache, include_storage=True),
             _q_token_tensor_abi_key(qo_indptr, include_storage=True),
+            *(
+                _q_token_tensor_abi_key(scale, include_storage=True)
+                for scale in (kv_scale_factors or ())
+            ),
         )
         if self._prepared_plan is None or prepared_key != self._prepared_key:
             if torch.cuda.is_current_stream_capturing():
@@ -894,6 +924,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
                         share_pattern_across_kv_heads=config.share_pattern_across_kv_heads,
                         count_current_block_in_topk=config.count_current_block_in_topk,
                         fixed_query_len=fixed_query_len,
+                        kv_scale_factors=kv_scale_factors,
                     )
                     self._prepared_key = prepared_key
         assert self._prepared_plan is not None
@@ -1091,33 +1122,47 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     if out_dtype is None:
         out_dtype = q_dtype
     _, device_index = _resolve_cuda_device(device)
-    spec = _resolve_decode_launch_spec(
-        device_index,
-        groups,
-        num_qo_heads,
-        num_kv_heads,
-        head_dim,
-        fragment_size,
-        max_seq_len,
-        group_size,
-        _dtype_key(q_dtype),
-        _dtype_key(kv_dtype),
-        _dtype_key(kv_dtype),
-        _dtype_key(out_dtype),
-        "HND",
-        "causal",
-        packed_query,
-        -1,
-        storage_page_size,
-        True,
-        True,
-        split_kv,
-        share_pattern_across_kv_heads,
+    # Interleaved NVFP4 rows with FP8 Q may run the FP8 Keeps recipe fed by the
+    # NVFP4 transform (see _prepare_prims_ts_batch_decode_plan); groups wider
+    # than a Swaps Q tile have no other NVFP4 recipe.
+    nvfp4_keeps_source = (
+        kv_dtype == torch.uint8
+        and q_dtype == torch.float8_e4m3fn
+        and (group_size >= 5 or group_size * (num_qo_heads // num_kv_heads) > 32)
     )
+    try:
+        spec = _resolve_decode_launch_spec(
+            device_index,
+            groups,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            fragment_size,
+            max_seq_len,
+            group_size,
+            _dtype_key(q_dtype),
+            _dtype_key(kv_dtype),
+            _dtype_key(kv_dtype),
+            _dtype_key(out_dtype),
+            "HND",
+            "causal",
+            packed_query,
+            -1,
+            storage_page_size,
+            True,
+            True,
+            split_kv,
+            share_pattern_across_kv_heads,
+        )
+    except ValueError:
+        if not nvfp4_keeps_source:
+            raise
+        spec = None
     # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
     # Other profiles and the standalone metadata API retain page-byte masks.
     query_major_memberships = (
         sparse_block_size == 4
+        and spec is not None
         and spec.config.use_fp8_qkv
         and replace(spec.config, fixed_seqlen=True).supports_query_major_memberships
     )
@@ -1146,13 +1191,54 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     )
     seq_lens_numel = metadata_rows
     seq_lens_bytes = seq_lens_numel * 4
-    attention_layout = _make_decode_workspace_layout(
-        spec.scratch_shapes,
-        out_dtype,
-        use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
-        use_split_kv=spec.config.use_split_kv,
-    )
-    attention_scratch_bytes = attention_layout.total_bytes
+    attention_scratch_bytes, uses_split_kv = 0, False
+    if spec is not None:
+        attention_layout = _make_decode_workspace_layout(
+            spec.scratch_shapes,
+            out_dtype,
+            use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
+            use_split_kv=spec.config.use_split_kv,
+        )
+        attention_scratch_bytes = attention_layout.total_bytes
+        uses_split_kv = attention_layout.uses_split_kv
+    if nvfp4_keeps_source:
+        # Interleaved NVFP4 rows can instead run the FP8 Keeps recipe fed by
+        # the NVFP4 transform (see _prepare_prims_ts_batch_decode_plan), whose
+        # split fanout can differ; size scratch for whichever is larger.
+        keeps_spec = _resolve_decode_launch_spec(
+            device_index,
+            groups,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            fragment_size,
+            max_seq_len,
+            group_size,
+            _dtype_key(q_dtype),
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            _dtype_key(out_dtype),
+            "HND",
+            "causal",
+            packed_query,
+            -1,
+            storage_page_size,
+            True,
+            True,
+            split_kv,
+            share_pattern_across_kv_heads,
+            prefer_keeps_mma_ab=True,
+        )
+        keeps_layout = _make_decode_workspace_layout(
+            keeps_spec.scratch_shapes,
+            out_dtype,
+            use_separate_reduction_kernel=(
+                keeps_spec.config.use_separate_reduction_kernel
+            ),
+            use_split_kv=keeps_spec.config.use_split_kv,
+        )
+        attention_scratch_bytes = max(attention_scratch_bytes, keeps_layout.total_bytes)
+        uses_split_kv = uses_split_kv or keeps_layout.uses_split_kv
     attention_workspace_byte_offset = _align_up_q_token_kv_block_sparse_workspace(
         seq_lens_byte_offset + seq_lens_bytes
     )
@@ -1166,7 +1252,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         seq_lens_bytes=seq_lens_bytes,
         attention_workspace_byte_offset=attention_workspace_byte_offset,
         attention_scratch_bytes=attention_scratch_bytes,
-        uses_split_kv=attention_layout.uses_split_kv,
+        uses_split_kv=uses_split_kv,
         query_major_memberships=query_major_memberships,
         max_seq_len=max_seq_len,
         total_bytes=attention_workspace_byte_offset + attention_scratch_bytes,
@@ -1328,7 +1414,14 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout_from_tensors(
         )
     if k_cache.ndim != 4:
         raise ValueError("k_cache must have shape [pages, Hkv, storage_page_size, D]")
-    if k_cache.device != query.device or k_cache.shape[3] != head_dim:
+    # Packed NVFP4 caches store two E2M1 values per byte, optionally followed
+    # by the token's interleaved E4M3 block scales.
+    cache_head_dims = (
+        (head_dim // 2, head_dim // 2 + head_dim // 16)
+        if k_cache.dtype == torch.uint8
+        else (head_dim,)
+    )
+    if k_cache.device != query.device or k_cache.shape[3] not in cache_head_dims:
         raise ValueError("query and k_cache must share device and head dimension")
     if block_table.ndim != 2 or block_table.dtype != torch.int32:
         raise ValueError("block_table must be a rank-two int32 tensor")
@@ -1705,6 +1798,7 @@ def _prepare_q_token_kv_block_sparse_attention(
     share_pattern_across_kv_heads: bool = True,
     count_current_block_in_topk: bool = True,
     fixed_query_len: int = 0,
+    kv_scale_factors: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> _PrimsTSQTokenKvBlockSparsePlan:
     """Prepare one graph-stable metadata-plus-attention QToken-KvBlock-Sparse-Attention launch.
 
@@ -1891,6 +1985,7 @@ def _prepare_q_token_kv_block_sparse_attention(
         window_left=-1,
         kv_layout="HND",
         page_size=math.gcd(sparse_block_size, int(k_cache.shape[2])),
+        kv_scale_factors=kv_scale_factors,
         direct_q1_sparse_block_size=sparse_block_size,
         query_major_memberships=layout.query_major_memberships,
         use_q_token_kv_block_sparse_route=True,
@@ -1972,6 +2067,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
     share_pattern_across_kv_heads: bool = True,
     count_current_block_in_topk: bool = True,
     seq_lens: Optional[torch.Tensor] = None,
+    kv_scale_factors: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Plan and run one QToken-KvBlock-Sparse-Attention launch.
 
@@ -1996,7 +2092,8 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         Packed ``[total_q, Hq, D]`` or fixed ``[B, Nq, G, Hq, D]`` query.
     paged_kv_cache : tuple[torch.Tensor, torch.Tensor]
         Separate HND K/V cache tensors shaped
-        ``[num_pages, Hkv, page_size, D]``. The cache writer must zero-fill
+        ``[num_pages, Hkv, page_size, D]`` (packed NVFP4: last dimension
+        ``D/2`` or ``D/2 + D/16``, see ``kv_scale_factors``). The cache writer must zero-fill
         unused token slots in allocated pages, as required by
         :meth:`QTokenKvBlockSparsePagedTSWrapper.run`.
     block_table : torch.Tensor
@@ -2055,6 +2152,10 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         True (default) counts a completed current block in the selection budget.
         False excludes it from selected IDs and always appends its visible tokens.
         Match this setting in workspace sizing and planning.
+    kv_scale_factors : tuple[torch.Tensor, torch.Tensor], optional
+        ``(K_SF, V_SF)`` block scales of a packed NVFP4 cache without
+        interleaved scales; see :meth:`QTokenKvBlockSparsePagedTSWrapper.run`
+        for both packed NVFP4 layouts.
 
     Returns
     -------
@@ -2126,6 +2227,7 @@ def q_token_kv_block_sparse_attention_with_paged_kv_cache(
         sm_scale=sm_scale,
         v_scale=v_scale,
         out=out,
+        kv_scale_factors=kv_scale_factors,
     )
 
 
