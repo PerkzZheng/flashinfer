@@ -4263,6 +4263,88 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize(
+    ("query_dtype", "interleaved_scales"),
+    ((torch.bfloat16, True), (torch.float8_e4m3fn, False)),
+    ids=("bf16-rows", "fp8-scale-tensors"),
+)
+def test_grouped_q_token_kv_block_sparse_nvfp4_kv_rejects_wide_group_without_keeps_source(
+    query_dtype: torch.dtype, interleaved_scales: bool
+) -> None:
+    """NVFP4 groups wider than 32 Q rows need the FP8 Keeps NVFP4 source.
+
+    Sixteen Q heads per KV head at G5 give 80 Q rows per KV head. BF16 Q has
+    no Keeps recipe with the NVFP4 transform, so workspace sizing rejects it;
+    separate scale tensors cannot feed the gather4 ring, so the launch does.
+    """
+
+    head_dim, num_qo_heads, group_size = 256, 16, 5
+    block_size, block_topk, page_size, num_pages = 4, 8, 16, 8
+    table = torch.arange(num_pages, dtype=torch.int32, device="cuda")[None]
+    row_bytes = head_dim // 2 + (head_dim // 16 if interleaved_scales else 0)
+    caches = tuple(
+        torch.zeros(
+            (num_pages, 1, page_size, row_bytes), dtype=torch.uint8, device="cuda"
+        )
+        for _ in range(2)
+    )
+    query = torch.zeros(
+        (1, 1, group_size, num_qo_heads, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    ).to(query_dtype)
+    max_seq_len_kv = num_pages * page_size
+    workspace_args = dict(
+        block_topk=block_topk,
+        max_seq_len_kv=max_seq_len_kv,
+        out_dtype=torch.bfloat16,
+        group_size=group_size,
+        kv_block_size=block_size,
+    )
+    message = "80 Q rows per KV head"
+    if interleaved_scales:
+        with pytest.raises(ValueError, match=message):
+            get_q_token_kv_block_sparse_workspace_size(
+                query, caches[0], table, **workspace_args
+            )
+        return
+
+    workspace = torch.zeros(
+        get_q_token_kv_block_sparse_workspace_size(
+            query, caches[0], table, **workspace_args
+        ),
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    scales = tuple(
+        torch.ones((num_pages, 1, page_size, head_dim // 16), device="cuda").to(
+            torch.float8_e4m3fn
+        )
+        for _ in range(2)
+    )
+    with pytest.raises(ValueError, match=message):
+        q_token_kv_block_sparse_attention_with_paged_kv_cache(
+            query,
+            caches,
+            table,
+            torch.zeros((group_size, block_topk), dtype=torch.int32, device="cuda"),
+            torch.zeros(group_size, dtype=torch.int32, device="cuda"),
+            torch.arange(
+                max_seq_len_kv - group_size,
+                max_seq_len_kv,
+                dtype=torch.int64,
+                device="cuda",
+            ),
+            workspace,
+            max_seq_len_kv=max_seq_len_kv,
+            group_size=group_size,
+            kv_block_size=block_size,
+            out=torch.empty(query.shape, dtype=torch.bfloat16, device="cuda"),
+            kv_scale_factors=scales,
+        )
+
+
+@_REQUIRES_PRIMS_TS_ATTENTION
+@pytest.mark.parametrize(
     ("dtype", "kv_heads", "share_pattern", "multi_wave"),
     [
         (dtype, heads, shared, False)

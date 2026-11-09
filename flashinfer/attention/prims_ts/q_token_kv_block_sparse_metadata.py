@@ -1081,6 +1081,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         _resolve_cuda_device,
         _resolve_decode_launch_spec,
         _validate_prims_ts_q_token_kv_block_sparse_group_capacity,
+        nvfp4_wide_group_error,
     )
 
     group_size = _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
@@ -1154,7 +1155,14 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
             split_kv,
             share_pattern_across_kv_heads,
         )
-    except ValueError:
+    except ValueError as error:
+        heads_q_per_kv = num_qo_heads // num_kv_heads
+        if (
+            kv_dtype == torch.uint8
+            and group_size * heads_q_per_kv > 32
+            and not nvfp4_keeps_source
+        ):
+            raise nvfp4_wide_group_error(group_size, heads_q_per_kv) from error
         if not nvfp4_keeps_source:
             raise
         spec = None

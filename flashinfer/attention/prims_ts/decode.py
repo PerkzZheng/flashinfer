@@ -1228,6 +1228,24 @@ def _decode_launch_spec_from_config(
     )
 
 
+def nvfp4_wide_group_error(seq_len_q: int, heads_q_per_kv: int) -> ValueError:
+    """Explain why an NVFP4 K/V plan has no recipe for its Q group width.
+
+    ``seq_len_q * heads_q_per_kv`` Q rows share one KV head. Above 32 rows only
+    the FP8 KeepsMmaAb recipe fed by the NVFP4 transform serves NVFP4 K/V; the
+    Swaps recipes (Q tiles 8/16/32) cannot hold the group and the BF16 Keeps
+    recipe has no NVFP4 transform.
+    """
+    return ValueError(
+        "NVFP4 K/V with "
+        f"{seq_len_q * heads_q_per_kv} Q rows per KV head "
+        f"(seq_len_q={seq_len_q} x {heads_q_per_kv} Q heads per KV head > 32) "
+        "runs only on the FP8 KeepsMmaAb recipe fed by the NVFP4 transform. "
+        "It needs FP8 Q, interleaved NVFP4 rows (kv_scale_factors=None) and a "
+        "contiguous paged cache whose KV tiles hold whole 4-page gather groups."
+    )
+
+
 # Share CPU policy selection across equivalent plans/layers.
 @functools.cache
 def _resolve_decode_launch_spec(
@@ -3847,6 +3865,13 @@ def _prepare_prims_ts_batch_decode_plan(
         else:
             nvfp4_keeps_source = False
     if spec is None:
+        heads_q_per_kv = num_qo_heads // num_kv_heads
+        if (
+            k_cache.dtype == torch.uint8
+            and use_q_token_kv_block_sparse_route
+            and seq_len_q * heads_q_per_kv > 32
+        ):
+            raise nvfp4_wide_group_error(seq_len_q, heads_q_per_kv)
         spec = _resolve_decode_launch_spec(
             *policy_args,
             use_attention_sinks=use_attention_sinks,
