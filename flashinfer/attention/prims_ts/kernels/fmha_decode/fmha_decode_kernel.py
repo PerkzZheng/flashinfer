@@ -94,7 +94,7 @@ from .fmha_decode_resources import (
     TmemSoftmaxOrderResource,
     TmemTransformedKvResource,
 )
-from .fmha_decode_resources.tmem_transformed_kv import SmemFp8KvFromNvfp4Resource
+from .fmha_decode_resources.tmem_transformed_kv import SmemKvFromNvfp4Resource
 from .fmha_decode_resources.helpers_common import (
     split_kv_grid_coord,
     UniformQueryOffsets,
@@ -1150,13 +1150,13 @@ def _build_decode_gen_schedule(
             seq_len_q=seq_len_q,
             inst_id=0,
         )
-        smem_k0 = SmemFp8KvFromNvfp4Resource(
+        smem_k0 = SmemKvFromNvfp4Resource(
             pipeline_config=smem_k0_cfg,
             kv_kind=KV_KIND_K,
             name="smemK0",
             **nvfp4_ring_kwargs,
         )
-        smem_v0 = SmemFp8KvFromNvfp4Resource(
+        smem_v0 = SmemKvFromNvfp4Resource(
             pipeline_config=smem_v0_cfg,
             kv_kind=KV_KIND_V,
             name="smemV0",

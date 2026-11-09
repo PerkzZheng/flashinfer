@@ -315,10 +315,11 @@ D/2 + D/16]` (each token's E2M1 payload, then its E4M3 block scales), or
 `[.., D/2]` payloads with `kv_scale_factors=(K_SF, V_SF)`. BF16 Q runs exact
 BF16 MMA operands; FP8 Q runs E4M3-rounded FP8 MMA operands. The
 TMEM-transformed SwapsMmaAb recipe serves both layouts. With interleaved rows
-in a flat paged cache whose page fragments fit one TMA gather4 box and FP8 Q,
-G >= 5 or more than 32 Q rows per KV head run the FP8 KeepsMmaAb recipe fed
-by an NVFP4-to-FP8 transform task instead. Groups wider than 32 Q rows have no
-other NVFP4 recipe and raise a `ValueError` otherwise. Decode's
+in a flat paged cache whose page fragments fit one TMA gather4 box, groups of
+more than 32 Q rows per KV head (and FP8-Q groups of G >= 5) run the KeepsMmaAb
+recipe of Q's dtype instead, fed by a task that converts NVFP4 into its E4M3
+or exact BF16 K/V tiles. Groups wider than 32 Q rows have no other NVFP4
+recipe and raise a `ValueError` otherwise. Decode's
 native logical HND cache views can use strided NHD/interleaved physical storage.
 The pure-host
 `suggest_q_token_kv_block_sparse_group_size` helper takes a caller-cached SM

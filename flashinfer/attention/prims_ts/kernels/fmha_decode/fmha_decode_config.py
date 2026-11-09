@@ -771,15 +771,15 @@ class FmhaDecodeConfig:
     # tensors. One TMA then stages a full-head-dim fragment with its scales,
     # and the transform reads packed bytes directly.
     nvfp4_interleaved_kv: bool = False
-    # An FP8 Q/K/V KeepsMmaAb profile whose K/V are not loaded from an FP8
-    # cache: the loader stages interleaved NVFP4 rows (see
+    # An FP8 or BF16 Q/K/V KeepsMmaAb profile whose K/V are not loaded from a
+    # cache of that dtype: the loader stages interleaved NVFP4 rows (see
     # ``nvfp4_interleaved_kv``) into a raw ring and TransformKvTask writes the
-    # E4M3 tiles, in the FP8 TMA layout, into the K/V rings MMA consumes.
-    # Here ``k_dtype``/``v_dtype`` name the FP8 ring operands; the NVFP4
-    # storage precision, its TMA descriptors and raw allocations come from
-    # ``nvfp4_raw_cfg``.
-    # ``transformed_kv_stages`` sets that FP8 ring depth per operand and
-    # ``kv_stages`` the raw ring depth.
+    # E4M3 or exact BF16 tiles, in the TMA layout of that dtype, into the K/V
+    # rings MMA consumes. Here ``k_dtype``/``v_dtype`` name the ring operands;
+    # the NVFP4 storage precision, its TMA descriptors and raw allocations
+    # come from ``nvfp4_raw_cfg``.
+    # ``transformed_kv_stages`` sets that ring depth per operand (in head-dim
+    # stages) and ``kv_stages`` the raw ring depth.
     nvfp4_kv_source: bool = False
 
     # ------------------------------------------------------------------
@@ -1108,8 +1108,9 @@ class FmhaDecodeConfig:
         """
         if self.nvfp4_kv_source:
             # One (token, half) row at a time: four payload words, two scale
-            # words and eight outputs; 48 keeps the 24-warp budget with the
-            # Keeps recipe's Softmax grant.
+            # words and eight outputs (BF16: four scale pairs and four outputs
+            # per word); 48 keeps the 24-warp budget with the Keeps recipe's
+            # Softmax grant.
             return 48
         if not self.use_transform_kv:
             return None
@@ -1320,8 +1321,14 @@ class FmhaDecodeConfig:
 
     @property
     def num_raw_kv_head_dim_stages(self) -> int:
-        """Raw K/V loads per tile; interleaved NVFP4 stages the whole row once."""
-        return 1 if self.nvfp4_interleaved_kv else self.num_head_dim_stages_kv
+        """Raw K/V loads per tile; interleaved NVFP4 stages the whole row once.
+
+        The NVFP4-fed Keeps profile loads the same raw rows, whatever its
+        transformed head-dim staging (one D256 FP8 or two D128 BF16 stages).
+        """
+        if self.nvfp4_interleaved_kv or self.nvfp4_kv_source:
+            return 1
+        return self.num_head_dim_stages_kv
 
     @property
     def smem_k_storage_tile_bytes(self) -> int:

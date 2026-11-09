@@ -1101,6 +1101,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         _resolve_decode_launch_spec,
         _validate_prims_ts_q_token_kv_block_sparse_group_capacity,
         nvfp4_wide_group_error,
+        prefers_nvfp4_keeps_source,
     )
 
     group_size = _validate_prims_ts_q_token_kv_block_sparse_group_capacity(
@@ -1142,13 +1143,11 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
     if out_dtype is None:
         out_dtype = q_dtype
     _, device_index = _resolve_cuda_device(device)
-    # Interleaved NVFP4 rows with FP8 Q may run the FP8 Keeps recipe fed by the
-    # NVFP4 transform (see _prepare_prims_ts_batch_decode_plan); groups wider
-    # than a Swaps Q tile have no other NVFP4 recipe.
-    nvfp4_keeps_source = (
-        kv_dtype == torch.uint8
-        and q_dtype == torch.float8_e4m3fn
-        and (group_size >= 5 or group_size * (num_qo_heads // num_kv_heads) > 32)
+    # Interleaved NVFP4 rows may run the Keeps recipe fed by the NVFP4
+    # transform (see _prepare_prims_ts_batch_decode_plan); groups wider than a
+    # Swaps Q tile have no other NVFP4 recipe.
+    nvfp4_keeps_source = kv_dtype == torch.uint8 and prefers_nvfp4_keeps_source(
+        q_dtype, group_size, num_qo_heads // num_kv_heads
     )
     try:
         spec = _resolve_decode_launch_spec(
@@ -1230,7 +1229,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         attention_scratch_bytes = attention_layout.total_bytes
         uses_split_kv = attention_layout.uses_split_kv
     if nvfp4_keeps_source:
-        # Interleaved NVFP4 rows can instead run the FP8 Keeps recipe fed by
+        # Interleaved NVFP4 rows can instead run the Keeps recipe fed by
         # the NVFP4 transform (see _prepare_prims_ts_batch_decode_plan), whose
         # split fanout can differ; size scratch for whichever is larger.
         keeps_spec = _resolve_decode_launch_spec(
@@ -1243,8 +1242,8 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
             max_seq_len,
             group_size,
             _dtype_key(q_dtype),
-            "float8_e4m3fn",
-            "float8_e4m3fn",
+            _dtype_key(q_dtype),
+            _dtype_key(q_dtype),
             _dtype_key(out_dtype),
             "HND",
             "causal",

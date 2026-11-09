@@ -1282,21 +1282,38 @@ def _decode_launch_spec_from_config(
     )
 
 
+def prefers_nvfp4_keeps_source(
+    q_dtype: torch.dtype, seq_len_q: int, heads_q_per_kv: int
+) -> bool:
+    """Whether NVFP4 K/V should run the KeepsMmaAb recipe fed by the transform.
+
+    ``seq_len_q * heads_q_per_kv`` Q rows share one KV head. Groups wider
+    than the widest (32-row) Swaps Q tile need it for either Q dtype. FP8 Q
+    also takes it from five grouped tokens: its per-Q-row softmax then beats
+    the Swaps recipe's per-K-row softmax. The cache layout must still allow
+    gather4 fragment loads (see ``_prepare_prims_ts_batch_decode_plan``).
+    """
+    wide_group = seq_len_q * heads_q_per_kv > 32
+    if q_dtype == torch.float8_e4m3fn:
+        return seq_len_q >= 5 or wide_group
+    return q_dtype == torch.bfloat16 and wide_group
+
+
 def nvfp4_wide_group_error(seq_len_q: int, heads_q_per_kv: int) -> ValueError:
     """Explain why an NVFP4 K/V plan has no recipe for its Q group width.
 
     ``seq_len_q * heads_q_per_kv`` Q rows share one KV head. Above 32 rows only
-    the FP8 KeepsMmaAb recipe fed by the NVFP4 transform serves NVFP4 K/V; the
-    Swaps recipes (Q tiles 8/16/32) cannot hold the group and the BF16 Keeps
-    recipe has no NVFP4 transform.
+    the KeepsMmaAb recipes fed by the NVFP4 transform serve NVFP4 K/V; the
+    Swaps recipes (Q tiles 8/16/32) cannot hold the group.
     """
     return ValueError(
         "NVFP4 K/V with "
         f"{seq_len_q * heads_q_per_kv} Q rows per KV head "
         f"(seq_len_q={seq_len_q} x {heads_q_per_kv} Q heads per KV head > 32) "
-        "runs only on the FP8 KeepsMmaAb recipe fed by the NVFP4 transform. "
-        "It needs FP8 Q, interleaved NVFP4 rows (kv_scale_factors=None) and a "
-        "contiguous paged cache whose KV tiles hold whole 4-page gather groups."
+        "runs only on the KeepsMmaAb recipe fed by the NVFP4 transform. "
+        "It needs BF16 or FP8 Q, interleaved NVFP4 rows (kv_scale_factors=None) "
+        "and a contiguous paged cache whose KV tiles hold whole 4-page gather "
+        "groups."
     )
 
 
@@ -3910,18 +3927,17 @@ def _prepare_prims_ts_batch_decode_plan(
         and v_cache.is_contiguous()
         and int(k_cache.shape[0]) * storage_page_size * num_kv_heads < (1 << 31)
     )
-    # FP8-MMA NVFP4 with five or more grouped Q tokens runs the FP8 Keeps
-    # recipe (softmax per Q row instead of per K row); TransformKvTask feeds
-    # its K/V rings from the interleaved NVFP4 cache. Fewer tokens keep the
-    # TMEM-transformed Swaps recipe, whose per-K-row softmax is cheaper there,
-    # unless the group's Q rows exceed the widest (32-row) Swaps Q tile.
-    # Its raw NVFP4 ring is filled only by flat TMA gather4 copies (see
+    # The Keeps recipe of Q's dtype (softmax per Q row instead of per K row)
+    # runs with TransformKvTask feeding its K/V rings from the interleaved
+    # NVFP4 cache; see prefers_nvfp4_keeps_source. Its raw NVFP4 ring is
+    # filled only by flat TMA gather4 copies (see
     # FmhaDecodeConfig.uses_nvfp4_gather4_kv).
     nvfp4_keeps_source = (
         nvfp4_interleaved_kv
         and use_q_token_kv_block_sparse_route
-        and query.dtype == torch.float8_e4m3fn
-        and (seq_len_q >= 5 or seq_len_q * (num_qo_heads // num_kv_heads) > 32)
+        and prefers_nvfp4_keeps_source(
+            query.dtype, seq_len_q, num_qo_heads // num_kv_heads
+        )
         and flat_native_kv_cache
     )
     spec = None
@@ -3930,18 +3946,21 @@ def _prepare_prims_ts_batch_decode_plan(
             NVFP4_GATHER4_MAX_FRAGMENT_BYTES,
         )
 
+        # K/V rings take Q's dtype: E4M3 for FP8 Q, exact BF16 for BF16 Q.
+        q_dtype_key = _dtype_key(query.dtype)
         keeps_spec = _resolve_decode_launch_spec(
             *policy_args[:9],
-            "float8_e4m3fn",
-            "float8_e4m3fn",
+            q_dtype_key,
+            q_dtype_key,
             *policy_args[11:],
             use_attention_sinks=use_attention_sinks,
             prefer_keeps_mma_ab=True,
         )
         keeps_cfg = keeps_spec.config
-        # The transform writes D256 SW128 FP8 slabs for KV128 tiles of the
-        # one-instance recipe, loaded four page fragments per gather4 copy;
-        # any other FP8 recipe or fragment count keeps the Swaps NVFP4 path.
+        # The transform writes SW128 slabs for KV128 tiles of the one-instance
+        # recipe (one D256 FP8 stage, or two D128 BF16 stages, per tile),
+        # loaded four page fragments per gather4 copy; any other recipe or
+        # fragment count keeps the Swaps NVFP4 path.
         # The FP8 policy is asked to prefer Keeps even where Swaps would split
         # KV: Keeps then splits with its own one-instance fanout and a
         # separate reduction. On GB300 that beats the Swaps NVFP4 split by
@@ -3950,7 +3969,8 @@ def _prepare_prims_ts_batch_decode_plan(
         if (
             keeps_cfg.use_keeps_mma_ab
             and keeps_cfg.num_insts_kv == 1
-            and keeps_cfg.head_dim_kv_stage == 256
+            and keeps_cfg.head_dim_kv_stage
+            == (256 if query.dtype == torch.float8_e4m3fn else 128)
             and keeps_cfg.tile_size_kv == 128
             and (keeps_cfg.tile_size_kv // page_size) % 4 == 0
             # Interleaved rows: one fragment is page_size rows of the cache.
@@ -3991,6 +4011,16 @@ def _prepare_prims_ts_batch_decode_plan(
         # 32 KB Q stage leaves no room for more) measured 4-10% faster on
         # GB300 at 16 Q heads per KV head.
         transformed_kv_stages, kv_stages = (2, 2) if cfg.tile_size_q == 128 else (1, 6)
+        if query.dtype == torch.bfloat16:
+            # BF16 rings count 32 KB D128 head-dim stages, two per tile. Q64
+            # keeps a full tile per operand (two stages) with three raw
+            # stages; one stage measured 24% slower. Q128's 64 KB Q stage
+            # leaves one stage per operand with four raw stages; a full tile
+            # per operand leaves a single raw stage, which serializes loads
+            # and measured 33-42% slower on GB300 at 16 Q heads per KV head.
+            transformed_kv_stages, kv_stages = (
+                (1, 4) if cfg.tile_size_q == 128 else (2, 3)
+            )
         keeps_profile = dict(
             nvfp4_kv_source=True,
             transformed_kv_stages=transformed_kv_stages,

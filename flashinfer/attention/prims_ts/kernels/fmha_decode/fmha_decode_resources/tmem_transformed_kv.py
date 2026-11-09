@@ -325,6 +325,16 @@ def ld_shared_v2_b32(addr: Int32):
 
 
 @cute.jit
+def ld_shared_b32(addr: Int32) -> Int32:
+    """Load one 32-bit word from a 4-byte-aligned shared address."""
+    return cute.arch.inline_ptx(
+        "ld.shared.b32 {$w0}, [{$r0}];",
+        write_only_types=[Int32],
+        read_only_args=[addr],
+    )
+
+
+@cute.jit
 def st_shared_v4_b32(addr: Int32, w0: Int32, w1: Int32, w2: Int32, w3: Int32) -> None:
     """Store four 32-bit words to a 16-byte-aligned shared address."""
     cute.arch.inline_ptx(
@@ -1013,21 +1023,118 @@ class TmemTransformedKvResource(DecodeGenResourceBase):
 
 
 @dataclass(kw_only=True)
-class SmemFp8KvFromNvfp4Resource(SmemKvTileResource):
-    """FP8 K or V tile ring written by TransformKvTask from interleaved NVFP4.
+class SmemKvFromNvfp4Resource(SmemKvTileResource):
+    """FP8 or BF16 K or V tile ring written by TransformKvTask from NVFP4.
 
-    MMA consumes it exactly like a TMA-loaded FP8 ``SmemKvTileResource`` of a
-    KeepsMmaAb D256 profile: each head-dim half is a 128-row slab of 128-byte
-    SW128 rows, token-major for both K (K-major B) and V (MN-major B), so
-    neither operand needs a transpose. ``raw_src`` is the raw interleaved ring
-    whose current consumer stage the transform converts.
+    MMA consumes it exactly like a TMA-loaded ``SmemKvTileResource`` of the
+    matching KeepsMmaAb profile: 128-row slabs of 128-byte SW128 rows,
+    token-major for both K (K-major B) and V (MN-major B), so neither operand
+    needs a transpose. An FP8 D256 stage holds two 128-channel slabs; a BF16
+    D128 head-dim stage holds two 64-channel slabs, so one raw tile fills two
+    BF16 stages. ``raw_src`` is the raw interleaved ring whose current
+    consumer stage the transform converts.
     """
 
     raw_src: Constexpr[SmemKvResource | None] = None
 
     @producer_work
     @cute.jit
-    def transform_from_raw(self, stage_info: StageInfo) -> None:
+    def transform_from_raw(
+        self, stage_info: StageInfo, *, head_dim_stage_idx: Constexpr[int]
+    ) -> None:
+        """Convert the raw ring's current tile into this ring's stage.
+
+        ``head_dim_stage_idx`` selects the BF16 D128 stage; FP8 has one.
+        """
+        if cutlass.const_expr(self.cfg.k_dtype_bytes == 2):
+            self._bf16_from_raw(stage_info, head_dim_stage_idx)
+        else:
+            assert head_dim_stage_idx == 0
+            self._fp8_from_raw(stage_info)
+
+    @cute.jit
+    def _raw_row_addr(self, token: Int32) -> Int32:
+        """Shared address of ``token``'s interleaved row in the raw stage."""
+        raw_cfg = self.raw_src.cfg
+        src_stage = self.raw_src.state_src.consumer_work_stage
+        src_base = Int32(self.raw_src._smem_base_kv.data_ptr().toint()) + (
+            src_stage * Int32(raw_cfg.smem_kv_tile_elements)
+        )
+        # Page fragments of ``num_tokens_per_page`` interleaved rows (payload
+        # D/2 bytes, then D/16 scale bytes) sit in fragment slots.
+        fragment_tokens = raw_cfg.num_tokens_per_page
+        return (
+            src_base
+            + (token // Int32(fragment_tokens))
+            * Int32(raw_cfg.nvfp4_interleaved_fragment_bytes)
+            + (token % Int32(fragment_tokens))
+            * Int32(raw_cfg.nvfp4_interleaved_row_bytes)
+        )
+
+    @cute.jit
+    def _bf16_from_raw(
+        self, stage_info: StageInfo, head_dim_stage_idx: Constexpr[int]
+    ) -> None:
+        """Convert one 128-channel slice of the raw tile into a BF16 stage.
+
+        Each thread owns (token, 64-channel slab) rows: 32 payload bytes and
+        their four block scales become one 128-byte SW128 row. E2M1 x E4M3
+        products are exact in BF16, so this matches the dequantized cache.
+        """
+        cfg = self.cfg
+        assert cfg.k_dtype_bytes == 2 and cfg.v_dtype_bytes == 2
+        assert cfg.headdim == 256 and cfg.head_dim_kv_stage == 128
+        assert cfg.tile_size_kv == 128
+        num_threads = cfg.transform_kv_num_warps * 32
+        units = 2 * cfg.tile_size_kv
+        assert units % num_threads == 0
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - Int32(
+            cfg.transform_kv_warp_idx
+        )
+        thread = warp * Int32(32) + cute.arch.lane_idx()
+        dst_base = Int32(self._stage_base(stage_info).data_ptr().toint())
+        slab_bytes = cfg.tile_size_kv * 128
+        for rep in cutlass.range_constexpr(units // num_threads):
+            unit = thread + Int32(rep * num_threads)
+            token = unit % Int32(cfg.tile_size_kv)
+            slab = unit // Int32(cfg.tile_size_kv)
+            row = self._raw_row_addr(token)
+            # Channels 128 * stage + 64 * slab: 32 payload bytes, 4 scales.
+            payload = row + Int32(64 * head_dim_stage_idx) + slab * Int32(32)
+            sf_word = ld_shared_b32(
+                row + Int32(cfg.headdim // 2 + 8 * head_dim_stage_idx) + slab * Int32(4)
+            )
+            # One BF16x2 pair per 16-channel scale block.
+            sf_pairs = (
+                e4m3x2_to_bf16x2(broadcast_byte_const(sf_word, 0)),
+                e4m3x2_to_bf16x2(broadcast_byte_const(sf_word, 1)),
+                e4m3x2_to_bf16x2(broadcast_byte_const(sf_word, 2)),
+                e4m3x2_to_bf16x2(broadcast_byte_const(sf_word, 3)),
+            )
+            dst_row = dst_base + slab * Int32(slab_bytes) + token * Int32(128)
+            # SW128: 16-byte segment s of row r lands at segment s ^ (r % 8).
+            swizzle = token % Int32(8)
+            for chunk in cutlass.range_constexpr(2):
+                words = ld_shared_v4_b32(payload + Int32(chunk * 16))
+                for word_idx in cutlass.range_constexpr(4):
+                    # Eight values per word, sixteen per scale block; each
+                    # word becomes one 16-byte BF16 segment in natural order.
+                    out = scale_e2m1x8_packed_to_bf16x2x4(
+                        words[word_idx], sf_pairs[(4 * chunk + word_idx) // 2]
+                    )
+                    seg_idx = Int32(4 * chunk + word_idx)
+                    st_shared_v4_b32(
+                        dst_row + ((seg_idx ^ swizzle) << Int32(4)),
+                        out[0],
+                        out[1],
+                        out[2],
+                        out[3],
+                    )
+        # Generic-proxy SMEM writes must be visible to the async-proxy MMA.
+        cute.arch.fence_view_async_shared()
+
+    @cute.jit
+    def _fp8_from_raw(self, stage_info: StageInfo) -> None:
         """Convert the raw ring's current tile into this ring's E4M3 stage.
 
         Each thread owns (token, head-dim half) rows: 64 payload bytes and
@@ -1036,7 +1143,6 @@ class SmemFp8KvFromNvfp4Resource(SmemKvTileResource):
         variant does everywhere) and interleaved back to natural order.
         """
         cfg = self.cfg
-        raw_cfg = self.raw_src.cfg
         assert cfg.k_dtype_bytes == 1 and cfg.v_dtype_bytes == 1
         assert cfg.headdim == 256 and cfg.head_dim_kv_stage == 256
         assert cfg.tile_size_kv == 128
@@ -1047,14 +1153,7 @@ class SmemFp8KvFromNvfp4Resource(SmemKvTileResource):
             cfg.transform_kv_warp_idx
         )
         thread = warp * Int32(32) + cute.arch.lane_idx()
-        src_stage = self.raw_src.state_src.consumer_work_stage
-        src_base = Int32(self.raw_src._smem_base_kv.data_ptr().toint()) + (
-            src_stage * Int32(raw_cfg.smem_kv_tile_elements)
-        )
         dst_base = Int32(self._stage_base(stage_info).data_ptr().toint())
-        # Raw stage: page fragments of ``num_tokens_per_page`` interleaved rows
-        # (payload D/2 bytes, then D/16 scale bytes) in fragment slots.
-        fragment_tokens = raw_cfg.num_tokens_per_page
         # One head-dim half: 128 values = 64 payload bytes and 8 scale bytes;
         # its FP8 slab holds tile_size_kv rows of 128 bytes.
         half_payload_bytes = cfg.headdim // 4
@@ -1064,13 +1163,7 @@ class SmemFp8KvFromNvfp4Resource(SmemKvTileResource):
             unit = thread + Int32(rep * num_threads)
             token = unit % Int32(cfg.tile_size_kv)
             half = unit // Int32(cfg.tile_size_kv)
-            row = (
-                src_base
-                + (token // Int32(fragment_tokens))
-                * Int32(raw_cfg.nvfp4_interleaved_fragment_bytes)
-                + (token % Int32(fragment_tokens))
-                * Int32(raw_cfg.nvfp4_interleaved_row_bytes)
-            )
+            row = self._raw_row_addr(token)
             payload = row + half * Int32(half_payload_bytes)
             sf_lo, sf_hi = ld_shared_v2_b32(
                 row + Int32(cfg.headdim // 2) + half * Int32(half_scale_bytes)

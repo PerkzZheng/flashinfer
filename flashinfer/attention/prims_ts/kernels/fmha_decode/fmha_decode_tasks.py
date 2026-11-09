@@ -2963,11 +2963,12 @@ def create_nvfp4_keeps_transform_task(
     task_class: type[DecodeGenTask] = DecodeGenTask,
     **kw: TaskKwarg,
 ) -> Task:
-    """Feed an FP8 KeepsMmaAb pipeline from a raw interleaved NVFP4 ring.
+    """Feed an FP8 or BF16 KeepsMmaAb pipeline from a raw interleaved NVFP4 ring.
 
     The shared K/V load task fills ``smem_kv_raw`` in the order K(head),
     then K(i+1), V(i) per loop iteration, then V(tail); this task converts
-    each raw stage, in the same order, into the matching FP8 K or V ring.
+    each raw stage, in the same order, into the matching K or V ring: one
+    D256 stage for FP8, or one stage per D128 head-dim slice for BF16.
     """
     assert cfg.nvfp4_kv_source and cfg.num_insts_kv == 1
 
@@ -2983,14 +2984,15 @@ def create_nvfp4_keeps_transform_task(
         def transform_one(dst: MemoryResource) -> None:
             """Convert the next raw stage into ``dst``, then return the raw stage.
 
-            ConsWait on the raw ring, ProdAcquire/Work/Commit on the FP8 ring,
-            and only then ConsRelease: the loader may overwrite the raw stage
-            once its rows have been read into the FP8 stage.
+            ConsWait on the raw ring, ProdAcquire/Work/Commit on the K/V ring
+            for each head-dim stage, and only then ConsRelease: the loader may
+            overwrite the raw stage once its rows have been read.
             """
             smem_kv_raw.wait()
-            dst.acquire()
-            dst.transform_from_raw()
-            dst.commit()
+            for head_dim_stage_idx in range(cfg.num_head_dim_stages_kv):
+                dst.acquire()
+                dst.transform_from_raw(head_dim_stage_idx=head_dim_stage_idx)
+                dst.commit()
             smem_kv_raw.release()
 
         transform_one(smem_k0)

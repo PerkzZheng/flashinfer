@@ -4075,6 +4075,9 @@ def _dequantize_nvfp4(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tens
         (torch.float8_e4m3fn, True, "split", "flat", (16, 4)),
         (torch.float8_e4m3fn, True, "split", "flat", (16, 5)),
         (torch.float8_e4m3fn, True, "full-wave", "flat", (16, 8)),
+        (torch.bfloat16, True, "split", "flat", (16, 4)),
+        (torch.bfloat16, True, "split", "flat", (16, 5)),
+        (torch.bfloat16, True, "full-wave", "flat", (16, 8)),
     ),
     ids=(
         "bf16-rows",
@@ -4089,6 +4092,9 @@ def _dequantize_nvfp4(payload: torch.Tensor, scales: torch.Tensor) -> torch.Tens
         "fp8-rows-gqa16-g4",
         "fp8-rows-gqa16-g5",
         "fp8-rows-gqa16-g8-full-wave",
+        "bf16-rows-gqa16-g4",
+        "bf16-rows-gqa16-g5",
+        "bf16-rows-gqa16-g8-full-wave",
     ),
 )
 def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
@@ -4117,7 +4123,8 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
 
     ``geometry`` is (Q heads per KV head, G). Sixteen Q heads per KV head
     give 64-128 Q rows per group, more than any Swaps Q tile holds, so G4
-    runs Keeps Q64 and G5/G8 run Keeps Q128 with the NVFP4 transform.
+    runs Keeps Q64 and G5/G8 run Keeps Q128 with the NVFP4 transform, which
+    writes E4M3 tiles for FP8 Q and exact BF16 tiles for BF16 Q.
     """
 
     from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
@@ -4269,27 +4276,23 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_matches_dequantized_reference(
 
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize(
-    ("query_dtype", "interleaved_scales"),
-    ((torch.bfloat16, True), (torch.float8_e4m3fn, False)),
-    ids=("bf16-rows", "fp8-scale-tensors"),
+    "query_dtype", (torch.bfloat16, torch.float8_e4m3fn), ids=("bf16", "fp8")
 )
 def test_grouped_q_token_kv_block_sparse_nvfp4_kv_rejects_wide_group_without_keeps_source(
-    query_dtype: torch.dtype, interleaved_scales: bool
+    query_dtype: torch.dtype,
 ) -> None:
-    """NVFP4 groups wider than 32 Q rows need the FP8 Keeps NVFP4 source.
+    """NVFP4 groups wider than 32 Q rows need the Keeps NVFP4 source.
 
-    Sixteen Q heads per KV head at G5 give 80 Q rows per KV head. BF16 Q has
-    no Keeps recipe with the NVFP4 transform, so workspace sizing rejects it;
-    separate scale tensors cannot feed the gather4 ring, so the launch does.
+    Sixteen Q heads per KV head at G5 give 80 Q rows per KV head. Separate
+    scale tensors cannot feed the gather4 ring, so the launch rejects them.
     """
 
     head_dim, num_qo_heads, group_size = 256, 16, 5
     block_size, block_topk, page_size, num_pages = 4, 8, 16, 8
     table = torch.arange(num_pages, dtype=torch.int32, device="cuda")[None]
-    row_bytes = head_dim // 2 + (head_dim // 16 if interleaved_scales else 0)
     caches = tuple(
         torch.zeros(
-            (num_pages, 1, page_size, row_bytes), dtype=torch.uint8, device="cuda"
+            (num_pages, 1, page_size, head_dim // 2), dtype=torch.uint8, device="cuda"
         )
         for _ in range(2)
     )
@@ -4307,13 +4310,6 @@ def test_grouped_q_token_kv_block_sparse_nvfp4_kv_rejects_wide_group_without_kee
         kv_block_size=block_size,
     )
     message = "80 Q rows per KV head"
-    if interleaved_scales:
-        with pytest.raises(ValueError, match=message):
-            get_q_token_kv_block_sparse_workspace_size(
-                query, caches[0], table, **workspace_args
-            )
-        return
-
     workspace = torch.zeros(
         get_q_token_kv_block_sparse_workspace_size(
             query, caches[0], table, **workspace_args
