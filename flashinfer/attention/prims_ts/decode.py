@@ -991,10 +991,14 @@ def _normalize_paged_kv_scale_factors(
     *,
     k_cache: torch.Tensor,
     logical_head_dim: int,
+    interleaved: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
-    """Validate NVFP4 scale tensors or create homogeneous-mode placeholders."""
+    """Validate NVFP4 scale tensors or create homogeneous-mode placeholders.
 
-    if k_cache.dtype != torch.uint8:
+    Interleaved NVFP4 rows carry their own scales and use placeholders.
+    """
+
+    if k_cache.dtype != torch.uint8 or interleaved:
         if kv_scale_factors is not None:
             raise ValueError(
                 "kv_scale_factors are accepted only with packed NVFP4 torch.uint8 K/V"
@@ -1224,6 +1228,24 @@ def _decode_launch_spec_from_config(
     )
 
 
+def nvfp4_wide_group_error(seq_len_q: int, heads_q_per_kv: int) -> ValueError:
+    """Explain why an NVFP4 K/V plan has no recipe for its Q group width.
+
+    ``seq_len_q * heads_q_per_kv`` Q rows share one KV head. Above 32 rows only
+    the FP8 KeepsMmaAb recipe fed by the NVFP4 transform serves NVFP4 K/V; the
+    Swaps recipes (Q tiles 8/16/32) cannot hold the group and the BF16 Keeps
+    recipe has no NVFP4 transform.
+    """
+    return ValueError(
+        "NVFP4 K/V with "
+        f"{seq_len_q * heads_q_per_kv} Q rows per KV head "
+        f"(seq_len_q={seq_len_q} x {heads_q_per_kv} Q heads per KV head > 32) "
+        "runs only on the FP8 KeepsMmaAb recipe fed by the NVFP4 transform. "
+        "It needs FP8 Q, interleaved NVFP4 rows (kv_scale_factors=None) and a "
+        "contiguous paged cache whose KV tiles hold whole 4-page gather groups."
+    )
+
+
 # Share CPU policy selection across equivalent plans/layers.
 @functools.cache
 def _resolve_decode_launch_spec(
@@ -1249,6 +1271,7 @@ def _resolve_decode_launch_spec(
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
     use_attention_sinks: bool = False,
+    prefer_keeps_mma_ab: bool = False,
 ) -> _DecodeLaunchSpec:
     """Resolve automatic policy and workspace geometry without compiling."""
 
@@ -1364,6 +1387,7 @@ def _resolve_decode_launch_spec(
                 use_pdl=use_pdl,
                 split_kv=split_kv,
                 share_pattern_across_kv_heads=share_pattern_across_kv_heads,
+                prefer_keeps_mma_ab=prefer_keeps_mma_ab,
             )
         else:
             config_overrides = {"use_pdl": use_pdl}
@@ -1887,6 +1911,8 @@ def _get_compiled_decode(
     )
     k_storage_head_dim = head_dim // 2 if k_dtype == cutlass.Float4E2M1FN else head_dim
     v_storage_head_dim = head_dim // 2 if v_dtype == cutlass.Float4E2M1FN else head_dim
+    if cfg.nvfp4_interleaved_kv or cfg.nvfp4_kv_source:
+        k_storage_head_dim = v_storage_head_dim = cfg.nvfp4_interleaved_row_bytes
     k_fake = cute.runtime.make_fake_tensor(
         k_storage_dtype,
         (physical_pages, num_kv_heads, storage_page_size, k_storage_head_dim),
@@ -1964,7 +1990,7 @@ def _get_compiled_decode(
     attention_sinks_fake = fake_compact(
         Float32, (num_qo_heads,) if cfg.use_attention_sinks else (1,), 4
     )
-    if cfg.use_nvfp4_kv:
+    if cfg.uses_nvfp4_scale_tensors:
         sf_shape = (physical_pages, num_kv_heads, storage_page_size, head_dim // 16)
         sf_inner_strides = (
             storage_page_size * (head_dim // 16),
@@ -3128,6 +3154,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
     use_pdl: bool,
     split_kv: bool = True,
     share_pattern_across_kv_heads: bool = True,
+    prefer_keeps_mma_ab: bool = False,
 ) -> "FmhaDecodeConfig":
     """Resolve the private encoded-page QToken-KvBlock-Sparse-Attention profile without compiling it."""
 
@@ -3141,7 +3168,8 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         num_qo_heads,
         num_kv_heads,
     )
-    # This route has no QK-BF16/PV-FP8 kernel, so Q, K, and V must match.
+    # This route has no QK-BF16/PV-FP8 kernel, so Q, K, and V must match,
+    # except NVFP4 K/V, which is transformed exactly to BF16 for BF16 Q.
     q_token_kv_block_sparse_dtype_supported = (
         q_dtype_key == k_dtype_key == v_dtype_key
         and (
@@ -3152,7 +3180,12 @@ def _resolve_q_token_kv_block_sparse_decode_config(
                 and out_dtype_key in ("float16", "bfloat16")
             )
         )
+    ) or (
+        k_dtype_key == v_dtype_key == "float4_e2m1fn"
+        and q_dtype_key in ("bfloat16", "float8_e4m3fn")
+        and out_dtype_key == "bfloat16"
     )
+    use_nvfp4_kv = k_dtype_key == "float4_e2m1fn"
     if not (
         page_size in _SUPPORTED_PAGE_SIZES
         and head_dim in _GENERIC_HEAD_DIMS
@@ -3170,13 +3203,21 @@ def _resolve_q_token_kv_block_sparse_decode_config(
         group_size=group_size,
         heads_q_per_kv=heads_q_per_kv,
         head_dim=head_dim,
-        q_dtype_key=q_dtype_key,
+        # NVFP4 uses the transformed-KV Swaps recipe for either Q dtype; the
+        # FP8-only Keeps fallback applies to raw FP8 caches.
+        q_dtype_key="bfloat16" if use_nvfp4_kv else q_dtype_key,
         num_routes=batch_size,
         num_kv_heads=num_kv_heads,
         route_kv_tokens=max_kv_len,
         multi_processor_count=max_active_clusters,
         split_kv=split_kv,
+        prefer_keeps_mma_ab=prefer_keeps_mma_ab and not use_nvfp4_kv,
     )
+    if use_nvfp4_kv:
+        # The NVFP4 transform needs a complete warp group: each warp may only
+        # address its own 32-lane TMEM quarter. One KV instance frees
+        # Softmax1's group for it.
+        launch = replace(launch, num_insts_kv=1, head_dim_per_stage_kv=128)
 
     q_token_kv_block_sparse_profile = {
         "use_variable_seqlens_q": packed_query,
@@ -3209,6 +3250,16 @@ def _resolve_q_token_kv_block_sparse_decode_config(
     }
     if launch.use_keeps_mma_ab:
         q_token_kv_block_sparse_profile["o_stages"] = launch.o_stages
+    if use_nvfp4_kv:
+        # Softmax, transform and correction each own one warp group.
+        # Four loader warps keep NVFP4 fragment issue ahead of the transform
+        # while leaving registers to Softmax.
+        q_token_kv_block_sparse_profile.update(
+            transform_kv_warp_idx=4,
+            transform_kv_num_warps=4,
+            correction_warp_idx=8,
+            load_num_warps=4,
+        )
     return make_config(
         q_token_kv_block_sparse_profile,
         split_kv_mode=(
@@ -3670,6 +3721,23 @@ def _prepare_prims_ts_batch_decode_plan(
         )
     k_cache = normalized_cache.k_cache
     v_cache = normalized_cache.v_cache
+    # Packed NVFP4 without separate scale tensors stores interleaved rows:
+    # D/2 payload bytes, then the D/16 E4M3 scale bytes of the same token.
+    nvfp4_interleaved_kv = k_cache.dtype == torch.uint8 and kv_scale_factors is None
+    if nvfp4_interleaved_kv:
+        storage_head_dim = int(k_cache.shape[-1])
+        if storage_head_dim * 16 % 9 != 0:
+            raise ValueError(
+                "interleaved NVFP4 K/V rows must hold D/2 payload bytes and "
+                f"D/16 scale bytes; got {storage_head_dim} bytes per token"
+            )
+        if not use_q_token_kv_block_sparse_route:
+            raise ValueError(
+                "interleaved NVFP4 K/V is supported only by QToken sparse attention"
+            )
+        normalized_cache = replace(
+            normalized_cache, head_dim=storage_head_dim * 16 // 9
+        )
     num_kv_heads = normalized_cache.num_kv_heads
     storage_page_size = normalized_cache.storage_page_size
     head_dim = normalized_cache.head_dim
@@ -3713,6 +3781,7 @@ def _prepare_prims_ts_batch_decode_plan(
         kv_scale_factors,
         k_cache=k_cache,
         logical_head_dim=head_dim,
+        interleaved=nvfp4_interleaved_kv,
     )
     resolved_device, device_index = _resolve_cuda_device(query.device)
     _validate_runtime_device(resolved_device)
@@ -3740,10 +3809,73 @@ def _prepare_prims_ts_batch_decode_plan(
         split_kv,
         share_pattern_across_kv_heads,
     )
-    spec = _resolve_decode_launch_spec(
-        *policy_args,
-        use_attention_sinks=use_attention_sinks,
+    # Flat compact-HND locators view each cache as one 2-D map of page-fragment
+    # rows: they need semantic subpages, contiguous K/V, an Int32 row index and
+    # head-aware locators when there are several KV heads.
+    flat_native_kv_cache = (
+        use_q_token_kv_block_sparse_route
+        and storage_page_size != page_size
+        and (num_kv_heads == 1 or (allow_head_aware_locators and not direct_q1_inputs))
+        and k_cache.is_contiguous()
+        and v_cache.is_contiguous()
+        and int(k_cache.shape[0]) * storage_page_size * num_kv_heads < (1 << 31)
     )
+    # FP8-MMA NVFP4 with five or more grouped Q tokens runs the FP8 Keeps
+    # recipe (softmax per Q row instead of per K row); TransformKvTask feeds
+    # its K/V rings from the interleaved NVFP4 cache. Fewer tokens keep the
+    # TMEM-transformed Swaps recipe, whose per-K-row softmax is cheaper there,
+    # unless the group's Q rows exceed the widest (32-row) Swaps Q tile.
+    # Its raw NVFP4 ring is filled only by flat TMA gather4 copies (see
+    # FmhaDecodeConfig.uses_nvfp4_gather4_kv).
+    nvfp4_keeps_source = (
+        nvfp4_interleaved_kv
+        and use_q_token_kv_block_sparse_route
+        and query.dtype == torch.float8_e4m3fn
+        and (seq_len_q >= 5 or seq_len_q * (num_qo_heads // num_kv_heads) > 32)
+        and flat_native_kv_cache
+    )
+    spec = None
+    if nvfp4_keeps_source:
+        keeps_spec = _resolve_decode_launch_spec(
+            *policy_args[:9],
+            "float8_e4m3fn",
+            "float8_e4m3fn",
+            *policy_args[11:],
+            use_attention_sinks=use_attention_sinks,
+            prefer_keeps_mma_ab=True,
+        )
+        keeps_cfg = keeps_spec.config
+        # The transform writes D256 SW128 FP8 slabs for KV128 tiles of the
+        # one-instance recipe, loaded four page fragments per gather4 copy;
+        # any other FP8 recipe or fragment count keeps the Swaps NVFP4 path.
+        # The FP8 policy is asked to prefer Keeps even where Swaps would split
+        # KV: Keeps then splits with its own one-instance fanout and a
+        # separate reduction. On GB300 that beats the Swaps NVFP4 split by
+        # 8-15% at 4-64 work tiles, and the unsplit Keeps launch beats it by
+        # 9-15% at 128 tiles.
+        if (
+            keeps_cfg.use_keeps_mma_ab
+            and keeps_cfg.num_insts_kv == 1
+            and keeps_cfg.head_dim_kv_stage == 256
+            and keeps_cfg.tile_size_kv == 128
+            and (keeps_cfg.tile_size_kv // page_size) % 4 == 0
+            and not keeps_cfg.runtime_split_kv
+        ):
+            spec = keeps_spec
+        else:
+            nvfp4_keeps_source = False
+    if spec is None:
+        heads_q_per_kv = num_qo_heads // num_kv_heads
+        if (
+            k_cache.dtype == torch.uint8
+            and use_q_token_kv_block_sparse_route
+            and seq_len_q * heads_q_per_kv > 32
+        ):
+            raise nvfp4_wide_group_error(seq_len_q, heads_q_per_kv)
+        spec = _resolve_decode_launch_spec(
+            *policy_args,
+            use_attention_sinks=use_attention_sinks,
+        )
     policy_config = replace(spec.config, fixed_seqlen=True)
     if query_major_memberships:
         if not policy_config.supports_query_major_memberships:
@@ -3751,6 +3883,53 @@ def _prepare_prims_ts_batch_decode_plan(
                 "query-major memberships require one G2..G8 Keeps/page-4 CTA"
             )
         spec = replace(spec, config=replace(spec.config, query_major_memberships=True))
+    if nvfp4_keeps_source:
+        cfg = spec.config
+        # Q64: SMEM goes to the raw NVFP4 ring. With every SM streaming, its
+        # bytes in flight bound the load rate. One 32 KB FP8 stage per operand
+        # suffices because converting a tile is shorter than the Softmax it
+        # overlaps; six 18 KB raw stages plus one Q stage then fit. Deeper FP8
+        # rings or a second Q stage measured slower.
+        # Q128 doubles the MMA and Softmax per tile, so one FP8 stage stalls
+        # the transform behind PV; two FP8 stages with two raw stages (the
+        # 32 KB Q stage leaves no room for more) measured 4-10% faster on
+        # GB300 at 16 Q heads per KV head.
+        transformed_kv_stages, kv_stages = (2, 2) if cfg.tile_size_q == 128 else (1, 6)
+        keeps_profile = dict(
+            nvfp4_kv_source=True,
+            transformed_kv_stages=transformed_kv_stages,
+            q_stages=1,
+            kv_stages=kv_stages,
+            load_warp_idx=8,
+            clc_load_warp_idx=8,
+            load_num_warps=4,
+            # Warp group 2 hosts the loader instead of its padding task.
+            wg2_padding_num_warps=0,
+            transform_kv_warp_idx=16,
+            transform_kv_num_warps=8,
+        )
+        spec = replace(spec, config=replace(cfg, **keeps_profile))
+    elif nvfp4_interleaved_kv:
+        # A 32-fragment interleaved raw stage is exactly as large as the
+        # separate payload plus scale stages, so the resolved stage counts stay.
+        if not spec.config.store_transformed_kv_in_tmem:
+            raise NotImplementedError(
+                "interleaved NVFP4 K/V requires the TMEM-transformed K/V profile"
+            )
+        # Two transform warp groups (warps 16-23) split each K/V stage; the
+        # four loader warps move to 4-7. Interleaved V has no cross-warp
+        # shuffles, so the transform scales with a second group.
+        spec = replace(
+            spec,
+            config=replace(
+                spec.config,
+                nvfp4_interleaved_kv=True,
+                transform_kv_warp_idx=16,
+                transform_kv_num_warps=8,
+                load_warp_idx=4,
+                clc_load_warp_idx=4,
+            ),
+        )
     if policy_config.uses_q_token_kv_block_sparse_page_membership:
         if q_token_kv_block_sparse_page_memberships is None:
             raise ValueError(
@@ -3813,15 +3992,17 @@ def _prepare_prims_ts_batch_decode_plan(
             page_capacity=max_num_pages,
             fixed_query_len=direct_q1_fixed_query_len,
         )
-    flat_native_kv_tma = (
-        use_q_token_kv_block_sparse_route
-        and spec.config.uses_staged_one_inst_tmem_p
-        and (spec.config.use_bf16_qkv or spec.config.use_fp8_qkv)
-        and spec.config.has_storage_subpages
-        and (num_kv_heads == 1 or (allow_head_aware_locators and not direct_q1_inputs))
-        and k_cache.is_contiguous()
-        and normalized_cache.v_cache.is_contiguous()
-        and int(k_cache.shape[0]) * storage_page_size * num_kv_heads < (1 << 31)
+    flat_native_kv_tma = flat_native_kv_cache and (
+        (
+            spec.config.uses_staged_one_inst_tmem_p
+            and (spec.config.use_bf16_qkv or spec.config.use_fp8_qkv)
+        )
+        # Interleaved NVFP4 gathers four flat fragment rows per copy. Tiles
+        # of fewer fragments keep the head-aware 4-D paged copies.
+        or (
+            (spec.config.nvfp4_interleaved_kv or spec.config.nvfp4_kv_source)
+            and (spec.config.tile_size_kv // page_size) % 4 == 0
+        )
     )
     compile_spec = _make_decode_compile_spec(
         spec,
